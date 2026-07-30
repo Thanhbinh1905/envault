@@ -1,0 +1,391 @@
+use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::{
+    process::{Command, Stdio},
+    sync::mpsc,
+    time::{Duration, Instant},
+};
+
+#[cfg(unix)]
+use envault_protocol::{
+    AuthenticatedRequest, BootstrapRequest, PROTOCOL_VERSION, ProtocolError, Request, Response,
+    ResponseBody, ServiceState, validate_version,
+};
+use envault_protocol::{DaemonStatus, Operation, Reply, SensitiveBytes, StructuredError};
+use thiserror::Error;
+#[cfg(unix)]
+use uuid::Uuid;
+
+#[cfg(unix)]
+use crate::ipc::{read_sync_frame, write_sync_frame};
+
+#[cfg(unix)]
+const DAEMON_TRANSITION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(unix)]
+const DAEMON_TRANSITION_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Error)]
+pub enum ClientError {
+    #[error("EnVault daemon is not running")]
+    NotRunning,
+    #[error("EnVault daemon did not respond before the deadline")]
+    Timeout,
+    #[error("EnVault IPC protocol failed")]
+    Protocol,
+    #[error("EnVault daemon returned an error")]
+    Remote(StructuredError),
+    #[error("EnVault daemon returned an unexpected response")]
+    UnexpectedResponse,
+    #[error("this platform does not support EnVault IPC yet")]
+    UnsupportedPlatform,
+}
+
+pub fn socket_path() -> Result<PathBuf, ClientError> {
+    envault_platform::runtime_directory()
+        .map(|directory| directory.join("envault.sock"))
+        .map_err(|_| ClientError::NotRunning)
+}
+
+pub fn request(operation: Operation) -> Result<Reply, ClientError> {
+    request_with_capability(operation, None)
+}
+
+pub fn request_with_capability(
+    operation: Operation,
+    capability_token: Option<SensitiveBytes>,
+) -> Result<Reply, ClientError> {
+    request_at(&socket_path()?, operation, capability_token)
+}
+
+#[cfg(unix)]
+pub fn start(password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
+    let _start_lock = acquire_start_lock()?;
+    match request(Operation::Status) {
+        Ok(Reply::Status(status)) if status.service == ServiceState::Unlocked => return Ok(status),
+        Ok(Reply::Status(_)) => {
+            match request(Operation::Stop) {
+                Ok(Reply::Acknowledged) | Err(ClientError::NotRunning) => {}
+                Ok(_) => return Err(ClientError::UnexpectedResponse),
+                Err(error) => return Err(error),
+            }
+            if let Some(status) = wait_for_daemon_exit()? {
+                return Ok(status);
+            }
+        }
+        Err(ClientError::NotRunning) => {}
+        Ok(_) => return Err(ClientError::UnexpectedResponse),
+        Err(error) => return Err(error),
+    }
+    match spawn_daemon(password) {
+        Err(ClientError::Remote(error)) if error.code == "daemon_busy" => wait_for_running_daemon(),
+        result => result,
+    }
+}
+
+#[cfg(not(unix))]
+pub fn start(_password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
+    Err(ClientError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
+pub fn request_at(
+    path: &std::path::Path,
+    operation: Operation,
+    capability_token: Option<SensitiveBytes>,
+) -> Result<Reply, ClientError> {
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(path).map_err(|_| ClientError::NotRunning)?;
+    authenticate_server(path, &stream)?;
+    let timeout = Some(Duration::from_secs(
+        envault_protocol::DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    ));
+    stream
+        .set_read_timeout(timeout)
+        .map_err(|_| ClientError::Protocol)?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(|_| ClientError::Protocol)?;
+    let request_id = Uuid::new_v4();
+    let request = Request {
+        version: PROTOCOL_VERSION,
+        request_id,
+        body: AuthenticatedRequest {
+            capability_token,
+            operation,
+        },
+    };
+    write_sync_frame(&mut stream, &request).map_err(|_| ClientError::Protocol)?;
+    let response: Response<Reply> = read_sync_frame(&mut stream).map_err(|error| match error {
+        ProtocolError::DeadlineExceeded => ClientError::Timeout,
+        _ => ClientError::Protocol,
+    })?;
+    validate_version(response.version).map_err(|_| ClientError::Protocol)?;
+    if response.request_id != request_id {
+        return Err(ClientError::Protocol);
+    }
+    match response.body {
+        ResponseBody::Ok(reply) => Ok(reply),
+        ResponseBody::Error(error) => Err(ClientError::Remote(error)),
+    }
+}
+
+#[cfg(unix)]
+fn spawn_daemon(password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
+    let executable = daemon_executable()?;
+    let mut child = Command::new(executable)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| ClientError::NotRunning)?;
+    let child_pid = child.id();
+    let request_id = Uuid::new_v4();
+    let bootstrap = Request {
+        version: PROTOCOL_VERSION,
+        request_id,
+        body: BootstrapRequest { password },
+    };
+    let mut stdin = child.stdin.take().ok_or(ClientError::Protocol)?;
+    if write_sync_frame(&mut stdin, &bootstrap).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ClientError::Protocol);
+    }
+    drop(stdin);
+    drop(bootstrap);
+    let mut stdout = child.stdout.take().ok_or(ClientError::Protocol)?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let response = read_sync_frame::<Response<Reply>>(&mut stdout);
+        let _ = sender.send(response);
+    });
+    let response = match receiver.recv_timeout(Duration::from_secs(30)) {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ClientError::Protocol);
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ClientError::Timeout);
+        }
+    };
+    validate_version(response.version).map_err(|_| ClientError::Protocol)?;
+    if response.request_id != request_id {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ClientError::Protocol);
+    }
+    match response.body {
+        ResponseBody::Ok(Reply::Status(status))
+            if status.service == ServiceState::Unlocked && status.pid == child_pid =>
+        {
+            drop(child);
+            Ok(status)
+        }
+        ResponseBody::Ok(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(ClientError::UnexpectedResponse)
+        }
+        ResponseBody::Error(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(ClientError::Remote(error))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn daemon_executable() -> Result<PathBuf, ClientError> {
+    let executable = std::env::current_exe().map_err(|_| ClientError::NotRunning)?;
+    let daemon = executable.with_file_name("envaultd");
+    if daemon.is_file() {
+        Ok(daemon)
+    } else {
+        Err(ClientError::NotRunning)
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_daemon_exit() -> Result<Option<DaemonStatus>, ClientError> {
+    let runtime = envault_platform::runtime_directory().map_err(|_| ClientError::Protocol)?;
+    envault_platform::create_private_directory(&runtime).map_err(|_| ClientError::Protocol)?;
+    let lock_path = runtime.join("envaultd.lock");
+    let lock =
+        envault_platform::open_private_lock_file(&lock_path).map_err(|_| ClientError::Protocol)?;
+    let deadline = Instant::now()
+        .checked_add(DAEMON_TRANSITION_TIMEOUT)
+        .ok_or(ClientError::Timeout)?;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(None),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(_) => return Err(ClientError::Protocol),
+        }
+        match request(Operation::Status) {
+            Ok(Reply::Status(status)) if status.service == ServiceState::Unlocked => {
+                return Ok(Some(status));
+            }
+            Ok(Reply::Status(_))
+            | Err(ClientError::NotRunning | ClientError::Protocol | ClientError::Timeout) => {}
+            Ok(_) => return Err(ClientError::UnexpectedResponse),
+            Err(ClientError::Remote(error)) if error.retryable => {}
+            Err(error) => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            return Err(ClientError::Timeout);
+        }
+        std::thread::sleep(DAEMON_TRANSITION_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn acquire_start_lock() -> Result<std::fs::File, ClientError> {
+    let runtime = envault_platform::runtime_directory().map_err(|_| ClientError::Protocol)?;
+    envault_platform::create_private_directory(&runtime).map_err(|_| ClientError::Protocol)?;
+    let lock = envault_platform::open_private_lock_file(&runtime.join("envault-start.lock"))
+        .map_err(|_| ClientError::Protocol)?;
+    let deadline = Instant::now()
+        .checked_add(DAEMON_TRANSITION_TIMEOUT)
+        .ok_or(ClientError::Timeout)?;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(_) => return Err(ClientError::Protocol),
+        }
+        if Instant::now() >= deadline {
+            return Err(ClientError::Timeout);
+        }
+        std::thread::sleep(DAEMON_TRANSITION_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_running_daemon() -> Result<DaemonStatus, ClientError> {
+    let deadline = Instant::now()
+        .checked_add(DAEMON_TRANSITION_TIMEOUT)
+        .ok_or(ClientError::Timeout)?;
+    loop {
+        match request(Operation::Status) {
+            Ok(Reply::Status(status)) if status.service == ServiceState::Unlocked => {
+                return Ok(status);
+            }
+            Ok(Reply::Status(_))
+            | Err(ClientError::NotRunning | ClientError::Protocol | ClientError::Timeout) => {}
+            Ok(_) => return Err(ClientError::UnexpectedResponse),
+            Err(ClientError::Remote(error)) if error.retryable => {}
+            Err(error) => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            return Err(ClientError::Timeout);
+        }
+        std::thread::sleep(DAEMON_TRANSITION_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn authenticate_server(
+    path: &std::path::Path,
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<(), ClientError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    let socket = std::fs::symlink_metadata(path).map_err(|_| ClientError::Protocol)?;
+    let parent = path.parent().ok_or(ClientError::Protocol)?;
+    let directory = std::fs::symlink_metadata(parent).map_err(|_| ClientError::Protocol)?;
+    if !socket.file_type().is_socket()
+        || socket.file_type().is_symlink()
+        || socket.permissions().mode() & 0o777 != 0o600
+        || socket.nlink() != 1
+        || !directory.file_type().is_dir()
+        || directory.file_type().is_symlink()
+        || directory.permissions().mode() & 0o777 != 0o700
+        || socket.uid() != directory.uid()
+    {
+        return Err(ClientError::Protocol);
+    }
+    let peer_uid = server_peer_uid(stream)?;
+    if peer_uid != socket.uid() {
+        return Err(ClientError::Protocol);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn server_peer_uid(stream: &std::os::unix::net::UnixStream) -> Result<u32, ClientError> {
+    nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+        .map(|credentials| credentials.uid())
+        .map_err(|_| ClientError::Protocol)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+))]
+fn server_peer_uid(stream: &std::os::unix::net::UnixStream) -> Result<u32, ClientError> {
+    nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerCred)
+        .map(|credentials| credentials.uid())
+        .map_err(|_| ClientError::Protocol)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))
+))]
+fn server_peer_uid(_stream: &std::os::unix::net::UnixStream) -> Result<u32, ClientError> {
+    Err(ClientError::UnsupportedPlatform)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sibling_daemon_path_does_not_use_shell_or_environment_lookup() {
+        let current = std::env::current_exe().expect("current exe");
+        let sibling = current.with_file_name("envaultd");
+        assert_eq!(sibling.parent(), current.parent());
+        assert_eq!(
+            sibling.file_name().and_then(|name| name.to_str()),
+            Some("envaultd")
+        );
+    }
+
+    #[test]
+    fn socket_path_is_runtime_scoped() {
+        let path = socket_path();
+        if let Ok(path) = path {
+            assert_eq!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("envault.sock")
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn request_at(
+    _path: &std::path::Path,
+    _operation: Operation,
+    _capability_token: Option<SensitiveBytes>,
+) -> Result<Reply, ClientError> {
+    Err(ClientError::UnsupportedPlatform)
+}

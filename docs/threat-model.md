@@ -37,6 +37,8 @@ External providers receive credentials only through a constrained broker action.
 - Each secret value mutation creates a new immutable version with a distinct DEK.
 - Deny rules take precedence over allow rules.
 - Capability tokens are random, bounded, revocable, stored as hashes in daemon memory, and invalid after daemon shutdown.
+- A capability-bearing request cannot fall back to ambient service or admin authorization.
+- IPC clients and the daemon verify operating-system peer identity, and runtime path handling refuses symbolic-link or non-socket substitution.
 - Audit entries are redacted, append-only, and hash-chained.
 
 ## Residual risks
@@ -45,9 +47,9 @@ An agent can misuse a capability that is too broad even if it cannot read the cr
 Exact-match redaction cannot detect every transformed representation of a secret.
 A weak master password lowers the cost of an offline attack despite Argon2id.
 Metadata such as ciphertext lengths and timestamps may remain observable.
+An admin lease deliberately trusts its originating operating-system login session, so code intentionally run inside that same session shares the ambient lease boundary until it expires or is locked.
 
 ## Verification strategy
 
 Every invariant must be covered by unit, property, integration, adversarial, or release-gate tests.
 Claims remain unverified until the corresponding phase exit gate has passed on packaged binaries.
-
