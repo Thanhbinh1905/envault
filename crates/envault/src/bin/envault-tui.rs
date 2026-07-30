@@ -1,8 +1,13 @@
 #![forbid(unsafe_code)]
 
-fn main() {
-    eprintln!(
-        "envault-tui: available after the authenticated IPC application service is implemented"
-    );
-    std::process::exit(1);
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    match envault::tui::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("envault-tui: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
