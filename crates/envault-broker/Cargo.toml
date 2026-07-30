@@ -1,0 +1,16 @@
+[package]
+name = "envault-broker"
+description = "Constrained agent-blind broker primitives for EnVault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true
+

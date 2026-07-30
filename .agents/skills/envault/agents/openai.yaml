@@ -1,0 +1,5 @@
+interface:
+  display_name: EnVault
+  short_description: Use scoped credentials through a local agent-blind broker.
+  default_prompt: Use EnVault for authenticated operations without requesting or exposing plaintext secrets.
+

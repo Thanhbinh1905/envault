@@ -1,0 +1,38 @@
+[package]
+name = "envault"
+description = "Local-first encrypted secret vault for developers and AI agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+default-run = "envault"
+
+[dependencies]
+clap.workspace = true
+envault-core = { version = "=0.0.1", path = "../envault-core" }
+envault-platform = { version = "=0.0.1", path = "../envault-platform" }
+envault-protocol = { version = "=0.0.1", path = "../envault-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "envault"
+path = "src/main.rs"
+
+[[bin]]
+name = "envaultd"
+path = "src/bin/envaultd.rs"
+
+[[bin]]
+name = "envault-tui"
+path = "src/bin/envault-tui.rs"

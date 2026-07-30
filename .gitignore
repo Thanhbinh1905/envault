@@ -1,0 +1,12 @@
+/target/
+/.idea/
+/.vscode/
+*.swp
+*.swo
+.DS_Store
+*.envault-profile
+*.envault-workspace
+*.db
+*.db-shm
+*.db-wal
+
