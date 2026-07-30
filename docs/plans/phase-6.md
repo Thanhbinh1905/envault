@@ -34,9 +34,10 @@ Every list and detail view is read-only and requires no admin lease, matching th
 
 ## Admin surface
 
-An admin panel exposes lease unlock, renewal, and explicit lock, issuing the same `AdminUnlock` and lock operations the CLI issues, with the human entering the master password through a masked input widget that is never echoed and never buffered to terminal scrollback.
-Mutating actions gated behind an active admin lease, such as creating a scope or profile, generating a new secret version, and rotating a secret, are available from the terminal UI only while the lease is active and each requires an explicit confirmation prompt naming the exact target before the request is sent.
-Agent session listing and explicit session revocation are available from the admin panel and call the same session-management operations the CLI exposes.
+An admin panel exposes lease unlock and explicit lock, issuing the same operations behind `admin unlock` and `admin lock`, with the human entering the master password through a masked input widget that is never echoed and never buffered to terminal scrollback.
+Mutating actions gated behind an active admin lease are available from the terminal UI only while the lease is active and each requires an explicit confirmation prompt naming the exact target before the request is sent.
+Phase 6 scopes those mutating actions to profile lifecycle (`profile create`, `rename`, `delete`, `activate`) and secret lifecycle (`secret create`, `update`, `rename`, `delete`, `value generate`), since these are the actions a human manages interactively and repeatedly.
+Agent principal management (`admin agent create/list/enable/disable`), grant issuance and revocation (`admin grant create/revoke`), and policy authoring (`admin policy create/list`) remain CLI-only in Phase 6; each is its own bulk or structured-authoring workflow (bearer-token handling, policy rule composition) that deserves dedicated screen design rather than an incidental extension of the profile and secret admin panel, and is deferred to a follow-up iteration.
 The terminal UI never creates or reads a capability token; capability issuance remains exclusive to the agent-facing broker path per ADR 0004.
 
 ## Portability surface
