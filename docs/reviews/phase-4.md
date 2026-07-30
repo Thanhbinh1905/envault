@@ -84,5 +84,6 @@ Windows-only dead-code warnings now disappear because Unix IPC is excluded from 
 
 ## Decision
 
-Phase 4 is approved when protected GitHub quality, Linux, macOS, and Windows checks pass for this reviewed change.
+Phase 4 is approved.
+Protected GitHub quality, Linux, macOS, and Windows checks passed for pull request 8 on the reviewed commit.
 No unresolved Phase 4 CLI, policy, capability, HTTP, SSRF, response-firewall, skill, persistence, packaging, or local portability finding remains in the reviewed implementation.
