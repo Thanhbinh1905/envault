@@ -70,3 +70,42 @@ pub fn install_panic_hook() {
         default_hook(panic_info);
     }));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `TerminalGuard::enter` requires a real terminal on stdout for raw mode
+    /// and the alternate screen to mean anything. Under the test harness,
+    /// stdout is ordinarily not a tty, so entry must fail cleanly rather than
+    /// leave stdout half-configured; on the rare occasion this test runs
+    /// attached to a real terminal, entry succeeds and `Drop` must restore it
+    /// without panicking. Either branch is exercised here; which one runs
+    /// depends on the environment, which is inherent to testing a real
+    /// terminal without a pseudo-terminal harness (see the real-binary
+    /// end-to-end coverage gap noted in docs/plans/phase-6.md).
+    #[test]
+    fn enter_either_fails_cleanly_or_restores_on_drop() {
+        match TerminalGuard::enter() {
+            Err(_) => {}
+            Ok(guard) => drop(guard),
+        }
+    }
+
+    /// The panic hook must restore the terminal and then let the panic keep
+    /// propagating; it must never swallow the panic or abort the process.
+    /// This does not observe raw-mode/alternate-screen state directly (there
+    /// is no portable way to do that in a unit test without a real
+    /// terminal), only that the hook composes correctly with unwinding.
+    #[test]
+    fn panic_hook_restores_then_lets_the_panic_propagate() {
+        install_panic_hook();
+        let result = std::panic::catch_unwind(|| {
+            panic!("simulated render-loop panic for terminal-restoration test");
+        });
+        assert!(
+            result.is_err(),
+            "the panic must still propagate to the caller"
+        );
+    }
+}

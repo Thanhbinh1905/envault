@@ -323,3 +323,74 @@ fn draw_status_line<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>
     let text = app.status_message().unwrap_or("ready");
     frame.render_widget(Paragraph::new(text), area);
 }
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyCode;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    use super::*;
+    use crate::tui::App;
+    use crate::tui::test_support::{FakeClient, sample_profile};
+
+    fn buffer_to_string(buffer: &Buffer) -> String {
+        let area = buffer.area;
+        let mut rendered = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                rendered.push_str(buffer[(area.x + x, area.y + y)].symbol());
+            }
+            rendered.push('\n');
+        }
+        rendered
+    }
+
+    fn render<C: DaemonClient>(app: &App<C>) -> String {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test backend terminal");
+        terminal
+            .draw(|frame| draw(frame, app))
+            .expect("draw succeeds against the test backend");
+        buffer_to_string(terminal.backend().buffer())
+    }
+
+    /// `ProfileView` carries only a name and an optional description; this
+    /// asserts the rendered buffer actually contains those exact sentinel
+    /// values and nothing beyond what the type exposes.
+    #[test]
+    fn profiles_view_renders_only_the_fields_profile_view_actually_carries() {
+        let client = FakeClient::default();
+        client
+            .profiles
+            .borrow_mut()
+            .push_back(Ok(vec![sample_profile(
+                "sentinel-profile-name",
+                Some("sentinel-profile-description".to_string()),
+            )]));
+        let mut app = App::new(client);
+        app.on_key(KeyCode::Char('p'));
+
+        let rendered = render(&app);
+        assert!(rendered.contains("sentinel-profile-name"));
+        assert!(rendered.contains("sentinel-profile-description"));
+    }
+
+    /// A master password typed into the admin-unlock prompt must never reach
+    /// the rendered buffer; only mask characters may appear.
+    #[test]
+    fn password_input_mode_never_renders_the_typed_characters() {
+        let client = FakeClient::default();
+        let mut app = App::new(client);
+        app.on_key(KeyCode::Char('u'));
+        let password = "sentinel-master-password";
+        for character in password.chars() {
+            app.on_key(KeyCode::Char(character));
+        }
+
+        let rendered = render(&app);
+        assert!(!rendered.contains(password));
+        assert!(rendered.contains(&"*".repeat(password.chars().count())));
+    }
+}

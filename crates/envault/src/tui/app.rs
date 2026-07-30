@@ -1873,3 +1873,192 @@ fn describe_import_summary(summary: &PortabilityImportSummary) -> String {
         summary.created, summary.replaced, summary.skipped, summary.versions_appended
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyCode;
+
+    use super::*;
+    use crate::tui::test_support::{
+        FakeClient, sample_admin_status, sample_env_preview, sample_import_summary, sample_profile,
+        sample_secret, sample_status, sample_version,
+    };
+
+    fn app_with(client: FakeClient) -> App<FakeClient> {
+        let mut app = App::new(client);
+        app.refresh_dashboard();
+        app
+    }
+
+    #[test]
+    fn navigation_moves_between_screens_and_refreshes_each_list() {
+        let client = FakeClient::default();
+        client
+            .status
+            .borrow_mut()
+            .push_back(Ok(sample_status(false)));
+        client
+            .admin_status
+            .borrow_mut()
+            .push_back(Ok(sample_admin_status(false)));
+        client
+            .profiles
+            .borrow_mut()
+            .push_back(Ok(vec![sample_profile("base", None)]));
+        // Secrets is refreshed twice: once on entry, once again when Esc
+        // returns from Versions back to Secrets.
+        for _ in 0..2 {
+            client
+                .secrets
+                .borrow_mut()
+                .push_back(Ok(vec![sample_secret("db-password", None)]));
+        }
+        client
+            .versions
+            .borrow_mut()
+            .push_back(Ok(vec![sample_version(1)]));
+        let mut app = app_with(client);
+        assert_eq!(app.screen(), Screen::Dashboard);
+
+        app.on_key(KeyCode::Char('p'));
+        assert_eq!(app.screen(), Screen::Profiles);
+        assert_eq!(app.profiles().len(), 1);
+
+        app.on_key(KeyCode::Char('s'));
+        assert_eq!(app.screen(), Screen::Secrets);
+        assert_eq!(app.secrets().len(), 1);
+
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::Versions);
+        assert_eq!(app.versions().len(), 1);
+
+        app.on_key(KeyCode::Esc);
+        assert_eq!(app.screen(), Screen::Secrets);
+    }
+
+    #[test]
+    fn password_input_cancel_returns_to_normal_without_calling_the_client() {
+        let client = FakeClient::default();
+        client
+            .status
+            .borrow_mut()
+            .push_back(Ok(sample_status(false)));
+        client
+            .admin_status
+            .borrow_mut()
+            .push_back(Ok(sample_admin_status(false)));
+        // No entry queued in `admin_unlock`: if Esc-cancel ever reached the
+        // client, `pop()` would panic instead of the assertion below firing.
+        let mut app = app_with(client);
+
+        app.on_key(KeyCode::Char('u'));
+        assert!(matches!(app.mode(), Mode::PasswordInput(..)));
+        app.on_key(KeyCode::Char('x'));
+        app.on_key(KeyCode::Esc);
+        assert!(matches!(app.mode(), Mode::Normal));
+        assert!(!app.admin_lease_active());
+    }
+
+    #[test]
+    fn mutating_action_requires_explicit_confirmation_before_it_can_commit() {
+        let client = FakeClient::default();
+        client
+            .status
+            .borrow_mut()
+            .push_back(Ok(sample_status(true)));
+        client
+            .admin_status
+            .borrow_mut()
+            .push_back(Ok(sample_admin_status(true)));
+        client.profiles.borrow_mut().push_back(Ok(Vec::new()));
+        let mut app = app_with(client);
+        app.on_key(KeyCode::Char('p'));
+
+        app.on_key(KeyCode::Char('c'));
+        for character in "team".chars() {
+            app.on_key(KeyCode::Char(character));
+        }
+        app.on_key(KeyCode::Enter);
+        app.on_key(KeyCode::Enter);
+        assert!(matches!(
+            app.mode(),
+            Mode::Confirm(PendingAction::CreateProfile { .. })
+        ));
+
+        // A single keypress that both selects and commits would be a defect;
+        // cancelling here must not have sent anything (no `profiles` entry
+        // beyond the initial listing is queued, so a real send would panic).
+        app.on_key(KeyCode::Char('n'));
+        assert!(matches!(app.mode(), Mode::Normal));
+    }
+
+    #[test]
+    fn reissuing_a_preview_clears_the_prior_plan_hash_before_the_new_response_lands() {
+        let client = FakeClient::default();
+        client
+            .status
+            .borrow_mut()
+            .push_back(Ok(sample_status(true)));
+        client
+            .admin_status
+            .borrow_mut()
+            .push_back(Ok(sample_admin_status(true)));
+        client
+            .preview_env
+            .borrow_mut()
+            .push_back(Ok(sample_env_preview("hash-one")));
+        client
+            .preview_env
+            .borrow_mut()
+            .push_back(Err(ClientError::Timeout));
+        let mut app = app_with(client);
+
+        app.request_env_preview("base".to_string(), "/tmp/one.env".to_string());
+        assert_eq!(app.portability_preview().unwrap().plan_hash(), "hash-one");
+
+        // The old hash is cleared the moment a new preview is requested, not
+        // only once a response arrives, so even a failing re-preview leaves
+        // no stale hash behind.
+        app.request_env_preview("base".to_string(), "/tmp/one.env".to_string());
+        assert!(app.portability_preview().is_none());
+    }
+
+    #[test]
+    fn commit_consumes_the_preview_so_a_repeated_commit_cannot_reuse_a_hash() {
+        let client = FakeClient::default();
+        client
+            .status
+            .borrow_mut()
+            .push_back(Ok(sample_status(true)));
+        client
+            .admin_status
+            .borrow_mut()
+            .push_back(Ok(sample_admin_status(true)));
+        client
+            .preview_env
+            .borrow_mut()
+            .push_back(Ok(sample_env_preview("hash-two")));
+        client
+            .commit_env
+            .borrow_mut()
+            .push_back(Ok(sample_import_summary()));
+        // A successful `.env` commit refreshes the secrets list.
+        client.secrets.borrow_mut().push_back(Ok(Vec::new()));
+        let mut app = app_with(client);
+
+        app.request_env_preview("base".to_string(), "/tmp/two.env".to_string());
+        assert!(app.portability_preview().is_some());
+
+        app.execute_portability_commit();
+        assert!(
+            app.portability_preview().is_none(),
+            "a successful commit must consume the held preview"
+        );
+
+        // A second commit attempt with no fresh preview must not reach the
+        // client at all: the `commit_env` queue is empty, so a real send
+        // would panic instead of the status message below being set.
+        app.execute_portability_commit();
+        assert_eq!(app.status_message(), Some("no preview to commit"));
+    }
+}

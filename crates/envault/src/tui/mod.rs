@@ -4,6 +4,8 @@
 
 mod app;
 mod terminal;
+#[cfg(test)]
+mod test_support;
 mod view;
 
 use std::io::{self, IsTerminal};
