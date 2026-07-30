@@ -376,6 +376,10 @@ impl VaultSession {
         self.store.policy_rules()?.iter().map(policy_rule).collect()
     }
 
+    pub fn validate_policy_resource(&self, resource: ResourceSelector) -> Result<(), ServiceError> {
+        self.validate_resource(resource)
+    }
+
     pub fn explain_policy(
         &mut self,
         principal_id: PrincipalId,

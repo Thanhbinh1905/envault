@@ -45,7 +45,23 @@ unset bootstrap_password
 
 The shell variable is not exported and is never read as an environment input by EnVault.
 Do not place a real password directly in shell history.
-Profile, secret, lifecycle, and broker commands remain fail-closed until the authenticated daemon and IPC phases are complete.
+
+Build the complete executable set before running from a development checkout:
+
+```sh
+cargo build -p envault --bins
+```
+
+Start the authenticated daemon from a masked terminal prompt:
+
+```sh
+target/debug/envault start
+```
+
+Automation may use `start --password-stdin` with the same safe input constraints as initialization.
+Use `envault status`, `envault lock`, and `envault stop` for explicit lifecycle control.
+Use `envault admin unlock --minutes 5`, `envault admin status`, and `envault admin lock` for the bounded admin lease.
+Profile, secret, agent-context, and broker workflows remain fail-closed until their later phases are complete.
 
 ## License
 

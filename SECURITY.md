@@ -13,6 +13,6 @@ Include reproduction steps, affected revision, impact, and any suggested mitigat
 
 ## Security boundary
 
-EnVault does not defend against root, kernel compromise, or malware with equivalent privileges to the current user.
+EnVault does not defend against root, kernel compromise, or a full user-session compromise that can replace trusted executables, control the login session, or capture terminal input.
+It does enforce peer, lease, policy, and capability boundaries for untrusted local callers that do not already control those trusted surfaces.
 The agent-blind guarantee applies only to actions mediated by a trusted broker.
-
