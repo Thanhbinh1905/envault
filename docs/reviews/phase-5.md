@@ -108,6 +108,6 @@ Plan-hash arguments accept the full Base64URL alphabet, including valid hashes w
 
 ## Decision
 
-Phase 5 is locally approved.
+Phase 5 is approved.
 No unresolved local package-format, cryptographic, KDF, key-slot, scanner, import-plan, transaction, policy-integrity, capability-lifecycle, filesystem-race, plaintext-leakage, CLI UX, packaging, release-build, or Windows compile finding remains.
-Final Phase 5 approval requires the protected Linux, macOS, Windows, and quality checks to pass on the reviewed pull-request commit.
+Protected GitHub quality, Linux, macOS, and Windows checks passed for pull request 10 on reviewed implementation commit `10dda0c`.
