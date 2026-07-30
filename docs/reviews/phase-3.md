@@ -78,6 +78,7 @@ Private runtime operations now reject symbolic links and hard links and use no-f
 Request processing and normal response writing now share one deadline instead of allowing two full consecutive timeout windows.
 Locked lifecycle and admin-status calls now return `envault_locked` with actionable guidance instead of reporting success or an ambiguous inactive lease.
 Native cross-target checking exposed and resolved the macOS filesystem-mode width difference.
+Native macOS testing exposed that changing a timeout after peer close returns `EINVAL`, so the repeated-frame regression now relies on the already-bounded read timeout and remains portable.
 
 ## Decision
 

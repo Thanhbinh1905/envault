@@ -12,8 +12,11 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
+
+#[cfg(target_os = "linux")]
+use std::time::SystemTime;
 
 use envault_core::PrincipalKind;
 use envault_policy::{Action, ResourceSelector};
@@ -414,9 +417,6 @@ fn malformed_local_clients_fail_closed_without_crashing_daemon() {
         .expect("second request");
     let response = read_response(&mut repeated);
     assert_eq!(response.request_id, first_request.request_id);
-    repeated
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .expect("repeat timeout");
     let mut extra = [0; 1];
     match repeated.read(&mut extra) {
         Ok(0) => {}
@@ -733,6 +733,7 @@ fn process_disk_bytes(pid: u32) -> Option<(u64, u64)> {
     Some((value("read_bytes:"), value("write_bytes:")))
 }
 
+#[cfg(target_os = "linux")]
 fn persistent_metadata(root: &Path) -> Vec<(PathBuf, u64, Option<SystemTime>)> {
     let mut pending = vec![root.to_path_buf()];
     let mut snapshot = Vec::new();
