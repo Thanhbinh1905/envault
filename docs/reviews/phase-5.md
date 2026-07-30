@@ -104,6 +104,7 @@ Portability timeouts now describe an ambiguous atomic outcome and require re-pre
 Package verification no longer resolves coordinated unpublished crates against an older registry version.
 The executable package now carries its synchronized command contract so packaged tests and local workspace tests evaluate the same source of truth.
 CLI help no longer advertises unsupported conflict strategies and documents credentials, identity files, plan hashes, explicit commit, recipients, destinations, and plaintext acknowledgement.
+Plan-hash arguments accept the full Base64URL alphabet, including valid hashes whose first character is `-`, without being misparsed as a new option.
 
 ## Decision
 

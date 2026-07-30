@@ -447,6 +447,7 @@ struct ProfilePackageImportArgs {
         long,
         value_name = "HASH",
         requires = "commit",
+        allow_hyphen_values = true,
         help = "Exact plan hash returned by the latest preview"
     )]
     plan_hash: Option<String>,
@@ -481,6 +482,7 @@ struct WorkspacePackageImportArgs {
         long,
         value_name = "HASH",
         requires = "commit",
+        allow_hyphen_values = true,
         help = "Exact plan hash returned by the latest preview"
     )]
     plan_hash: Option<String>,
@@ -520,6 +522,7 @@ struct EnvImportArgs {
         long,
         value_name = "HASH",
         requires = "commit",
+        allow_hyphen_values = true,
         help = "Exact plan hash returned by the latest preview"
     )]
     plan_hash: Option<String>,
@@ -2538,6 +2541,19 @@ mod tests {
                 "rename",
             ])
             .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "envault",
+                "profile",
+                "import-env",
+                "base",
+                ".env",
+                "--commit",
+                "--plan-hash",
+                "-X_base64url-plan-hash",
+            ])
+            .is_ok()
         );
     }
 
