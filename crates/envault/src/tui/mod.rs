@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEventKind};
 
-pub use app::{App, DaemonClient, RealClient, Screen};
+pub use app::{App, DaemonClient, InputKind, Mode, PendingAction, RealClient, Screen};
 pub use terminal::TerminalGuard;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);

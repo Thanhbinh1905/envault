@@ -1,11 +1,11 @@
 use envault_protocol::ServiceState;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use super::app::{App, DaemonClient, Screen};
+use super::app::{App, DaemonClient, Mode, Screen};
 
 pub fn draw<C: DaemonClient>(frame: &mut Frame, app: &App<C>) {
     let area = frame.area();
@@ -18,7 +18,7 @@ pub fn draw<C: DaemonClient>(frame: &mut Frame, app: &App<C>) {
         ])
         .split(area);
 
-    draw_tabs(frame, chunks[0], app.screen());
+    draw_tabs(frame, chunks[0], app);
     match app.screen() {
         Screen::Dashboard => draw_dashboard(frame, chunks[1], app),
         Screen::Profiles => draw_profiles(frame, chunks[1], app),
@@ -26,9 +26,47 @@ pub fn draw<C: DaemonClient>(frame: &mut Frame, app: &App<C>) {
         Screen::Versions => draw_versions(frame, chunks[1], app),
     }
     draw_status_line(frame, chunks[2], app);
+
+    match app.mode() {
+        Mode::Normal => {}
+        Mode::PasswordInput(buffer) => {
+            draw_modal(
+                frame,
+                area,
+                "Admin unlock",
+                &format!(
+                    "Master password: {}\n\nEnter to submit, Esc to cancel.",
+                    "*".repeat(buffer.len())
+                ),
+            );
+        }
+        Mode::TextInput(kind, buffer) => {
+            draw_modal(
+                frame,
+                area,
+                "Input",
+                &format!(
+                    "{}\n{buffer}\n\nEnter to continue, Esc to cancel.",
+                    kind.prompt()
+                ),
+            );
+        }
+        Mode::Confirm(action) => {
+            draw_modal(
+                frame,
+                area,
+                "Confirm",
+                &format!(
+                    "{}?\n\ny/Enter to confirm, n/Esc to cancel.",
+                    action.describe()
+                ),
+            );
+        }
+    }
 }
 
-fn draw_tabs(frame: &mut Frame, area: Rect, screen: Screen) {
+fn draw_tabs<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>) {
+    let screen = app.screen();
     let label = |name: &str, current: bool| {
         if current {
             format!("[{name}]")
@@ -36,14 +74,59 @@ fn draw_tabs(frame: &mut Frame, area: Rect, screen: Screen) {
             format!(" {name} ")
         }
     };
+    let admin_hint = if app.admin_lease_active() {
+        match screen {
+            Screen::Profiles => "  admin: c/n/x/a, L:lock",
+            Screen::Secrets => "  admin: c/e/n/x/g, L:lock",
+            _ => "  admin: L:lock",
+        }
+    } else {
+        "  u:unlock admin"
+    };
     let line = Line::from(format!(
-        "{}{}{}{}  (d/p/s, arrows, enter, esc, r, q)",
+        "{}{}{}{}  (d/p/s, arrows, enter, esc, r, q){admin_hint}",
         label("Dashboard", screen == Screen::Dashboard),
         label("Profiles", screen == Screen::Profiles),
         label("Secrets", screen == Screen::Secrets),
         label("Versions", screen == Screen::Versions),
     ));
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Renders a centered overlay for password entry, a text-input wizard step,
+/// or a confirmation prompt. Used only for these three modal interactions;
+/// the read surface never uses a modal.
+fn draw_modal(frame: &mut Frame, area: Rect, title: &str, body: &str) {
+    let popup = centered_rect(60, 30, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string());
+    frame.render_widget(
+        Paragraph::new(body.to_string())
+            .block(block)
+            .alignment(Alignment::Left),
+        popup,
+    );
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
 }
 
 fn draw_dashboard<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>) {
