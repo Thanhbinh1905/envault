@@ -18,7 +18,7 @@ The CLI and terminal UI remain IPC-only clients with no direct storage or crypto
 ## Terminal application structure
 
 `envault-tui` is a new `[[bin]]` target in the existing `envault` crate, replacing the placeholder in `src/bin/envault-tui.rs`.
-The binary depends on `ratatui` for layout and widgets and `crossterm` for the terminal backend, both added as new workspace dependencies pinned to exact versions.
+The binary depends on `ratatui` for layout and widgets and `crossterm` for the terminal backend, both added as new workspace dependencies using the same caret-range version convention every other workspace dependency already uses.
 The terminal UI reuses `envault::client` for every daemon call, so socket discovery, CBOR framing, the one-megabyte frame cap, and the portability response deadline are identical to the CLI's behavior.
 The daemon IPC client is a synchronous blocking call over a Unix socket, matching the existing `envault::client` used by the CLI, so the terminal UI issues each request inline on the input loop rather than spawning an async runtime; daemon round trips are local and fast enough that this does not visibly stall input handling.
 Raw mode and the alternate screen are entered only after the terminal is confirmed interactive and are unconditionally restored on every exit path, including panics, through a panic hook installed before raw mode begins and a guard type whose `Drop` restores the terminal.
