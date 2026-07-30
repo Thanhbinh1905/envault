@@ -30,12 +30,18 @@ const DAEMON_TRANSITION_INTERVAL: Duration = Duration::from_millis(100);
 const IPC_RESPONSE_TIMEOUT: Duration =
     Duration::from_secs(envault_protocol::DEFAULT_REQUEST_TIMEOUT_SECONDS + 1);
 
+#[cfg(unix)]
+const PORTABILITY_RESPONSE_TIMEOUT: Duration =
+    Duration::from_secs(envault_protocol::PORTABILITY_REQUEST_TIMEOUT_SECONDS + 1);
+
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("EnVault daemon is not running")]
     NotRunning,
     #[error("EnVault daemon did not respond before the deadline")]
     Timeout,
+    #[error("EnVault portability operation did not respond before the deadline")]
+    PortabilityTimeout,
     #[error("EnVault IPC protocol failed")]
     Protocol,
     #[error("EnVault daemon returned an error")]
@@ -103,7 +109,12 @@ pub fn request_at(
 
     let mut stream = UnixStream::connect(path).map_err(|_| ClientError::NotRunning)?;
     authenticate_server(path, &stream)?;
-    let timeout = Some(IPC_RESPONSE_TIMEOUT);
+    let is_portability = operation.is_portability();
+    let timeout = Some(if is_portability {
+        PORTABILITY_RESPONSE_TIMEOUT
+    } else {
+        IPC_RESPONSE_TIMEOUT
+    });
     stream
         .set_read_timeout(timeout)
         .map_err(|_| ClientError::Protocol)?;
@@ -120,9 +131,16 @@ pub fn request_at(
         },
     };
     write_sync_frame(&mut stream, &request).map_err(|_| ClientError::Protocol)?;
-    let response: Response<Reply> = read_sync_frame(&mut stream).map_err(|error| match error {
-        ProtocolError::DeadlineExceeded => ClientError::Timeout,
-        _ => ClientError::Protocol,
+    let response: Response<Reply> = read_sync_frame(&mut stream).map_err(|error| {
+        if matches!(error, ProtocolError::DeadlineExceeded) {
+            if is_portability {
+                ClientError::PortabilityTimeout
+            } else {
+                ClientError::Timeout
+            }
+        } else {
+            ClientError::Protocol
+        }
     })?;
     validate_version(response.version).map_err(|_| ClientError::Protocol)?;
     if response.request_id != request_id {

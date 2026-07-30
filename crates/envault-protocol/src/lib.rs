@@ -4,8 +4,10 @@ use std::{fmt, io::Write};
 
 pub use envault_broker::{HttpConstraint, HttpContentType, HttpMethod, HttpRequest, HttpResponse};
 use envault_core::{
-    ApprovalId, GeneratorSpec, GrantId, PrincipalId, PrincipalKind, PrincipalView, ProfileView,
-    SecretId, SecretVersionView, SecretView, VaultId,
+    ApprovalId, EnvImportPreview, GeneratorSpec, GrantId, ImportConflictStrategy, PackageKind,
+    PlaintextExportSummary, PortabilityExportSummary, PortabilityImportSummary, PortabilityPreview,
+    PrincipalId, PrincipalKind, PrincipalView, ProfileView, SecretId, SecretVersionView,
+    SecretView, VaultId,
 };
 use envault_policy::{Action, Effect, ResourceSelector, Rule};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -16,6 +18,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 5;
+pub const PORTABILITY_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Request<T> {
@@ -195,6 +198,46 @@ pub enum Operation {
         secret_id: SecretId,
         request: HttpRequest,
     },
+    ExportPackage {
+        kind: PackageKind,
+        profile_name: Option<String>,
+        output_path: String,
+        transfer_password: Option<SensitiveBytes>,
+        age_recipients: Vec<String>,
+    },
+    PreviewPackageImport {
+        expected_kind: PackageKind,
+        input_path: String,
+        transfer_password: Option<SensitiveBytes>,
+        age_identity_path: Option<String>,
+        strategy: ImportConflictStrategy,
+        rename_to: Option<String>,
+    },
+    CommitPackageImport {
+        expected_kind: PackageKind,
+        input_path: String,
+        transfer_password: Option<SensitiveBytes>,
+        age_identity_path: Option<String>,
+        strategy: ImportConflictStrategy,
+        rename_to: Option<String>,
+        expected_plan_hash: String,
+    },
+    PreviewEnvImport {
+        profile_name: String,
+        input_path: String,
+        strategy: ImportConflictStrategy,
+    },
+    CommitEnvImport {
+        profile_name: String,
+        input_path: String,
+        strategy: ImportConflictStrategy,
+        expected_plan_hash: String,
+    },
+    ExportPlaintextEnv {
+        profile_name: String,
+        output_path: String,
+        allow_plaintext: bool,
+    },
 }
 
 impl Operation {
@@ -206,6 +249,18 @@ impl Operation {
                 | Self::AgentSessionStatus
                 | Self::DiscoverSecrets
                 | Self::HttpRequest { .. }
+        )
+    }
+
+    pub const fn is_portability(&self) -> bool {
+        matches!(
+            self,
+            Self::ExportPackage { .. }
+                | Self::PreviewPackageImport { .. }
+                | Self::CommitPackageImport { .. }
+                | Self::PreviewEnvImport { .. }
+                | Self::CommitEnvImport { .. }
+                | Self::ExportPlaintextEnv { .. }
         )
     }
 }
@@ -277,6 +332,11 @@ pub enum Reply {
     SecretVersion(SecretVersionView),
     SecretVersions(Vec<SecretVersionView>),
     HttpResponse(HttpResponse),
+    PortabilityExport(PortabilityExportSummary),
+    PortabilityPreview(PortabilityPreview),
+    PortabilityImport(PortabilityImportSummary),
+    EnvImportPreview(EnvImportPreview),
+    PlaintextExport(PlaintextExportSummary),
     Acknowledged,
 }
 
@@ -374,7 +434,12 @@ pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, ProtocolErro
     if payload.len() != length {
         return Err(ProtocolError::InvalidLength);
     }
-    ciborium::from_reader(payload).map_err(|_| ProtocolError::Decode)
+    let mut cursor = std::io::Cursor::new(payload);
+    let decoded = ciborium::from_reader(&mut cursor).map_err(|_| ProtocolError::Decode)?;
+    if usize::try_from(cursor.position()).ok() != Some(payload.len()) {
+        return Err(ProtocolError::Decode);
+    }
+    Ok(decoded)
 }
 
 #[cfg(test)]
@@ -396,6 +461,22 @@ mod tests {
             decode_frame::<Request<AuthenticatedRequest>>(&frame).expect("decode"),
             request
         );
+    }
+
+    #[test]
+    fn frame_decoder_rejects_trailing_cbor_data_inside_the_declared_length() {
+        let mut payload = Vec::new();
+        ciborium::into_writer(&42_u8, &mut payload).expect("encode");
+        payload.push(0);
+        let mut frame = u32::try_from(payload.len())
+            .expect("bounded payload")
+            .to_be_bytes()
+            .to_vec();
+        frame.extend_from_slice(&payload);
+        assert!(matches!(
+            decode_frame::<u8>(&frame),
+            Err(ProtocolError::Decode)
+        ));
     }
 
     #[test]

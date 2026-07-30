@@ -80,6 +80,10 @@ fn profile_rename_preserves_identity_and_startup_invariant() {
     );
     assert_eq!(updated.generation, 3);
     session.activate_profile("engineering").expect("activate");
+    assert!(matches!(
+        session.delete_profile("base"),
+        Err(ServiceError::Conflict)
+    ));
     let profiles = session.profiles().expect("profiles");
     assert_eq!(
         profiles
@@ -441,6 +445,28 @@ fn nested_scope_cycles_fail_unlock_closed() {
             rusqlite::params![project.id.0.as_bytes(), workspace.id.0.as_bytes()],
         )
         .expect("create cycle");
+    drop(connection);
+    assert!(matches!(
+        VaultSession::unlock(&path, &password),
+        Err(ServiceError::Corrupt)
+    ));
+}
+
+#[test]
+fn profile_scope_rebinding_fails_unlock_closed() {
+    let (_directory, path, password, mut session) = initialized();
+    let profile = session.create_profile("protected", None).expect("profile");
+    let workspace = session
+        .create_scope(session.root_scope_id(), ScopeKind::Workspace, "workspace")
+        .expect("workspace");
+    drop(session);
+    let connection = rusqlite::Connection::open(&path).expect("open database");
+    connection
+        .execute(
+            "UPDATE profile SET scope_id = ?1 WHERE id = ?2",
+            rusqlite::params![workspace.id.0.as_bytes(), profile.id.0.as_bytes()],
+        )
+        .expect("rebind profile");
     drop(connection);
     assert!(matches!(
         VaultSession::unlock(&path, &password),

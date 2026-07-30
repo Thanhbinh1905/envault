@@ -23,6 +23,7 @@ homepage = "https://github.com/Thanhbinh1905/envault"
 authors = ["Thanhbinh1905"]
 
 [workspace.dependencies]
+age = { version = "0.12.1", default-features = false }
 anyhow = "1.0"
 argon2 = "0.5"
 base64 = "0.22"
@@ -38,6 +39,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "0.40", features = ["backup", "bundled"] }
 rpassword = "7.4"
+rustix = { version = "1.1", features = ["fs"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.20"

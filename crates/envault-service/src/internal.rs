@@ -237,7 +237,12 @@ pub(super) fn encode_cbor<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Ser
 }
 
 pub(super) fn decode_cbor<T: serde::de::DeserializeOwned>(value: &[u8]) -> Result<T, ServiceError> {
-    ciborium::from_reader(value).map_err(|_| ServiceError::Serialization)
+    let mut cursor = std::io::Cursor::new(value);
+    let decoded = ciborium::from_reader(&mut cursor).map_err(|_| ServiceError::Serialization)?;
+    if usize::try_from(cursor.position()).ok() != Some(value.len()) {
+        return Err(ServiceError::Serialization);
+    }
+    Ok(decoded)
 }
 
 pub(super) fn unix_seconds() -> Result<i64, ServiceError> {

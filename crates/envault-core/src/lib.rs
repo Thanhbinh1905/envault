@@ -15,6 +15,12 @@ pub const MAX_NAME_BYTES: usize = 128;
 pub const MIN_STRONG_GENERATED_CHARS: usize = 22;
 pub const MAX_GENERATED_SIZE: usize = 4096;
 pub const MAX_SCOPE_DEPTH: usize = 64;
+pub const MAX_PORTABILITY_PACKAGE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_PORTABILITY_ENTITIES: usize = 100_000;
+pub const MAX_PORTABILITY_KEY_SLOTS: usize = 32;
+pub const MAX_ENV_FILE_BYTES: usize = 1024 * 1024;
+pub const MAX_ENV_LINE_BYTES: usize = 64 * 1024;
+pub const MAX_SECRET_VALUE_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct VaultId(pub Uuid);
@@ -67,6 +73,33 @@ pub enum ScopeKind {
 pub enum SecretStatus {
     Active,
     Tombstone,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageKind {
+    Profile,
+    Workspace,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportConflictStrategy {
+    Abort,
+    Skip,
+    Replace,
+    Rename,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportAction {
+    Create,
+    AppendVersion,
+    Replace,
+    Rename,
+    Skip,
+    Reject,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -174,6 +207,80 @@ pub struct SecretVersionView {
     pub generator: Option<GeneratorFormat>,
     pub generated_length: Option<usize>,
     pub entropy_bits: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PortabilityCounts {
+    pub scopes: u64,
+    pub profiles: u64,
+    pub secrets: u64,
+    pub versions: u64,
+    pub principals: u64,
+    pub policy_rules: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImportConflictView {
+    pub resource: String,
+    pub name: String,
+    pub action: ImportAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PortabilityPreview {
+    pub package_id: Option<Uuid>,
+    pub kind: Option<PackageKind>,
+    pub source_vault_id: Option<VaultId>,
+    pub destination_profile: Option<String>,
+    pub strategy: ImportConflictStrategy,
+    pub counts: PortabilityCounts,
+    pub conflicts: Vec<ImportConflictView>,
+    pub plan_hash: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PortabilityExportSummary {
+    pub package_id: Uuid,
+    pub kind: PackageKind,
+    pub output_path: String,
+    pub counts: PortabilityCounts,
+    pub password_slots: u32,
+    pub age_slots: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PortabilityImportSummary {
+    pub package_id: Option<Uuid>,
+    pub kind: Option<PackageKind>,
+    pub counts: PortabilityCounts,
+    pub created: u64,
+    pub replaced: u64,
+    pub skipped: u64,
+    pub versions_appended: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EnvImportEntryView {
+    pub name: String,
+    pub value_bytes: u64,
+    pub action: ImportAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EnvImportPreview {
+    pub profile: String,
+    pub entries: Vec<EnvImportEntryView>,
+    pub strategy: ImportConflictStrategy,
+    pub plan_hash: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlaintextExportSummary {
+    pub profile: String,
+    pub output_path: String,
+    pub secret_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

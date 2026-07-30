@@ -23,7 +23,10 @@ CLI and TUI code must access secrets through application services and IPC, never
 
 ```sh
 cargo xtask verify
+cargo xtask package-verify
 ```
+
+Run `cargo xtask sync-contract` after intentionally changing the canonical `commands.toml`, then rerun both verification commands.
 
 The pinned toolchain is Rust 1.97.1 with Rust Edition 2024.
 
@@ -61,7 +64,58 @@ target/debug/envault start
 Automation may use `start --password-stdin` with the same safe input constraints as initialization.
 Use `envault status`, `envault lock`, and `envault stop` for explicit lifecycle control.
 Use `envault admin unlock --minutes 5`, `envault admin status`, and `envault admin lock` for the bounded admin lease.
-Profile, secret, agent-context, and broker workflows remain fail-closed until their later phases are complete.
+Profile, versioned secret, policy-filtered agent discovery, capability inspection, and constrained HTTP broker workflows run only through daemon IPC.
+
+## Encrypted portability
+
+Export a profile with a masked transfer password:
+
+```sh
+target/debug/envault profile export base \
+  --output-file ./base.envault-profile \
+  --transfer-password
+```
+
+Use one or more public age X25519 recipients instead of, or in addition to, the transfer password:
+
+```sh
+target/debug/envault workspace export \
+  --output-file ./workspace.envault-workspace \
+  --age-recipient "$AGE_RECIPIENT"
+```
+
+Imports are preview-first and never commit without the exact returned plan hash:
+
+```sh
+target/debug/envault workspace import ./workspace.envault-workspace \
+  --transfer-password
+
+target/debug/envault workspace import ./workspace.envault-workspace \
+  --transfer-password \
+  --strategy abort \
+  --commit \
+  --plan-hash PLAN_HASH_FROM_PREVIEW
+```
+
+Transfer passwords are accepted only from a masked terminal or piped standard input.
+Age identity files and plaintext `.env` input files must be stable private files on Unix.
+Encrypted package files and plaintext export files are created without replacement at mode `0600` on Unix.
+
+Preview and atomically import a private `.env` file into one profile:
+
+```sh
+target/debug/envault profile import-env base ./.env --strategy abort
+```
+
+Plaintext export is a human-only recovery escape hatch that requires an active admin lease, an explicit acknowledgement, and a new destination path:
+
+```sh
+target/debug/envault profile export-env base \
+  --output-file ./recovery.env \
+  --allow-plaintext
+```
+
+Never commit plaintext exports or transfer passwords to a repository or shell history.
 
 ## License
 

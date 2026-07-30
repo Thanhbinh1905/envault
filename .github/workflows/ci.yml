@@ -28,6 +28,7 @@ jobs:
       - run: cargo test --workspace --doc
       - run: cargo deny check
       - run: cargo audit
+      - run: cargo xtask package-verify
 
   build:
     name: Build (${{ matrix.os }})
@@ -53,4 +54,3 @@ jobs:
         with:
           toolchain: 1.97.1
       - run: cargo check --workspace --all-targets
-

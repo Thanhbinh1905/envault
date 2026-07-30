@@ -33,6 +33,10 @@ impl SecretKey {
         Self(bytes)
     }
 
+    pub fn copy_bytes(&self) -> SecretBytes {
+        SecretBytes::copy_from_slice(&self.0)
+    }
+
     fn expose(&self) -> &[u8; KEY_BYTES] {
         &self.0
     }

@@ -99,6 +99,57 @@ pub struct PolicyRuleRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ImportReset {
+    None,
+    Workspace {
+        root_scope_id: ScopeId,
+        base_profile_id: ProfileId,
+    },
+    Profile {
+        retained_scope_id: ScopeId,
+        removed_scope_ids: Vec<ScopeId>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretVersionAppend {
+    pub secret_id: SecretId,
+    pub expected_current_version: u64,
+    pub version: SecretVersionRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportBatch {
+    pub reset: ImportReset,
+    pub scope_updates: Vec<ScopeRecord>,
+    pub profile_updates: Vec<ProfileRecord>,
+    pub scopes: Vec<ScopeRecord>,
+    pub profiles: Vec<ProfileRecord>,
+    pub secrets: Vec<SecretRecord>,
+    pub secret_versions: Vec<SecretVersionRecord>,
+    pub version_appends: Vec<SecretVersionAppend>,
+    pub principals: Vec<PrincipalRecord>,
+    pub policy_rules: Vec<PolicyRuleRecord>,
+}
+
+impl Default for ImportBatch {
+    fn default() -> Self {
+        Self {
+            reset: ImportReset::None,
+            scope_updates: Vec::new(),
+            profile_updates: Vec::new(),
+            scopes: Vec::new(),
+            profiles: Vec::new(),
+            secrets: Vec::new(),
+            secret_versions: Vec::new(),
+            version_appends: Vec::new(),
+            principals: Vec::new(),
+            policy_rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuditEventDraft {
     pub id: AuditEventId,
     pub action: u8,
@@ -683,6 +734,60 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub fn apply_import_batch(&mut self, batch: &ImportBatch) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        apply_import_reset(&transaction, &batch.reset)?;
+        for scope in &batch.scope_updates {
+            update_scope(&transaction, scope)?;
+        }
+        for profile in &batch.profile_updates {
+            update_profile(&transaction, profile)?;
+        }
+        for scope in &batch.scopes {
+            insert_scope(&transaction, scope)?;
+        }
+        for profile in &batch.profiles {
+            insert_profile(&transaction, profile)?;
+        }
+        for secret in &batch.secrets {
+            insert_secret(&transaction, secret)?;
+        }
+        for version in &batch.secret_versions {
+            insert_secret_version(&transaction, version)?;
+        }
+        for append in &batch.version_appends {
+            if append.version.secret_id != append.secret_id
+                || append.expected_current_version.checked_add(1) != Some(append.version.version)
+            {
+                return Err(StoreError::Integrity);
+            }
+            let changed = transaction.execute(
+                "UPDATE secret SET current_version = ?1
+                 WHERE id = ?2 AND current_version = ?3 AND status = 0",
+                params![
+                    to_i64(append.version.version)?,
+                    id_bytes(append.secret_id.0),
+                    to_i64(append.expected_current_version)?,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::Integrity);
+            }
+            insert_secret_version(&transaction, &append.version)?;
+        }
+        for principal in &batch.principals {
+            insert_principal(&transaction, principal)?;
+        }
+        for rule in &batch.policy_rules {
+            insert_policy_rule(&transaction, rule)?;
+        }
+        validate_import_transaction(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn append_audit<EventHash, StateMac>(
         &mut self,
         draft: &AuditEventDraft,
@@ -1221,6 +1326,204 @@ fn insert_secret_version(
     Ok(())
 }
 
+fn apply_import_reset(
+    transaction: &Transaction<'_>,
+    reset: &ImportReset,
+) -> Result<(), StoreError> {
+    match reset {
+        ImportReset::None => Ok(()),
+        ImportReset::Workspace {
+            root_scope_id,
+            base_profile_id,
+        } => {
+            transaction.execute("DELETE FROM policy_rule", [])?;
+            transaction.execute("DELETE FROM principal", [])?;
+            transaction.execute("DELETE FROM secret_version", [])?;
+            transaction.execute("DELETE FROM secret", [])?;
+            transaction.execute(
+                "DELETE FROM profile WHERE id != ?1",
+                params![id_bytes(base_profile_id.0)],
+            )?;
+            transaction.execute(
+                "DELETE FROM scope WHERE id != ?1",
+                params![id_bytes(root_scope_id.0)],
+            )?;
+            Ok(())
+        }
+        ImportReset::Profile {
+            retained_scope_id,
+            removed_scope_ids,
+        } => {
+            for scope_id in removed_scope_ids.iter().rev() {
+                if scope_id == retained_scope_id {
+                    continue;
+                }
+                transaction.execute(
+                    "DELETE FROM secret_version
+                     WHERE secret_id IN (SELECT id FROM secret WHERE scope_id = ?1)",
+                    params![id_bytes(scope_id.0)],
+                )?;
+                transaction.execute(
+                    "DELETE FROM secret WHERE scope_id = ?1",
+                    params![id_bytes(scope_id.0)],
+                )?;
+                transaction.execute(
+                    "DELETE FROM scope WHERE id = ?1",
+                    params![id_bytes(scope_id.0)],
+                )?;
+            }
+            transaction.execute(
+                "DELETE FROM secret_version
+                 WHERE secret_id IN (SELECT id FROM secret WHERE scope_id = ?1)",
+                params![id_bytes(retained_scope_id.0)],
+            )?;
+            transaction.execute(
+                "DELETE FROM secret WHERE scope_id = ?1",
+                params![id_bytes(retained_scope_id.0)],
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn validate_import_transaction(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    let foreign_key_violation: Option<i64> = transaction
+        .query_row(
+            "SELECT 1 FROM pragma_foreign_key_check LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if foreign_key_violation.is_some() {
+        return Err(StoreError::Integrity);
+    }
+    let startup_profiles: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM profile WHERE activate_on_start = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if startup_profiles != 1 {
+        return Err(StoreError::Integrity);
+    }
+    let invalid_secret: Option<i64> = transaction
+        .query_row(
+            "SELECT 1
+             FROM secret
+             WHERE (status = 0 AND current_version !=
+                       (SELECT COUNT(*) FROM secret_version WHERE secret_id = secret.id))
+                OR (status = 1 AND EXISTS
+                       (SELECT 1 FROM secret_version WHERE secret_id = secret.id))
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if invalid_secret.is_some() {
+        return Err(StoreError::Integrity);
+    }
+    let invalid_policy_resource: Option<i64> = transaction
+        .query_row(
+            "SELECT 1
+             FROM policy_rule
+             WHERE (resource_kind = 0 AND NOT EXISTS
+                       (SELECT 1 FROM vault WHERE vault.id = policy_rule.resource_id))
+                OR (resource_kind = 1 AND NOT EXISTS
+                       (SELECT 1 FROM scope WHERE scope.id = policy_rule.resource_id))
+                OR (resource_kind = 2 AND NOT EXISTS
+                       (SELECT 1 FROM secret WHERE secret.id = policy_rule.resource_id))
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if invalid_policy_resource.is_some() {
+        return Err(StoreError::Integrity);
+    }
+    Ok(())
+}
+
+fn update_scope(transaction: &Transaction<'_>, record: &ScopeRecord) -> Result<(), StoreError> {
+    let changed = transaction.execute(
+        "UPDATE scope
+         SET vault_id = ?1, parent_id = ?2, kind = ?3, encrypted_path = ?4, path_lookup = ?5
+         WHERE id = ?6",
+        params![
+            id_bytes(record.vault_id.0),
+            record.parent_id.map(|id| id_bytes(id.0)),
+            i64::from(record.kind),
+            record.encrypted_path,
+            record.path_lookup,
+            id_bytes(record.id.0),
+        ],
+    )?;
+    expect_single_change(changed)
+}
+
+fn update_profile(transaction: &Transaction<'_>, record: &ProfileRecord) -> Result<(), StoreError> {
+    let changed = transaction.execute(
+        "UPDATE profile
+         SET vault_id = ?1, scope_id = ?2, encrypted_name = ?3, name_lookup = ?4,
+             encrypted_description = ?5, activate_on_start = ?6, generation = ?7
+         WHERE id = ?8",
+        params![
+            id_bytes(record.vault_id.0),
+            id_bytes(record.scope_id.0),
+            record.encrypted_name,
+            record.name_lookup,
+            record.encrypted_description,
+            record.activate_on_start,
+            to_i64(record.generation)?,
+            id_bytes(record.id.0),
+        ],
+    )?;
+    expect_single_change(changed)
+}
+
+fn insert_principal(
+    transaction: &Transaction<'_>,
+    record: &PrincipalRecord,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO principal
+         (id, vault_id, kind, encrypted_name, name_lookup, disabled, generation)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id_bytes(record.id.0),
+            id_bytes(record.vault_id.0),
+            i64::from(record.kind),
+            record.encrypted_name,
+            record.name_lookup,
+            record.disabled,
+            to_i64(record.generation)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_policy_rule(
+    transaction: &Transaction<'_>,
+    record: &PolicyRuleRecord,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO policy_rule
+         (id, vault_id, principal_id, effect, action, resource_kind, resource_id,
+          disabled, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id_bytes(record.id.0),
+            id_bytes(record.vault_id.0),
+            id_bytes(record.principal_id.0),
+            i64::from(record.effect),
+            i64::from(record.action),
+            i64::from(record.resource_kind),
+            record.resource_id,
+            record.disabled,
+            record.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
 fn map_vault(row: &rusqlite::Row<'_>) -> rusqlite::Result<VaultRecord> {
     Ok(VaultRecord {
         id: VaultId(read_id(row, 0)?),
@@ -1595,6 +1898,93 @@ mod tests {
                 .expect("version"),
             3
         );
+    }
+
+    #[test]
+    fn portability_batch_rolls_back_every_record_on_late_failure() {
+        let (vault, scope, profile) = fixture();
+        let mut store = Store::open_in_memory().expect("store");
+        store
+            .initialize(&vault, &scope, &profile)
+            .expect("initialize");
+        let secret_id = SecretId(Uuid::new_v4());
+        let batch = ImportBatch {
+            secrets: vec![SecretRecord {
+                id: secret_id,
+                scope_id: scope.id,
+                encrypted_name: vec![1],
+                name_lookup: vec![2; 32],
+                encrypted_description: None,
+                current_version: 1,
+                status: 0,
+            }],
+            secret_versions: vec![SecretVersionRecord {
+                id: SecretVersionId(Uuid::new_v4()),
+                secret_id,
+                version: 1,
+                ciphertext: vec![3; 64],
+                wrapped_dek: vec![4; 72],
+                aad_digest: vec![5; 32],
+                generator: None,
+                generated_length: None,
+                entropy_bits: None,
+                created_at: 1,
+            }],
+            policy_rules: vec![PolicyRuleRecord {
+                id: PolicyRuleId(Uuid::new_v4()),
+                vault_id: vault.id,
+                principal_id: PrincipalId(Uuid::new_v4()),
+                effect: 0,
+                action: 0,
+                resource_kind: 0,
+                resource_id: vault.id.0.as_bytes().to_vec(),
+                disabled: false,
+                created_at: 1,
+            }],
+            ..ImportBatch::default()
+        };
+        assert!(store.apply_import_batch(&batch).is_err());
+        assert!(store.secrets().expect("rolled back").is_empty());
+        assert!(store.policy_rules().expect("rolled back").is_empty());
+    }
+
+    #[test]
+    fn portability_batch_rejects_orphaned_policy_resources_atomically() {
+        let (vault, scope, profile) = fixture();
+        let mut store = Store::open_in_memory().expect("store");
+        store
+            .initialize(&vault, &scope, &profile)
+            .expect("initialize");
+        let principal = PrincipalRecord {
+            id: PrincipalId(Uuid::new_v4()),
+            vault_id: vault.id,
+            kind: 1,
+            encrypted_name: vec![1],
+            name_lookup: vec![2; 32],
+            disabled: false,
+            generation: 1,
+        };
+        let batch = ImportBatch {
+            principals: vec![principal.clone()],
+            policy_rules: vec![PolicyRuleRecord {
+                id: PolicyRuleId(Uuid::new_v4()),
+                vault_id: vault.id,
+                principal_id: principal.id,
+                effect: 0,
+                action: 0,
+                resource_kind: 2,
+                resource_id: Uuid::new_v4().as_bytes().to_vec(),
+                disabled: false,
+                created_at: 1,
+            }],
+            ..ImportBatch::default()
+        };
+        assert!(matches!(
+            store.apply_import_batch(&batch),
+            Err(StoreError::Integrity)
+        ));
+        assert!(store.principals().expect("rolled back").is_empty());
+        assert!(store.policy_rules().expect("rolled back").is_empty());
     }
 
     #[test]
