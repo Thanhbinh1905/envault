@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeSet, env, fs, path::Path, process::Command};
+use std::{
+    collections::BTreeSet,
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -25,12 +30,85 @@ fn main() -> Result<()> {
     let task = env::args().nth(1).unwrap_or_else(|| "help".to_owned());
     match task.as_str() {
         "contract" => verify_contract(),
+        "package-verify" => verify_packages(),
+        "sync-contract" => sync_contract(),
         "verify" => verify(),
         _ => {
-            println!("xtask commands: contract, verify");
+            println!("xtask commands: contract, package-verify, sync-contract, verify");
             Ok(())
         }
     }
+}
+
+fn verify_packages() -> Result<()> {
+    const PACKAGES: &[&str] = &[
+        "envault-core",
+        "envault-platform",
+        "envault-policy",
+        "envault-broker",
+        "envault-protocol",
+        "envault-crypto",
+        "envault-store",
+        "envault-service",
+        "envault",
+    ];
+
+    verify_contract()?;
+    run(
+        "cargo",
+        &["package", "--workspace", "--allow-dirty", "--no-verify"],
+    )?;
+    let version = env!("CARGO_PKG_VERSION");
+    let verification_root = PathBuf::from("target/package-verification");
+    if verification_root.exists() {
+        fs::remove_dir_all(&verification_root).context("clear package verification directory")?;
+    }
+    fs::create_dir_all(&verification_root).context("create package verification directory")?;
+    for package in PACKAGES {
+        let archive = format!("target/package/{package}-{version}.crate");
+        run(
+            "tar",
+            &[
+                "-xzf",
+                &archive,
+                "-C",
+                verification_root
+                    .to_str()
+                    .context("package verification path is not UTF-8")?,
+            ],
+        )?;
+    }
+    let members = PACKAGES
+        .iter()
+        .map(|package| format!("  \"{package}-{version}\","))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let patches = PACKAGES
+        .iter()
+        .map(|package| format!("{package} = {{ path = \"{package}-{version}\" }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        verification_root.join("Cargo.toml"),
+        format!(
+            "[workspace]\nmembers = [\n{members}\n]\nresolver = \"3\"\n\n[patch.crates-io]\n{patches}\n"
+        ),
+    )
+    .context("write package verification workspace")?;
+    run_in(
+        &verification_root,
+        "cargo",
+        &["test", "--workspace", "--all-targets", "--no-run"],
+    )?;
+    println!("packaged crate tarballs compile together with local registry patches");
+    Ok(())
+}
+
+fn sync_contract() -> Result<()> {
+    fs::copy("commands.toml", "crates/envault/commands.toml")
+        .context("synchronize packaged command contract")?;
+    println!("packaged command contract synchronized");
+    Ok(())
 }
 
 fn verify() -> Result<()> {
@@ -54,6 +132,11 @@ fn verify() -> Result<()> {
 
 fn verify_contract() -> Result<()> {
     let source = fs::read_to_string("commands.toml").context("read commands.toml")?;
+    let packaged_contract = fs::read_to_string("crates/envault/commands.toml")
+        .context("read packaged command contract")?;
+    if packaged_contract != source {
+        bail!("packaged command contract has drifted; copy commands.toml into crates/envault");
+    }
     let contract: Contract = toml::from_str(&source).context("parse commands.toml")?;
     if contract.schema_version != 1 {
         bail!("unsupported command contract schema");
@@ -128,6 +211,7 @@ fn verify_contract() -> Result<()> {
         "docs/adr/0008-deterministic-scope-policy.md",
         "docs/adr/0009-daemon-runtime-state.md",
         "docs/adr/0010-agent-context-and-http-broker.md",
+        "docs/adr/0011-portability-import-plans.md",
     ] {
         if !Path::new(path).is_file() {
             bail!("required architecture document is missing: {path}");
@@ -183,7 +267,18 @@ fn validate_command_contract(
 }
 
 fn run(program: &str, arguments: &[&str]) -> Result<()> {
-    let status = Command::new(program)
+    let mut command = Command::new(program);
+    run_command(&mut command, program, arguments)
+}
+
+fn run_in(directory: &Path, program: &str, arguments: &[&str]) -> Result<()> {
+    let mut command = Command::new(program);
+    command.current_dir(directory);
+    run_command(&mut command, program, arguments)
+}
+
+fn run_command(command: &mut Command, program: &str, arguments: &[&str]) -> Result<()> {
+    let status = command
         .args(arguments)
         .status()
         .with_context(|| format!("run {program}"))?;

@@ -16,8 +16,9 @@ use envault_protocol::{
     Response, ResponseBody, SensitiveBytes, ServiceState, StructuredError, validate_version,
 };
 use envault_service::{
-    BrokerFailure, CapabilityTokenKey, SensitiveInput, ServiceError, VaultSession,
-    classify_broker_failure, execute_agent_http_request, normalize_agent_http_constraint,
+    BrokerFailure, CapabilityTokenKey, PackageImportOptions, SensitiveInput, ServiceError,
+    VaultSession, classify_broker_failure, execute_agent_http_request,
+    normalize_agent_http_constraint,
 };
 use thiserror::Error;
 use tokio::{
@@ -41,11 +42,13 @@ const ERROR_RESPONSE_GRACE: Duration = Duration::from_millis(250);
 #[derive(Clone, Copy)]
 struct ConnectionTiming {
     request_timeout: Duration,
+    portability_timeout: Duration,
     error_response_grace: Duration,
 }
 
 const CONNECTION_TIMING: ConnectionTiming = ConnectionTiming {
     request_timeout: Duration::from_secs(envault_protocol::DEFAULT_REQUEST_TIMEOUT_SECONDS),
+    portability_timeout: Duration::from_secs(envault_protocol::PORTABILITY_REQUEST_TIMEOUT_SECONDS),
     error_response_grace: ERROR_RESPONSE_GRACE,
 };
 
@@ -629,6 +632,11 @@ enum RuntimeFailure {
     InvalidTtl,
     InvalidGrant,
     InvalidInput,
+    Io,
+    PackageError,
+    PackageAuthenticationFailed,
+    StaleImportPlan,
+    PlaintextAcknowledgementRequired,
     Conflict,
     NotFound,
     RequestRejected,
@@ -639,6 +647,7 @@ enum RuntimeFailure {
     Busy,
     Corrupt,
     DeadlineExceeded,
+    PortabilityDeadlineExceeded,
     InvalidRequest,
     ProtocolMismatch,
     Internal,
@@ -669,7 +678,7 @@ impl Server {
         drop(sensitive);
         remove_stale_socket(&config.socket_path)?;
         let listener = UnixListener::bind(&config.socket_path)?;
-        envault_platform::set_private_file_permissions(&config.socket_path)?;
+        envault_platform::set_private_socket_permissions(&config.socket_path)?;
         let socket_guard = SocketGuard::new(config.socket_path.clone())?;
         let owner_uid = std::fs::metadata(&config.runtime_directory)?.uid();
         let state = RuntimeState::new(vault, config.database_path.clone())
@@ -818,33 +827,47 @@ async fn handle_connection_with_timing(
     authentication: Arc<Semaphore>,
     timing: ConnectionTiming,
 ) {
-    let deadline = tokio::time::Instant::now() + timing.request_timeout;
-    let mut observed_request_id = None;
-    let processed = tokio::time::timeout_at(
-        deadline,
-        process_request(
-            &mut stream,
-            peer,
-            &state,
-            &authentication,
-            &mut observed_request_id,
-        ),
-    )
-    .await;
-    let (response, stop, write_deadline) = match processed {
-        Ok(Ok((response, stop))) => (response, stop, deadline),
-        Ok(Err((request_id, failure))) => (error_response(request_id, failure), false, deadline),
-        Err(_) => {
-            let grace = tokio::time::Instant::now() + timing.error_response_grace;
-            (
-                error_response(
-                    observed_request_id.unwrap_or_else(Uuid::new_v4),
-                    RuntimeFailure::DeadlineExceeded,
-                ),
-                false,
-                grace,
+    let read_deadline = tokio::time::Instant::now() + timing.request_timeout;
+    let request = tokio::time::timeout_at(read_deadline, read_async_frame(&mut stream)).await;
+    let (response, stop, write_deadline) = match request {
+        Ok(Ok(request)) => {
+            let request: Request<AuthenticatedRequest> = request;
+            let request_id = request.request_id;
+            let is_portability = request.body.operation.is_portability();
+            let operation_deadline = if is_portability {
+                tokio::time::Instant::now() + timing.portability_timeout
+            } else {
+                read_deadline
+            };
+            match tokio::time::timeout_at(
+                operation_deadline,
+                process_decoded_request(request, peer, &state, &authentication),
             )
+            .await
+            {
+                Ok(Ok((response, stop))) => (response, stop, operation_deadline),
+                Ok(Err((request_id, failure))) => (
+                    error_response(request_id, failure),
+                    false,
+                    operation_deadline,
+                ),
+                Err(_) => (
+                    error_response(request_id, deadline_failure(is_portability)),
+                    false,
+                    tokio::time::Instant::now() + timing.error_response_grace,
+                ),
+            }
         }
+        Ok(Err(_)) => (
+            error_response(Uuid::new_v4(), RuntimeFailure::InvalidRequest),
+            false,
+            read_deadline,
+        ),
+        Err(_) => (
+            error_response(Uuid::new_v4(), RuntimeFailure::DeadlineExceeded),
+            false,
+            tokio::time::Instant::now() + timing.error_response_grace,
+        ),
     };
     let _ =
         tokio::time::timeout_at(write_deadline, write_async_frame(&mut stream, &response)).await;
@@ -853,18 +876,21 @@ async fn handle_connection_with_timing(
     }
 }
 
-async fn process_request(
-    stream: &mut UnixStream,
+const fn deadline_failure(is_portability: bool) -> RuntimeFailure {
+    if is_portability {
+        RuntimeFailure::PortabilityDeadlineExceeded
+    } else {
+        RuntimeFailure::DeadlineExceeded
+    }
+}
+
+async fn process_decoded_request(
+    request: Request<AuthenticatedRequest>,
     peer: PeerIdentity,
     state: &Arc<Mutex<RuntimeState>>,
     authentication: &Arc<Semaphore>,
-    observed_request_id: &mut Option<Uuid>,
 ) -> Result<(Response<Reply>, bool), (Uuid, RuntimeFailure)> {
-    let request: Request<AuthenticatedRequest> = read_async_frame(stream)
-        .await
-        .map_err(|_| (Uuid::new_v4(), RuntimeFailure::InvalidRequest))?;
     let request_id = request.request_id;
-    *observed_request_id = Some(request_id);
     validate_version(request.version)
         .map_err(|_| (request_id, RuntimeFailure::ProtocolMismatch))?;
     if request.body.capability_token.is_some() && !request.body.operation.accepts_agent_capability()
@@ -874,8 +900,8 @@ async fn process_request(
     if let Operation::AdminUnlock { ttl_minutes, .. } = &request.body.operation {
         validate_admin_lease(*ttl_minutes).map_err(|_| (request_id, RuntimeFailure::InvalidTtl))?;
         state
-            .lock()
-            .map_err(|_| (request_id, RuntimeFailure::Internal))?
+            .try_lock()
+            .map_err(|_| (request_id, RuntimeFailure::Busy))?
             .check_authentication_rate(peer)
             .map_err(|failure| (request_id, failure))?;
     }
@@ -896,8 +922,8 @@ async fn process_request(
         .map(|status| (Reply::AdminStatus(status), false)),
         Operation::HttpRequest { secret_id, request } => {
             let prepared = state
-                .lock()
-                .map_err(|_| (request_id, RuntimeFailure::Internal))?
+                .try_lock()
+                .map_err(|_| (request_id, RuntimeFailure::Busy))?
                 .prepare_http_request(capability_token.as_ref(), secret_id, request, request_id)
                 .map_err(|failure| (request_id, failure))?;
             execute_agent_http_request(prepared)
@@ -905,9 +931,20 @@ async fn process_request(
                 .map(|response| (Reply::HttpResponse(response), false))
                 .map_err(map_broker_failure)
         }
-        operation => state
-            .lock()
+        operation if operation.is_portability() => {
+            let state = Arc::clone(state);
+            tokio::task::spawn_blocking(move || {
+                state
+                    .try_lock()
+                    .map_err(|_| RuntimeFailure::Busy)?
+                    .handle(peer, operation, None, request_id)
+            })
+            .await
             .map_err(|_| (request_id, RuntimeFailure::Internal))?
+        }
+        operation => state
+            .try_lock()
+            .map_err(|_| (request_id, RuntimeFailure::Busy))?
             .handle(peer, operation, capability_token.as_ref(), request_id),
     };
     let (reply, stop) = result.map_err(|failure| (request_id, failure))?;
@@ -1004,6 +1041,12 @@ impl RuntimeState {
             | Operation::SetSecretValue { .. }
             | Operation::GenerateSecretValue { .. }
             | Operation::ListSecretVersions { .. }) => self.handle_secret(peer, operation),
+            operation @ (Operation::ExportPackage { .. }
+            | Operation::PreviewPackageImport { .. }
+            | Operation::CommitPackageImport { .. }
+            | Operation::PreviewEnvImport { .. }
+            | Operation::CommitEnvImport { .. }
+            | Operation::ExportPlaintextEnv { .. }) => self.handle_portability(peer, operation),
             Operation::DiscoverSecrets => Ok((
                 Reply::Secrets(self.discover_secrets(token, request_id)?),
                 false,
@@ -1217,6 +1260,159 @@ impl RuntimeState {
         };
         Ok((reply, false))
     }
+
+    fn handle_portability(
+        &mut self,
+        peer: PeerIdentity,
+        operation: Operation,
+    ) -> Result<(Reply, bool), RuntimeFailure> {
+        self.require_admin(peer)?;
+        let revoke_capabilities = revokes_capabilities_after_success(&operation);
+        let vault = self.vault.as_mut().ok_or(RuntimeFailure::Locked)?;
+        let reply = match operation {
+            Operation::ExportPackage { .. }
+            | Operation::PreviewPackageImport { .. }
+            | Operation::CommitPackageImport { .. } => {
+                Self::handle_package_operation(vault, operation)?
+            }
+            Operation::PreviewEnvImport { .. }
+            | Operation::CommitEnvImport { .. }
+            | Operation::ExportPlaintextEnv { .. } => {
+                Self::handle_env_portability_operation(vault, operation)?
+            }
+            _ => return Err(RuntimeFailure::Internal),
+        };
+        if revoke_capabilities {
+            self.capabilities.clear();
+        }
+        Ok((reply, false))
+    }
+
+    fn handle_package_operation(
+        vault: &mut VaultSession,
+        operation: Operation,
+    ) -> Result<Reply, RuntimeFailure> {
+        match operation {
+            Operation::ExportPackage {
+                kind,
+                profile_name,
+                output_path,
+                transfer_password,
+                age_recipients,
+            } => {
+                let transfer_password =
+                    transfer_password.map(|password| SensitiveInput::new(password.into_vec()));
+                Ok(Reply::PortabilityExport(
+                    vault
+                        .export_package(
+                            kind,
+                            profile_name.as_deref(),
+                            Path::new(&output_path),
+                            transfer_password.as_ref(),
+                            &age_recipients,
+                        )
+                        .map_err(|error| map_service_failure(&error))?,
+                ))
+            }
+            Operation::PreviewPackageImport {
+                expected_kind,
+                input_path,
+                transfer_password,
+                age_identity_path,
+                strategy,
+                rename_to,
+            } => {
+                let transfer_password =
+                    transfer_password.map(|password| SensitiveInput::new(password.into_vec()));
+                Ok(Reply::PortabilityPreview(
+                    vault
+                        .preview_package_import_for_kind(PackageImportOptions {
+                            expected_kind,
+                            input_path: Path::new(&input_path),
+                            transfer_password: transfer_password.as_ref(),
+                            age_identity_path: age_identity_path.as_deref().map(Path::new),
+                            strategy,
+                            rename_to: rename_to.as_deref(),
+                        })
+                        .map_err(|error| map_service_failure(&error))?,
+                ))
+            }
+            Operation::CommitPackageImport {
+                expected_kind,
+                input_path,
+                transfer_password,
+                age_identity_path,
+                strategy,
+                rename_to,
+                expected_plan_hash,
+            } => {
+                let transfer_password =
+                    transfer_password.map(|password| SensitiveInput::new(password.into_vec()));
+                Ok(Reply::PortabilityImport(
+                    vault
+                        .commit_package_import_for_kind(
+                            PackageImportOptions {
+                                expected_kind,
+                                input_path: Path::new(&input_path),
+                                transfer_password: transfer_password.as_ref(),
+                                age_identity_path: age_identity_path.as_deref().map(Path::new),
+                                strategy,
+                                rename_to: rename_to.as_deref(),
+                            },
+                            &expected_plan_hash,
+                        )
+                        .map_err(|error| map_service_failure(&error))?,
+                ))
+            }
+            _ => Err(RuntimeFailure::Internal),
+        }
+    }
+
+    fn handle_env_portability_operation(
+        vault: &mut VaultSession,
+        operation: Operation,
+    ) -> Result<Reply, RuntimeFailure> {
+        match operation {
+            Operation::PreviewEnvImport {
+                profile_name,
+                input_path,
+                strategy,
+            } => Ok(Reply::EnvImportPreview(
+                vault
+                    .preview_env_import(&profile_name, Path::new(&input_path), strategy)
+                    .map_err(|error| map_service_failure(&error))?,
+            )),
+            Operation::CommitEnvImport {
+                profile_name,
+                input_path,
+                strategy,
+                expected_plan_hash,
+            } => Ok(Reply::PortabilityImport(
+                vault
+                    .commit_env_import(
+                        &profile_name,
+                        Path::new(&input_path),
+                        strategy,
+                        &expected_plan_hash,
+                    )
+                    .map_err(|error| map_service_failure(&error))?,
+            )),
+            Operation::ExportPlaintextEnv {
+                profile_name,
+                output_path,
+                allow_plaintext,
+            } => Ok(Reply::PlaintextExport(
+                vault
+                    .export_plaintext_env(&profile_name, Path::new(&output_path), allow_plaintext)
+                    .map_err(|error| map_service_failure(&error))?,
+            )),
+            _ => Err(RuntimeFailure::Internal),
+        }
+    }
+}
+
+const fn revokes_capabilities_after_success(operation: &Operation) -> bool {
+    matches!(operation, Operation::CommitPackageImport { .. })
 }
 
 async fn authenticate_admin(
@@ -1228,7 +1424,7 @@ async fn authenticate_admin(
 ) -> Result<AdminLeaseStatus, RuntimeFailure> {
     validate_admin_lease(ttl_minutes).map_err(|_| RuntimeFailure::InvalidTtl)?;
     let database_path = {
-        let state = state.lock().map_err(|_| RuntimeFailure::Internal)?;
+        let state = state.try_lock().map_err(|_| RuntimeFailure::Busy)?;
         if state.vault.is_none() {
             return Err(RuntimeFailure::Locked);
         }
@@ -1250,8 +1446,8 @@ async fn authenticate_admin(
     .map_err(|error| map_service_failure(&error))?;
     drop(authenticated);
     state
-        .lock()
-        .map_err(|_| RuntimeFailure::Internal)?
+        .try_lock()
+        .map_err(|_| RuntimeFailure::Busy)?
         .issue_admin_lease(peer, ttl_minutes)
 }
 
@@ -1278,6 +1474,18 @@ fn map_service_failure(error: &ServiceError) -> RuntimeFailure {
         ServiceError::Invariant(_) | ServiceError::InvalidPasswordLength => {
             RuntimeFailure::InvalidInput
         }
+        ServiceError::InvalidPackage | ServiceError::UnsupportedPackageVersion => {
+            RuntimeFailure::PackageError
+        }
+        ServiceError::PackageAuthenticationFailed => RuntimeFailure::PackageAuthenticationFailed,
+        ServiceError::InvalidImportStrategy
+        | ServiceError::InvalidEnvFile { .. }
+        | ServiceError::PlaintextExportUnsupported => RuntimeFailure::InvalidInput,
+        ServiceError::StaleImportPlan => RuntimeFailure::StaleImportPlan,
+        ServiceError::PlaintextAcknowledgementRequired => {
+            RuntimeFailure::PlaintextAcknowledgementRequired
+        }
+        ServiceError::Io(_) | ServiceError::Platform(_) => RuntimeFailure::Io,
         ServiceError::Broker(error) => map_broker_failure(classify_broker_failure(error)),
         _ => RuntimeFailure::Internal,
     }
@@ -1357,6 +1565,17 @@ fn failure_details(failure: RuntimeFailure) -> FailureDetails {
             "Correct the bounded command arguments",
             false,
         ),
+        RuntimeFailure::Io => (
+            "io_error",
+            "the trusted local filesystem operation failed",
+            "Check the path, permissions, free space, and file stability",
+            true,
+        ),
+        failure @ (RuntimeFailure::PackageError
+        | RuntimeFailure::PackageAuthenticationFailed
+        | RuntimeFailure::StaleImportPlan
+        | RuntimeFailure::PlaintextAcknowledgementRequired
+        | RuntimeFailure::PortabilityDeadlineExceeded) => portability_failure_details(failure),
         RuntimeFailure::Conflict => (
             "conflict",
             "the requested mutation conflicts with existing vault state",
@@ -1395,6 +1614,47 @@ fn failure_details(failure: RuntimeFailure) -> FailureDetails {
             false,
         ),
         RuntimeFailure::Internal => (
+            "internal_error",
+            "EnVault daemon could not complete the request",
+            "Retry and inspect redacted diagnostics",
+            true,
+        ),
+    }
+}
+
+fn portability_failure_details(failure: RuntimeFailure) -> FailureDetails {
+    match failure {
+        RuntimeFailure::PackageError => (
+            "package_error",
+            "the encrypted portability package is invalid or unsupported",
+            "Verify the package source, suffix, version, and integrity",
+            false,
+        ),
+        RuntimeFailure::PackageAuthenticationFailed => (
+            "package_authentication_failed",
+            "the portability package could not be authenticated",
+            "Retry with the correct transfer password or age identity",
+            false,
+        ),
+        RuntimeFailure::StaleImportPlan => (
+            "stale_import_plan",
+            "the import source or destination changed after preview",
+            "Preview again and commit the new exact plan hash",
+            true,
+        ),
+        RuntimeFailure::PlaintextAcknowledgementRequired => (
+            "plaintext_acknowledgement_required",
+            "plaintext export requires explicit acknowledgement",
+            "Pass --allow-plaintext only from a trusted terminal",
+            false,
+        ),
+        RuntimeFailure::PortabilityDeadlineExceeded => (
+            "request_timeout",
+            "the portability request exceeded its deadline",
+            "Preview current state before retrying because an atomic commit may have completed",
+            false,
+        ),
+        _ => (
             "internal_error",
             "EnVault daemon could not complete the request",
             "Retry and inspect redacted diagnostics",
@@ -1558,6 +1818,7 @@ async fn shutdown_signal() -> Result<(), io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use envault_core::{ImportConflictStrategy, PackageKind};
 
     fn peer() -> PeerIdentity {
         PeerIdentity {
@@ -1688,6 +1949,7 @@ mod tests {
             Arc::new(Semaphore::new(0)),
             ConnectionTiming {
                 request_timeout: Duration::from_millis(100),
+                portability_timeout: Duration::from_secs(1),
                 error_response_grace: Duration::from_secs(1),
             },
         ));
@@ -1714,6 +1976,52 @@ mod tests {
         };
         assert_eq!(error.code, "request_timeout");
         task.await.expect("connection task");
+    }
+
+    #[test]
+    fn portability_deadline_requires_a_fresh_preview_before_retry() {
+        let error = structured_error(
+            Uuid::new_v4(),
+            deadline_failure(
+                Operation::PreviewPackageImport {
+                    expected_kind: PackageKind::Profile,
+                    input_path: "/tmp/package.envault-profile".into(),
+                    transfer_password: None,
+                    age_identity_path: None,
+                    strategy: ImportConflictStrategy::Abort,
+                    rename_to: None,
+                }
+                .is_portability(),
+            ),
+        );
+        assert_eq!(error.code, "request_timeout");
+        assert!(!error.retryable);
+        assert!(error.help[0].contains("Preview current state"));
+    }
+
+    #[test]
+    fn package_commit_is_an_agent_capability_revocation_boundary() {
+        assert!(revokes_capabilities_after_success(
+            &Operation::CommitPackageImport {
+                expected_kind: PackageKind::Workspace,
+                input_path: "/tmp/workspace.envault-workspace".into(),
+                transfer_password: None,
+                age_identity_path: None,
+                strategy: ImportConflictStrategy::Replace,
+                rename_to: None,
+                expected_plan_hash: "plan".into(),
+            }
+        ));
+        assert!(!revokes_capabilities_after_success(
+            &Operation::PreviewPackageImport {
+                expected_kind: PackageKind::Workspace,
+                input_path: "/tmp/workspace.envault-workspace".into(),
+                transfer_password: None,
+                age_identity_path: None,
+                strategy: ImportConflictStrategy::Replace,
+                rename_to: None,
+            }
+        ));
     }
 
     #[test]

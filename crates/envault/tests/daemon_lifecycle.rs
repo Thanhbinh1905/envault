@@ -28,6 +28,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 const PASSWORD: &[u8] = b"daemon-e2e-sentinel-password";
+const TRANSFER_PASSWORD: &[u8] = b"daemon-e2e-transfer-password";
 
 struct DaemonFixture {
     directory: tempfile::TempDir,
@@ -178,6 +179,158 @@ fn concurrent_start_commands_converge_on_one_unlocked_daemon() {
         fixture.json(&["--output", "json", "status"])["pid"],
         first_status["pid"]
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn phase_five_cli_round_trips_workspace_and_env_without_plaintext_output() {
+    let source = DaemonFixture::initialize_and_start();
+    let destination = DaemonFixture::initialize_and_start();
+    for fixture in [&source, &destination] {
+        assert_success(&fixture.run(
+            &["--output", "json", "admin", "unlock", "--password-stdin"],
+            Some(PASSWORD),
+        ));
+    }
+    let sentinel = b"phase5-cli-secret-sentinel";
+    assert_success(&source.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "PHASE5_TOKEN",
+            "--stdin",
+        ],
+        Some(sentinel),
+    ));
+    let package = source.directory.path().join("transfer.envault-workspace");
+    let package_text = package.to_string_lossy().into_owned();
+    let exported = source.run(
+        &[
+            "--output",
+            "json",
+            "workspace",
+            "export",
+            "--output-file",
+            &package_text,
+            "--transfer-password-stdin",
+        ],
+        Some(TRANSFER_PASSWORD),
+    );
+    assert_success(&exported);
+    assert_no_bytes(&exported.stdout, sentinel);
+    assert_no_bytes(&exported.stdout, TRANSFER_PASSWORD);
+    assert_no_bytes(&exported.stderr, sentinel);
+    assert_no_bytes(&fs::read(&package).expect("package"), sentinel);
+    assert_eq!(mode(&package), 0o600);
+
+    let preview = destination.run(
+        &[
+            "--output",
+            "json",
+            "workspace",
+            "import",
+            &package_text,
+            "--transfer-password-stdin",
+            "--strategy",
+            "abort",
+        ],
+        Some(TRANSFER_PASSWORD),
+    );
+    assert_success(&preview);
+    assert_no_bytes(&preview.stdout, sentinel);
+    let preview: Value = serde_json::from_slice(&preview.stdout).expect("preview");
+    let plan_hash = preview["plan_hash"].as_str().expect("plan hash");
+    let committed = destination.run(
+        &[
+            "--output",
+            "json",
+            "workspace",
+            "import",
+            &package_text,
+            "--transfer-password-stdin",
+            "--strategy",
+            "abort",
+            "--commit",
+            "--plan-hash",
+            plan_hash,
+        ],
+        Some(TRANSFER_PASSWORD),
+    );
+    assert_success(&committed);
+    assert_no_bytes(&committed.stdout, sentinel);
+    assert_no_bytes(&committed.stderr, sentinel);
+
+    let env_input = destination.directory.path().join("guided.env");
+    write_private_fixture(&env_input, b"GUIDED_TOKEN=guided-import-sentinel\n");
+    let env_input_text = env_input.to_string_lossy().into_owned();
+    let env_preview = destination.run(
+        &[
+            "--output",
+            "json",
+            "profile",
+            "import-env",
+            "base",
+            &env_input_text,
+            "--strategy",
+            "abort",
+        ],
+        None,
+    );
+    assert_success(&env_preview);
+    assert_no_bytes(&env_preview.stdout, b"guided-import-sentinel");
+    let env_preview: Value = serde_json::from_slice(&env_preview.stdout).expect("env preview");
+    let env_plan_hash = env_preview["plan_hash"].as_str().expect("env plan hash");
+    assert_success(&destination.run(
+        &[
+            "--output",
+            "json",
+            "profile",
+            "import-env",
+            "base",
+            &env_input_text,
+            "--strategy",
+            "abort",
+            "--commit",
+            "--plan-hash",
+            env_plan_hash,
+        ],
+        None,
+    ));
+
+    let plaintext = destination.directory.path().join("recovery.env");
+    let plaintext_text = plaintext.to_string_lossy().into_owned();
+    let plaintext_output = destination.run(
+        &[
+            "--output",
+            "json",
+            "profile",
+            "export-env",
+            "base",
+            "--output-file",
+            &plaintext_text,
+            "--allow-plaintext",
+        ],
+        None,
+    );
+    assert_success(&plaintext_output);
+    assert_no_bytes(&plaintext_output.stdout, sentinel);
+    assert_no_bytes(&plaintext_output.stdout, b"guided-import-sentinel");
+    let plaintext_bytes = fs::read(&plaintext).expect("plaintext export");
+    assert!(
+        plaintext_bytes
+            .windows(sentinel.len())
+            .any(|window| window == sentinel)
+    );
+    assert!(
+        plaintext_bytes
+            .windows(b"guided-import-sentinel".len())
+            .any(|window| window == b"guided-import-sentinel")
+    );
+    assert_eq!(mode(&plaintext), 0o600);
+    assert_tree_has_no_bytes(&destination.data_home, sentinel);
+    assert_tree_has_no_bytes(&destination.data_home, b"guided-import-sentinel");
 }
 
 #[test]
@@ -858,6 +1011,12 @@ fn assert_remote_code(result: Result<Reply, envault::client::ClientError>, expec
 
 fn mode(path: &Path) -> u32 {
     fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+}
+
+fn write_private_fixture(path: &Path, bytes: &[u8]) {
+    let mut file = envault_platform::create_private_file(path).expect("private fixture");
+    file.write_all(bytes).expect("write fixture");
+    file.sync_all().expect("sync fixture");
 }
 
 fn assert_no_bytes(haystack: &[u8], needle: &[u8]) {

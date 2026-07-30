@@ -11,8 +11,9 @@ use base64::Engine as _;
 use clap::{Parser, Subcommand, ValueEnum};
 use envault::client::{self, ClientError};
 use envault_core::{
-    GeneratorFormat, GeneratorLength, GeneratorSpec, PrincipalKind, ProfileView, SecretVersionView,
-    SecretView,
+    EnvImportPreview, GeneratorFormat, GeneratorLength, GeneratorSpec, ImportConflictStrategy,
+    PackageKind, PlaintextExportSummary, PortabilityExportSummary, PortabilityImportSummary,
+    PortabilityPreview, PrincipalKind, ProfileView, SecretVersionView, SecretView,
 };
 use envault_policy::{Action, Effect, ResourceSelector};
 use envault_protocol::{
@@ -72,7 +73,10 @@ enum Command {
         #[command(subcommand)]
         command: RequestCommand,
     },
-    Workspace,
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
 }
 
 #[derive(Clone, Copy, Debug, clap::Args)]
@@ -128,6 +132,16 @@ enum ProfileCommand {
     Rename(RenameArgs),
     Delete(NameArgs),
     Activate(NameArgs),
+    Export(ProfileExportArgs),
+    Import(ProfilePackageImportArgs),
+    ImportEnv(EnvImportArgs),
+    ExportEnv(PlaintextExportArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCommand {
+    Export(WorkspaceExportArgs),
+    Import(WorkspacePackageImportArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -347,6 +361,208 @@ struct HttpRequestArgs {
     content_type: Option<HttpContentTypeArg>,
 }
 
+#[derive(Clone, Copy, Debug, Default, clap::Args)]
+struct TransferPasswordArgs {
+    #[arg(
+        long,
+        conflicts_with = "transfer_password_stdin",
+        help = "Prompt for a transfer password on a masked terminal"
+    )]
+    transfer_password: bool,
+    #[arg(
+        long,
+        conflicts_with = "transfer_password",
+        help = "Read the transfer password from standard input"
+    )]
+    transfer_password_stdin: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct ProfileExportArgs {
+    #[arg(value_name = "PROFILE", help = "Profile to export")]
+    name: String,
+    #[arg(long, value_name = "FILE", help = "New .envault-profile package path")]
+    output_file: PathBuf,
+    #[command(flatten)]
+    password: TransferPasswordArgs,
+    #[arg(
+        long = "age-recipient",
+        value_name = "RECIPIENT",
+        help = "Add an age recipient key slot; repeat for multiple recipients"
+    )]
+    age_recipients: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct WorkspaceExportArgs {
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "New .envault-workspace package path"
+    )]
+    output_file: PathBuf,
+    #[command(flatten)]
+    password: TransferPasswordArgs,
+    #[arg(
+        long = "age-recipient",
+        value_name = "RECIPIENT",
+        help = "Add an age recipient key slot; repeat for multiple recipients"
+    )]
+    age_recipients: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct ProfilePackageImportArgs {
+    #[arg(value_name = "FILE", help = "Encrypted .envault-profile package")]
+    input_file: PathBuf,
+    #[command(flatten)]
+    password: TransferPasswordArgs,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Private age identity file used to unwrap a package key slot"
+    )]
+    age_identity: Option<PathBuf>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = ProfileConflictStrategyArg::Abort,
+        help = "Conflict strategy for the destination profile"
+    )]
+    strategy: ProfileConflictStrategyArg,
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        required_if_eq("strategy", "rename"),
+        help = "Destination profile for rename, or an existing renamed profile for replace"
+    )]
+    rename_to: Option<String>,
+    #[arg(
+        long,
+        requires = "plan_hash",
+        help = "Atomically apply a previously previewed import plan"
+    )]
+    commit: bool,
+    #[arg(
+        long,
+        value_name = "HASH",
+        requires = "commit",
+        help = "Exact plan hash returned by the latest preview"
+    )]
+    plan_hash: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct WorkspacePackageImportArgs {
+    #[arg(value_name = "FILE", help = "Encrypted .envault-workspace package")]
+    input_file: PathBuf,
+    #[command(flatten)]
+    password: TransferPasswordArgs,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Private age identity file used to unwrap a package key slot"
+    )]
+    age_identity: Option<PathBuf>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = WorkspaceConflictStrategyArg::Abort,
+        help = "Abort unless empty, or atomically replace the workspace"
+    )]
+    strategy: WorkspaceConflictStrategyArg,
+    #[arg(
+        long,
+        requires = "plan_hash",
+        help = "Atomically apply a previously previewed import plan"
+    )]
+    commit: bool,
+    #[arg(
+        long,
+        value_name = "HASH",
+        requires = "commit",
+        help = "Exact plan hash returned by the latest preview"
+    )]
+    plan_hash: Option<String>,
+}
+
+struct PackageImportRequest {
+    expected_kind: PackageKind,
+    input_file: PathBuf,
+    password: TransferPasswordArgs,
+    age_identity: Option<PathBuf>,
+    strategy: ImportConflictStrategy,
+    rename_to: Option<String>,
+    commit: bool,
+    plan_hash: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct EnvImportArgs {
+    #[arg(value_name = "PROFILE", help = "Destination profile")]
+    name: String,
+    #[arg(value_name = "FILE", help = "Plaintext .env file to scan and import")]
+    input_file: PathBuf,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = EnvConflictStrategyArg::Abort,
+        help = "Conflict strategy for existing secret names"
+    )]
+    strategy: EnvConflictStrategyArg,
+    #[arg(
+        long,
+        requires = "plan_hash",
+        help = "Atomically apply a previously previewed import plan"
+    )]
+    commit: bool,
+    #[arg(
+        long,
+        value_name = "HASH",
+        requires = "commit",
+        help = "Exact plan hash returned by the latest preview"
+    )]
+    plan_hash: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct PlaintextExportArgs {
+    #[arg(value_name = "PROFILE", help = "Profile to export")]
+    name: String,
+    #[arg(long, value_name = "FILE", help = "New plaintext .env destination")]
+    output_file: PathBuf,
+    #[arg(
+        long,
+        required = true,
+        help = "Acknowledge that the destination contains plaintext secrets"
+    )]
+    allow_plaintext: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum ProfileConflictStrategyArg {
+    #[default]
+    Abort,
+    Skip,
+    Replace,
+    Rename,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum WorkspaceConflictStrategyArg {
+    #[default]
+    Abort,
+    Replace,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum EnvConflictStrategyArg {
+    #[default]
+    Abort,
+    Skip,
+    Replace,
+}
+
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum HttpMethodArg {
     #[default]
@@ -392,7 +608,7 @@ fn main() -> ExitCode {
         Command::Request {
             command: RequestCommand::Http(arguments),
         } => http_request(cli.output, arguments),
-        Command::Workspace => phase_pending(cli.output, "workspace"),
+        Command::Workspace { command } => workspace_command(cli.output, command),
     }
 }
 
@@ -611,6 +827,28 @@ fn policy_command(output: Output, command: PolicyCommand) -> ExitCode {
 }
 
 fn profile_command(output: Output, command: ProfileCommand) -> ExitCode {
+    match command {
+        ProfileCommand::Export(arguments) => {
+            return export_package(
+                output,
+                PackageKind::Profile,
+                Some(arguments.name),
+                &arguments.output_file,
+                arguments.password,
+                arguments.age_recipients,
+            );
+        }
+        ProfileCommand::Import(arguments) => return import_profile_package(output, arguments),
+        ProfileCommand::ImportEnv(arguments) => return import_env(output, arguments),
+        ProfileCommand::ExportEnv(arguments) => return export_plaintext_env(output, arguments),
+        ProfileCommand::Create(_)
+        | ProfileCommand::Show(_)
+        | ProfileCommand::List
+        | ProfileCommand::Update(_)
+        | ProfileCommand::Rename(_)
+        | ProfileCommand::Delete(_)
+        | ProfileCommand::Activate(_) => {}
+    }
     let operation = match command {
         ProfileCommand::Create(arguments) => Operation::CreateProfile {
             name: arguments.name,
@@ -634,11 +872,202 @@ fn profile_command(output: Output, command: ProfileCommand) -> ExitCode {
         ProfileCommand::Activate(arguments) => Operation::ActivateProfile {
             name: arguments.name,
         },
+        ProfileCommand::Export(_)
+        | ProfileCommand::Import(_)
+        | ProfileCommand::ImportEnv(_)
+        | ProfileCommand::ExportEnv(_) => unreachable!("portability commands returned above"),
     };
     match client::request(operation) {
         Ok(Reply::Profile(profile)) => print_profiles(output, &[profile]),
         Ok(Reply::Profiles(profiles)) => print_profiles(output, &profiles),
         Ok(Reply::Acknowledged) => print_acknowledgement(output, "profile_deleted"),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn workspace_command(output: Output, command: WorkspaceCommand) -> ExitCode {
+    match command {
+        WorkspaceCommand::Export(arguments) => export_package(
+            output,
+            PackageKind::Workspace,
+            None,
+            &arguments.output_file,
+            arguments.password,
+            arguments.age_recipients,
+        ),
+        WorkspaceCommand::Import(arguments) => import_workspace_package(output, arguments),
+    }
+}
+
+fn export_package(
+    output: Output,
+    kind: PackageKind,
+    profile_name: Option<String>,
+    output_file: &Path,
+    password_arguments: TransferPasswordArgs,
+    age_recipients: Vec<String>,
+) -> ExitCode {
+    let transfer_password = match read_optional_transfer_password(password_arguments, true) {
+        Ok(password) => password,
+        Err(error) => return print_error(output, &error),
+    };
+    if transfer_password.is_none() && age_recipients.is_empty() {
+        return print_error(
+            output,
+            &input_error(
+                "package_credential_required",
+                "choose a transfer password or at least one age recipient",
+            ),
+        );
+    }
+    let output_path = match protocol_path(output_file) {
+        Ok(path) => path,
+        Err(error) => return print_error(output, &error),
+    };
+    match client::request(Operation::ExportPackage {
+        kind,
+        profile_name,
+        output_path,
+        transfer_password,
+        age_recipients,
+    }) {
+        Ok(Reply::PortabilityExport(summary)) => print_portability_export(output, &summary),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn import_profile_package(output: Output, arguments: ProfilePackageImportArgs) -> ExitCode {
+    import_package(
+        output,
+        PackageImportRequest {
+            expected_kind: PackageKind::Profile,
+            input_file: arguments.input_file,
+            password: arguments.password,
+            age_identity: arguments.age_identity,
+            strategy: import_profile_strategy(arguments.strategy),
+            rename_to: arguments.rename_to,
+            commit: arguments.commit,
+            plan_hash: arguments.plan_hash,
+        },
+    )
+}
+
+fn import_workspace_package(output: Output, arguments: WorkspacePackageImportArgs) -> ExitCode {
+    import_package(
+        output,
+        PackageImportRequest {
+            expected_kind: PackageKind::Workspace,
+            input_file: arguments.input_file,
+            password: arguments.password,
+            age_identity: arguments.age_identity,
+            strategy: import_workspace_strategy(arguments.strategy),
+            rename_to: None,
+            commit: arguments.commit,
+            plan_hash: arguments.plan_hash,
+        },
+    )
+}
+
+fn import_package(output: Output, request: PackageImportRequest) -> ExitCode {
+    let transfer_password = match read_optional_transfer_password(request.password, false) {
+        Ok(password) => password,
+        Err(error) => return print_error(output, &error),
+    };
+    if transfer_password.is_none() && request.age_identity.is_none() {
+        return print_error(
+            output,
+            &input_error(
+                "package_credential_required",
+                "choose a transfer password or an age identity file",
+            ),
+        );
+    }
+    let input_path = match protocol_path(&request.input_file) {
+        Ok(path) => path,
+        Err(error) => return print_error(output, &error),
+    };
+    let age_identity_path = match request
+        .age_identity
+        .as_deref()
+        .map(protocol_path)
+        .transpose()
+    {
+        Ok(path) => path,
+        Err(error) => return print_error(output, &error),
+    };
+    let operation = if request.commit {
+        Operation::CommitPackageImport {
+            expected_kind: request.expected_kind,
+            input_path,
+            transfer_password,
+            age_identity_path,
+            strategy: request.strategy,
+            rename_to: request.rename_to,
+            expected_plan_hash: request
+                .plan_hash
+                .expect("clap requires a plan hash for commit"),
+        }
+    } else {
+        Operation::PreviewPackageImport {
+            expected_kind: request.expected_kind,
+            input_path,
+            transfer_password,
+            age_identity_path,
+            strategy: request.strategy,
+            rename_to: request.rename_to,
+        }
+    };
+    match client::request(operation) {
+        Ok(Reply::PortabilityPreview(preview)) => print_portability_preview(output, &preview),
+        Ok(Reply::PortabilityImport(summary)) => print_portability_import(output, &summary),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn import_env(output: Output, arguments: EnvImportArgs) -> ExitCode {
+    let input_path = match protocol_path(&arguments.input_file) {
+        Ok(path) => path,
+        Err(error) => return print_error(output, &error),
+    };
+    let strategy = import_env_strategy(arguments.strategy);
+    let operation = if arguments.commit {
+        Operation::CommitEnvImport {
+            profile_name: arguments.name,
+            input_path,
+            strategy,
+            expected_plan_hash: arguments
+                .plan_hash
+                .expect("clap requires a plan hash for commit"),
+        }
+    } else {
+        Operation::PreviewEnvImport {
+            profile_name: arguments.name,
+            input_path,
+            strategy,
+        }
+    };
+    match client::request(operation) {
+        Ok(Reply::EnvImportPreview(preview)) => print_env_import_preview(output, &preview),
+        Ok(Reply::PortabilityImport(summary)) => print_portability_import(output, &summary),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn export_plaintext_env(output: Output, arguments: PlaintextExportArgs) -> ExitCode {
+    let output_path = match protocol_path(&arguments.output_file) {
+        Ok(path) => path,
+        Err(error) => return print_error(output, &error),
+    };
+    match client::request(Operation::ExportPlaintextEnv {
+        profile_name: arguments.name,
+        output_path,
+        allow_plaintext: arguments.allow_plaintext,
+    }) {
+        Ok(Reply::PlaintextExport(summary)) => print_plaintext_export(output, &summary),
         Ok(_) => print_error(output, &unexpected_response()),
         Err(error) => print_error(output, &client_error(error)),
     }
@@ -1089,6 +1518,107 @@ fn read_master_password(
     validate_password(password)
 }
 
+fn read_optional_transfer_password(
+    arguments: TransferPasswordArgs,
+    require_confirmation: bool,
+) -> Result<Option<SensitiveBytes>, StructuredError> {
+    if !arguments.transfer_password && !arguments.transfer_password_stdin {
+        return Ok(None);
+    }
+    let password = if arguments.transfer_password_stdin {
+        if io::stdin().is_terminal() {
+            return Err(input_error(
+                "transfer_password_stdin_requires_pipe",
+                "`--transfer-password-stdin` requires piped standard input",
+            ));
+        }
+        let mut bytes = Vec::new();
+        io::stdin()
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .map_err(|_| input_error("io_error", "failed to read the transfer password"))?;
+        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+            bytes.pop();
+        }
+        SensitiveBytes::new(bytes)
+    } else {
+        if !io::stdin().is_terminal() {
+            return Err(input_error(
+                "interactive_terminal_required",
+                "use `--transfer-password-stdin` when standard input is not a terminal",
+            ));
+        }
+        let password = SensitiveBytes::new(
+            rpassword::prompt_password("Transfer password: ")
+                .map_err(|_| input_error("io_error", "failed to read the transfer password"))?
+                .into_bytes(),
+        );
+        if require_confirmation {
+            let confirmation = SensitiveBytes::new(
+                rpassword::prompt_password("Confirm transfer password: ")
+                    .map_err(|_| {
+                        input_error("io_error", "failed to confirm the transfer password")
+                    })?
+                    .into_bytes(),
+            );
+            if !password.matches(&confirmation) {
+                return Err(input_error(
+                    "transfer_password_confirmation_mismatch",
+                    "transfer password confirmation does not match",
+                ));
+            }
+        }
+        password
+    };
+    if password.len() < 12 || password.len() > 4096 {
+        return Err(input_error(
+            "invalid_transfer_password_length",
+            "transfer password must contain between 12 and 4096 bytes",
+        ));
+    }
+    Ok(Some(password))
+}
+
+fn protocol_path(path: &Path) -> Result<String, StructuredError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| input_error("io_error", "unable to resolve the current directory"))?
+            .join(path)
+    };
+    absolute
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| input_error("invalid_path", "path must be valid UTF-8"))
+}
+
+const fn import_profile_strategy(strategy: ProfileConflictStrategyArg) -> ImportConflictStrategy {
+    match strategy {
+        ProfileConflictStrategyArg::Abort => ImportConflictStrategy::Abort,
+        ProfileConflictStrategyArg::Skip => ImportConflictStrategy::Skip,
+        ProfileConflictStrategyArg::Replace => ImportConflictStrategy::Replace,
+        ProfileConflictStrategyArg::Rename => ImportConflictStrategy::Rename,
+    }
+}
+
+const fn import_workspace_strategy(
+    strategy: WorkspaceConflictStrategyArg,
+) -> ImportConflictStrategy {
+    match strategy {
+        WorkspaceConflictStrategyArg::Abort => ImportConflictStrategy::Abort,
+        WorkspaceConflictStrategyArg::Replace => ImportConflictStrategy::Replace,
+    }
+}
+
+const fn import_env_strategy(strategy: EnvConflictStrategyArg) -> ImportConflictStrategy {
+    match strategy {
+        EnvConflictStrategyArg::Abort => ImportConflictStrategy::Abort,
+        EnvConflictStrategyArg::Skip => ImportConflictStrategy::Skip,
+        EnvConflictStrategyArg::Replace => ImportConflictStrategy::Replace,
+    }
+}
+
 fn validate_password(password: SensitiveBytes) -> Result<SensitiveBytes, StructuredError> {
     if password.len() < 12 || password.len() > 4096 {
         Err(input_error(
@@ -1104,6 +1634,161 @@ fn vault_database_path() -> Result<PathBuf, StructuredError> {
     envault_platform::data_directory()
         .map(|directory| directory.join("vault.db"))
         .map_err(|_| input_error("io_error", "unable to resolve the EnVault data directory"))
+}
+
+fn print_portability_export(output: Output, summary: &PortabilityExportSummary) -> ExitCode {
+    match output {
+        Output::Human => println!(
+            "package: exported · kind: {:?} · id: {} · profiles: {} · secrets: {} · versions: {} · path: {}",
+            summary.kind,
+            summary.package_id,
+            summary.counts.profiles,
+            summary.counts.secrets,
+            summary.counts.versions,
+            summary.output_path
+        ),
+        Output::Json => print_json(summary),
+        Output::Toon => println!(
+            "package{{status,kind,id,profiles,secrets,versions,password_slots,age_slots,path}}: exported,{:?},{},{},{},{},{},{},{}",
+            summary.kind,
+            summary.package_id,
+            summary.counts.profiles,
+            summary.counts.secrets,
+            summary.counts.versions,
+            summary.password_slots,
+            summary.age_slots,
+            toon_string(&summary.output_path)
+        ),
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_portability_preview(output: Output, preview: &PortabilityPreview) -> ExitCode {
+    match output {
+        Output::Human => {
+            println!(
+                "import: preview · kind: {:?} · profiles: {} · secrets: {} · versions: {} · strategy: {:?}",
+                preview.kind,
+                preview.counts.profiles,
+                preview.counts.secrets,
+                preview.counts.versions,
+                preview.strategy
+            );
+            for conflict in &preview.conflicts {
+                println!(
+                    "action: {:?} · resource: {} · name: {}",
+                    conflict.action, conflict.resource, conflict.name
+                );
+            }
+            println!("plan_hash: {}", preview.plan_hash);
+            println!(
+                "commit: repeat the command with `--commit --plan-hash {}`",
+                preview.plan_hash
+            );
+            for warning in &preview.warnings {
+                println!("warning: {warning}");
+            }
+        }
+        Output::Json => print_json(preview),
+        Output::Toon => {
+            println!(
+                "import{{status,kind,profiles,secrets,versions,strategy,plan_hash}}: preview,{:?},{},{},{},{:?},{}",
+                preview.kind,
+                preview.counts.profiles,
+                preview.counts.secrets,
+                preview.counts.versions,
+                preview.strategy,
+                preview.plan_hash
+            );
+            for conflict in &preview.conflicts {
+                println!(
+                    "conflict{{resource,name,action}}: {},{},{:?}",
+                    toon_string(&conflict.resource),
+                    toon_string(&conflict.name),
+                    conflict.action
+                );
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_env_import_preview(output: Output, preview: &EnvImportPreview) -> ExitCode {
+    match output {
+        Output::Human => {
+            println!(
+                "env import: preview · profile: {} · entries: {} · strategy: {:?}",
+                preview.profile,
+                preview.entries.len(),
+                preview.strategy
+            );
+            for entry in &preview.entries {
+                println!(
+                    "secret: {} · value: [REDACTED {} bytes] · action: {:?}",
+                    entry.name, entry.value_bytes, entry.action
+                );
+            }
+            println!("plan_hash: {}", preview.plan_hash);
+            println!(
+                "commit: repeat the command with `--commit --plan-hash {}`",
+                preview.plan_hash
+            );
+            for warning in &preview.warnings {
+                println!("warning: {warning}");
+            }
+        }
+        Output::Json => print_json(preview),
+        Output::Toon => {
+            println!(
+                "env_import{{status,profile,entries,strategy,plan_hash}}: preview,{},{},{:?},{}",
+                toon_string(&preview.profile),
+                preview.entries.len(),
+                preview.strategy,
+                preview.plan_hash
+            );
+            for entry in &preview.entries {
+                println!(
+                    "entry{{name,value_bytes,action}}: {},{},{:?}",
+                    toon_string(&entry.name),
+                    entry.value_bytes,
+                    entry.action
+                );
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_portability_import(output: Output, summary: &PortabilityImportSummary) -> ExitCode {
+    match output {
+        Output::Human => println!(
+            "import: committed · created: {} · replaced: {} · skipped: {} · versions appended: {}",
+            summary.created, summary.replaced, summary.skipped, summary.versions_appended
+        ),
+        Output::Json => print_json(summary),
+        Output::Toon => println!(
+            "import{{status,created,replaced,skipped,versions_appended}}: committed,{},{},{},{}",
+            summary.created, summary.replaced, summary.skipped, summary.versions_appended
+        ),
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_plaintext_export(output: Output, summary: &PlaintextExportSummary) -> ExitCode {
+    match output {
+        Output::Human => println!(
+            "plaintext export: written · profile: {} · secrets: {} · path: {} · mode: 0600",
+            summary.profile, summary.secret_count, summary.output_path
+        ),
+        Output::Json => print_json(summary),
+        Output::Toon => println!(
+            "plaintext_export{{status,profile,secrets,path,mode}}: written,{},{},{},0600",
+            toon_string(&summary.profile),
+            summary.secret_count,
+            toon_string(&summary.output_path)
+        ),
+    }
+    ExitCode::SUCCESS
 }
 
 fn print_context(output: Output, context: &AgentContext) -> ExitCode {
@@ -1577,24 +2262,6 @@ fn print_admin_status(output: Output, status: &AdminLeaseStatus) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn phase_pending(output: Output, action: &str) -> ExitCode {
-    match client::request(Operation::Status) {
-        Ok(Reply::Status(status)) if status.service == ServiceState::Locked => print_error(
-            output,
-            &StructuredError {
-                code: "envault_locked".into(),
-                message: "EnVault daemon is locked".into(),
-                help: vec!["Run `envault start`".into()],
-                request_id: Uuid::new_v4(),
-                retryable: true,
-            },
-        ),
-        Ok(Reply::Status(_)) => not_implemented(output, action),
-        Ok(_) => print_error(output, &unexpected_response()),
-        Err(error) => print_error(output, &client_error(error)),
-    }
-}
-
 fn service_error(error: &ServiceError) -> StructuredError {
     let (code, message, retryable) = match error {
         ServiceError::AlreadyInitialized => (
@@ -1649,6 +2316,16 @@ fn client_error(error: ClientError) -> StructuredError {
             request_id: Uuid::new_v4(),
             retryable: true,
         },
+        ClientError::PortabilityTimeout => StructuredError {
+            code: "request_timeout".into(),
+            message: "EnVault portability operation did not respond before the deadline".into(),
+            help: vec![
+                "Preview current state before retrying because an atomic commit may have completed"
+                    .into(),
+            ],
+            request_id: Uuid::new_v4(),
+            retryable: false,
+        },
         ClientError::UnsupportedPlatform => StructuredError {
             code: "platform_not_supported".into(),
             message: "runtime support is not available on this platform in the current phase"
@@ -1684,21 +2361,6 @@ fn input_error(code: &str, message: &str) -> StructuredError {
         request_id: Uuid::new_v4(),
         retryable,
     }
-}
-
-fn not_implemented(output: Output, action: &str) -> ExitCode {
-    print_error(
-        output,
-        &StructuredError {
-            code: "phase_not_implemented".into(),
-            message: format!(
-                "`envault {action}` is defined by the contract but not implemented yet"
-            ),
-            help: vec!["Track implementation status in the phase roadmap".into()],
-            request_id: Uuid::new_v4(),
-            retryable: false,
-        },
-    )
 }
 
 fn print_error(output: Output, error: &StructuredError) -> ExitCode {
@@ -1788,7 +2450,7 @@ mod tests {
 
     #[test]
     fn canonical_contract_has_no_plaintext_value_flag() {
-        let contract = include_str!("../../../commands.toml");
+        let contract = include_str!("../commands.toml");
         assert!(!contract.contains("--value"));
         assert!(!contract.contains("get_secret"));
     }
@@ -1826,14 +2488,75 @@ mod tests {
     }
 
     #[test]
+    fn portability_commands_expose_only_supported_conflict_strategies() {
+        assert!(
+            Cli::try_parse_from([
+                "envault",
+                "profile",
+                "import",
+                "profile.envault-profile",
+                "--strategy",
+                "rename",
+                "--rename-to",
+                "copy",
+                "--transfer-password-stdin",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "envault",
+                "profile",
+                "import",
+                "profile.envault-profile",
+                "--strategy",
+                "rename",
+                "--transfer-password-stdin",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "envault",
+                "workspace",
+                "import",
+                "workspace.envault-workspace",
+                "--strategy",
+                "skip",
+                "--transfer-password-stdin",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "envault",
+                "profile",
+                "import-env",
+                "base",
+                ".env",
+                "--strategy",
+                "rename",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_portability_timeout_requires_preview_instead_of_blind_retry() {
+        let error = client_error(ClientError::PortabilityTimeout);
+        assert_eq!(error.code, "request_timeout");
+        assert!(!error.retryable);
+        assert!(error.help[0].contains("Preview current state"));
+    }
+
+    #[test]
     fn implemented_cli_leaf_paths_match_the_canonical_contract() {
         use clap::CommandFactory;
 
         let mut actual = BTreeSet::new();
         collect_leaf_paths(&Cli::command(), "", &mut actual);
-        actual.remove("workspace");
-        let contract: Contract = toml::from_str(include_str!("../../../commands.toml"))
-            .expect("canonical command contract");
+        let contract: Contract =
+            toml::from_str(include_str!("../commands.toml")).expect("canonical command contract");
         let expected = contract
             .command
             .into_iter()

@@ -36,8 +36,18 @@ A stable node in a tree used for inheritance, override, tombstone, and policy re
 
 A named set of scope and binding references.
 Exactly one profile has `activate_on_start = true`.
+The base profile is the durable profile bound to the vault root scope and cannot be deleted.
 
 ## TOON
 
 A compact, stable, agent-oriented output format.
 
+## Transfer key
+
+A fresh random key that encrypts one portability package payload.
+The transfer key is wrapped by a transfer-password slot or encrypted into one or more age recipient slots.
+
+## Import plan hash
+
+A keyed digest binding an import preview to the exact source bytes, destination state, conflict strategy, optional rename target, and planned actions.
+Commit rejects a missing or stale plan hash before starting a write transaction.

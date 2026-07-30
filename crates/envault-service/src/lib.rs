@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
 
 use envault_core::{
     EntityKind, GeneratorSpec, InvariantError, ProfileId, ProfileSummary, ProfileView, ScopeId,
@@ -20,6 +23,7 @@ use uuid::Uuid;
 mod broker;
 mod capability;
 mod internal;
+mod portability;
 mod scope_policy;
 
 pub use broker::{
@@ -27,6 +31,7 @@ pub use broker::{
     normalize_agent_http_constraint,
 };
 pub use capability::{CapabilityTokenKey, IssuedCapabilityMaterial};
+pub use portability::PackageImportOptions;
 
 use internal::{
     GeneratorMetadata, decode_cbor, encode_cbor, encrypt_text, generate_value, generator_code,
@@ -145,6 +150,22 @@ pub enum ServiceError {
     Time,
     #[error("serialization failed")]
     Serialization,
+    #[error("encrypted portability package is invalid or corrupt")]
+    InvalidPackage,
+    #[error("encrypted portability package version is unsupported")]
+    UnsupportedPackageVersion,
+    #[error("portability package authentication failed")]
+    PackageAuthenticationFailed,
+    #[error("the selected import conflict strategy is invalid for this operation")]
+    InvalidImportStrategy,
+    #[error("the import plan is stale; preview the import again")]
+    StaleImportPlan,
+    #[error("environment file is invalid at line {line}")]
+    InvalidEnvFile { line: u64 },
+    #[error("plaintext export requires explicit acknowledgement")]
+    PlaintextAcknowledgementRequired,
+    #[error("plaintext export contains a name or value that cannot be represented safely")]
+    PlaintextExportUnsupported,
     #[error(transparent)]
     Invariant(#[from] InvariantError),
     #[error(transparent)]
@@ -474,6 +495,9 @@ impl VaultSession {
         if record.activate_on_start {
             return Err(ServiceError::StartupProfileRequired);
         }
+        if record.scope_id == self.root_scope_id {
+            return Err(ServiceError::Conflict);
+        }
         if self.policy_rules()?.iter().any(|rule| {
             matches!(
                 rule.resource,
@@ -483,12 +507,8 @@ impl VaultSession {
         }) {
             return Err(ServiceError::Conflict);
         }
-        if record.scope_id == self.root_scope_id {
-            self.store.delete_profile(record.id)?;
-        } else {
-            self.store
-                .delete_profile_and_scope(record.id, record.scope_id)?;
-        }
+        self.store
+            .delete_profile_and_scope(record.id, record.scope_id)?;
         Ok(())
     }
 
@@ -843,11 +863,14 @@ impl VaultSession {
     }
 
     fn validate_scopes(&self) -> Result<(), ServiceError> {
-        for scope in self.store.scopes()? {
+        let scopes = self.store.scopes()?;
+        let mut paths = BTreeMap::new();
+        for scope in &scopes {
             if scope.vault_id != self.vault_id
                 || (scope.id != self.root_scope_id && scope.parent_id.is_none())
                 || (scope.id == self.root_scope_id && scope.kind != 0)
                 || (scope.id != self.root_scope_id && scope.kind == 0)
+                || scope.kind > scope_policy::scope_kind_code(ScopeKind::Project)
             {
                 return Err(ServiceError::Corrupt);
             }
@@ -862,19 +885,49 @@ impl VaultSession {
             {
                 return Err(ServiceError::Corrupt);
             }
+            paths.insert(scope.id, path);
+        }
+        for scope in &scopes {
+            if let Some(parent_id) = scope.parent_id {
+                let parent_path = paths.get(&parent_id).ok_or(ServiceError::Corrupt)?;
+                let path = paths.get(&scope.id).ok_or(ServiceError::Corrupt)?;
+                let expected_prefix = format!("{parent_path}/");
+                if !path.starts_with(&expected_prefix)
+                    || path.len() == expected_prefix.len()
+                    || (scope.kind == scope_policy::scope_kind_code(ScopeKind::Profile)
+                        && parent_id != self.root_scope_id)
+                {
+                    return Err(ServiceError::Corrupt);
+                }
+            }
             self.scope_chain(scope.id)?;
         }
         Ok(())
     }
 
     fn validate_profiles(&self) -> Result<(), ServiceError> {
-        for record in self.store.profiles()? {
-            if record.vault_id != self.vault_id
-                || self.store.scope_by_id(record.scope_id)?.is_none()
+        let profiles = self.store.profiles()?;
+        let scopes = self
+            .store
+            .scopes()?
+            .into_iter()
+            .map(|scope| (scope.id, scope))
+            .collect::<BTreeMap<_, _>>();
+        let mut profile_scopes = BTreeSet::new();
+        let mut root_profiles = 0_usize;
+        for record in &profiles {
+            let scope = scopes.get(&record.scope_id).ok_or(ServiceError::Corrupt)?;
+            if record.vault_id != self.vault_id || !profile_scopes.insert(record.scope_id) {
+                return Err(ServiceError::Corrupt);
+            }
+            if record.scope_id == self.root_scope_id {
+                root_profiles = root_profiles.saturating_add(1);
+            } else if scope.kind != scope_policy::scope_kind_code(ScopeKind::Profile)
+                || scope.parent_id != Some(self.root_scope_id)
             {
                 return Err(ServiceError::Corrupt);
             }
-            let view = self.profile_view(&record)?;
+            let view = self.profile_view(record)?;
             validate_optional_description(view.description.as_deref())?;
             let normalized = normalize_name(&view.name)?;
             if record.name_lookup
@@ -887,6 +940,14 @@ impl VaultSession {
             {
                 return Err(ServiceError::Corrupt);
             }
+        }
+        if root_profiles != 1
+            || scopes.values().any(|scope| {
+                scope.kind == scope_policy::scope_kind_code(ScopeKind::Profile)
+                    && !profile_scopes.contains(&scope.id)
+            })
+        {
+            return Err(ServiceError::Corrupt);
         }
         Ok(())
     }
