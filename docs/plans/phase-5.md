@@ -10,6 +10,7 @@ Deliver redacted `.env` discovery and guided import, encrypted profile and works
 `envault-crypto` continues to own key generation, Argon2id derivation, XChaCha20-Poly1305 encryption, and key wrapping.
 `envault-store` owns validated portability mutation batches and commits each accepted batch in one immediate SQLite transaction.
 `envault-platform` owns bounded no-follow file reads and private atomic no-replace writes.
+On macOS it first expands only the fixed root-owned `/var`, `/tmp`, and `/etc` aliases to their `/private` targets, then applies the same no-follow walk to every remaining component.
 `envault-service` owns `.env` parsing, encrypted package construction, key-slot handling, import planning, plan hashing, entity remapping, DEK re-wrapping, ciphertext migration, and plaintext export authorization boundaries.
 `envault-protocol` owns path-based preview, commit, export, and response messages so package payloads never need to fit inside the IPC frame.
 The daemon owns admin-lease enforcement and dispatches every portability operation through the application service.

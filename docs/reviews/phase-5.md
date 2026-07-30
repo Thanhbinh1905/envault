@@ -54,6 +54,7 @@ The explicit destination is created directly at mode `0600`, synchronized, and v
 Error handling never deletes a destination path that may have been concurrently replaced.
 Encrypted package publication uses a private synchronized temporary file and an atomic no-replace rename through one held parent directory descriptor.
 Unix path traversal opens every parent component with directory and no-follow flags and rejects symbolic-link parents plus `..` traversal.
+macOS fixed root-owned `/var`, `/tmp`, and `/etc` aliases are normalized to their `/private` targets before the same no-follow walk, so standard platform temporary paths work without permitting arbitrary symbolic-link parents.
 Portability work runs through `spawn_blocking` with a sixty-second client and daemon deadline.
 An expired deadline never claims that blocking work was cancelled or rolled back.
 Both daemon and client timeout errors are non-retryable for portability and require a fresh preview because an atomic commit may have completed.
@@ -85,6 +86,7 @@ Native macOS build and runtime coverage remains assigned to the protected macOS 
 
 Stable file operations no longer follow symbolic-link parent components between validation and use.
 Socket permission hardening now validates socket inodes instead of incorrectly applying regular-file checks that prevented daemon startup.
+macOS standard temporary paths no longer fail stable-parent validation on the operating system's fixed `/var` and `/tmp` aliases.
 Package preview now validates inner DEK wrapping and value ciphertext authentication instead of trusting only the outer payload tag.
 Hostile transfer-password KDF parameters are rejected before derivation and cannot request unbounded memory or CPU.
 Encrypted package commands cannot import the other package kind through a semantically incorrect CLI path.

@@ -418,6 +418,8 @@ fn open_stable_parent(
         sys::stat::Mode,
     };
 
+    let normalized_path = normalize_platform_path(path);
+    let path = normalized_path.as_ref();
     let name = path
         .file_name()
         .filter(|name| !name.is_empty())
@@ -448,6 +450,25 @@ fn open_stable_parent(
         }
     }
     Ok((descriptor, name))
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_platform_path(path: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
+    for (alias, target) in [
+        ("/var", "/private/var"),
+        ("/tmp", "/private/tmp"),
+        ("/etc", "/private/etc"),
+    ] {
+        if let Ok(remainder) = path.strip_prefix(alias) {
+            return std::borrow::Cow::Owned(std::path::Path::new(target).join(remainder));
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn normalize_platform_path(path: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
+    std::borrow::Cow::Borrowed(path)
 }
 
 fn invalid_private_path() -> PlatformError {
@@ -719,5 +740,18 @@ mod tests {
         fs::remove_file(&path).expect("unlink");
         drop(create_private_file(&path).expect("replacement"));
         assert!(validate_private_file_path(&path, &file).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_system_aliases_resolve_to_their_private_prefixes() {
+        assert_eq!(
+            normalize_platform_path(std::path::Path::new("/var/folders/package")),
+            std::path::Path::new("/private/var/folders/package")
+        );
+        assert_eq!(
+            normalize_platform_path(std::path::Path::new("/tmp/package")),
+            std::path::Path::new("/private/tmp/package")
+        );
     }
 }
