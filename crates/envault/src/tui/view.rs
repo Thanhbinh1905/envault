@@ -5,7 +5,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use super::app::{App, DaemonClient, Mode, Screen};
+use super::app::{App, DaemonClient, Mode, PasswordPurpose, PortabilityPreviewState, Screen};
 
 pub fn draw<C: DaemonClient>(frame: &mut Frame, app: &App<C>) {
     let area = frame.area();
@@ -24,18 +24,26 @@ pub fn draw<C: DaemonClient>(frame: &mut Frame, app: &App<C>) {
         Screen::Profiles => draw_profiles(frame, chunks[1], app),
         Screen::Secrets => draw_secrets(frame, chunks[1], app),
         Screen::Versions => draw_versions(frame, chunks[1], app),
+        Screen::Portability => draw_portability(frame, chunks[1], app),
     }
     draw_status_line(frame, chunks[2], app);
 
     match app.mode() {
         Mode::Normal => {}
-        Mode::PasswordInput(buffer) => {
+        Mode::PasswordInput(purpose, buffer) => {
+            let title = match purpose {
+                PasswordPurpose::AdminUnlock => "Admin unlock",
+                PasswordPurpose::PackageImportTransfer { .. } => {
+                    "Transfer password (Enter with nothing typed to use an age identity instead)"
+                }
+                PasswordPurpose::PackageExportTransfer { .. } => "Transfer password",
+            };
             draw_modal(
                 frame,
                 area,
-                "Admin unlock",
+                title,
                 &format!(
-                    "Master password: {}\n\nEnter to submit, Esc to cancel.",
+                    "Password: {}\n\nEnter to submit, Esc to cancel.",
                     "*".repeat(buffer.len())
                 ),
             );
@@ -78,17 +86,21 @@ fn draw_tabs<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>) {
         match screen {
             Screen::Profiles => "  admin: c/n/x/a, L:lock",
             Screen::Secrets => "  admin: c/e/n/x/g, L:lock",
+            Screen::Portability => "  v:kind t:strategy i:preview x:export c:commit, L:lock",
             _ => "  admin: L:lock",
         }
+    } else if screen == Screen::Portability {
+        "  v:kind t:strategy, u:unlock admin"
     } else {
         "  u:unlock admin"
     };
     let line = Line::from(format!(
-        "{}{}{}{}  (d/p/s, arrows, enter, esc, r, q){admin_hint}",
+        "{}{}{}{}{}  (d/p/s/o, arrows, enter, esc, r, q){admin_hint}",
         label("Dashboard", screen == Screen::Dashboard),
         label("Profiles", screen == Screen::Profiles),
         label("Secrets", screen == Screen::Secrets),
         label("Versions", screen == Screen::Versions),
+        label("Portability", screen == Screen::Portability),
     ));
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -252,6 +264,59 @@ fn draw_versions<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>) {
         area,
         &mut state,
     );
+}
+
+fn draw_portability<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>) {
+    let mut lines = vec![
+        Line::from(format!("selected kind: {}", app.portability_kind_label())),
+        Line::from(format!(
+            "selected strategy: {}",
+            app.portability_strategy_label()
+        )),
+        Line::from(""),
+    ];
+    match app.portability_preview() {
+        None => lines.push(Line::from(
+            "no preview yet - press 'i' to preview an import for the selected kind",
+        )),
+        Some(PortabilityPreviewState::Package { preview, .. }) => {
+            lines.push(Line::from(format!("plan hash: {}", preview.plan_hash)));
+            lines.push(Line::from(format!(
+                "counts: scopes={} profiles={} secrets={} versions={} principals={} policy_rules={}",
+                preview.counts.scopes,
+                preview.counts.profiles,
+                preview.counts.secrets,
+                preview.counts.versions,
+                preview.counts.principals,
+                preview.counts.policy_rules
+            )));
+            for conflict in &preview.conflicts {
+                lines.push(Line::from(format!(
+                    "conflict: {} '{}' -> {:?}",
+                    conflict.resource, conflict.name, conflict.action
+                )));
+            }
+            for warning in &preview.warnings {
+                lines.push(Line::from(format!("warning: {warning}")));
+            }
+            lines.push(Line::from("press 'c' to commit this exact plan"));
+        }
+        Some(PortabilityPreviewState::Env { preview, .. }) => {
+            lines.push(Line::from(format!("plan hash: {}", preview.plan_hash)));
+            for entry in &preview.entries {
+                lines.push(Line::from(format!(
+                    "{} ({} bytes) -> {:?}",
+                    entry.name, entry.value_bytes, entry.action
+                )));
+            }
+            for warning in &preview.warnings {
+                lines.push(Line::from(format!("warning: {warning}")));
+            }
+            lines.push(Line::from("press 'c' to commit this exact plan"));
+        }
+    }
+    let block = Block::default().borders(Borders::ALL).title("Portability");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_status_line<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>) {

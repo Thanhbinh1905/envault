@@ -1,5 +1,7 @@
 use envault_core::{
-    DEFAULT_ADMIN_LEASE_MINUTES, GeneratorSpec, ProfileView, SecretVersionView, SecretView,
+    DEFAULT_ADMIN_LEASE_MINUTES, EnvImportPreview, GeneratorSpec, ImportConflictStrategy,
+    PackageKind, PortabilityExportSummary, PortabilityImportSummary, PortabilityPreview,
+    ProfileView, SecretVersionView, SecretView,
 };
 use envault_protocol::{AdminLeaseStatus, DaemonStatus, Operation, Reply, SensitiveBytes};
 use zeroize::Zeroizing;
@@ -52,6 +54,48 @@ pub trait DaemonClient {
         name: String,
         generator: GeneratorSpec,
     ) -> Result<SecretVersionView, ClientError>;
+
+    fn preview_package_import(
+        &self,
+        expected_kind: PackageKind,
+        input_path: String,
+        transfer_password: Option<SensitiveBytes>,
+        age_identity_path: Option<String>,
+        strategy: ImportConflictStrategy,
+        rename_to: Option<String>,
+    ) -> Result<PortabilityPreview, ClientError>;
+    #[allow(clippy::too_many_arguments)]
+    fn commit_package_import(
+        &self,
+        expected_kind: PackageKind,
+        input_path: String,
+        transfer_password: Option<SensitiveBytes>,
+        age_identity_path: Option<String>,
+        strategy: ImportConflictStrategy,
+        rename_to: Option<String>,
+        expected_plan_hash: String,
+    ) -> Result<PortabilityImportSummary, ClientError>;
+    fn preview_env_import(
+        &self,
+        profile_name: String,
+        input_path: String,
+        strategy: ImportConflictStrategy,
+    ) -> Result<EnvImportPreview, ClientError>;
+    fn commit_env_import(
+        &self,
+        profile_name: String,
+        input_path: String,
+        strategy: ImportConflictStrategy,
+        expected_plan_hash: String,
+    ) -> Result<PortabilityImportSummary, ClientError>;
+    fn export_package(
+        &self,
+        kind: PackageKind,
+        profile_name: Option<String>,
+        output_path: String,
+        transfer_password: Option<SensitiveBytes>,
+        age_recipients: Vec<String>,
+    ) -> Result<PortabilityExportSummary, ClientError>;
 }
 
 /// Issues every call through the real daemon socket via [`crate::client`].
@@ -204,6 +248,107 @@ impl DaemonClient for RealClient {
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
+
+    fn preview_package_import(
+        &self,
+        expected_kind: PackageKind,
+        input_path: String,
+        transfer_password: Option<SensitiveBytes>,
+        age_identity_path: Option<String>,
+        strategy: ImportConflictStrategy,
+        rename_to: Option<String>,
+    ) -> Result<PortabilityPreview, ClientError> {
+        match client::request(Operation::PreviewPackageImport {
+            expected_kind,
+            input_path,
+            transfer_password,
+            age_identity_path,
+            strategy,
+            rename_to,
+        })? {
+            Reply::PortabilityPreview(preview) => Ok(preview),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_package_import(
+        &self,
+        expected_kind: PackageKind,
+        input_path: String,
+        transfer_password: Option<SensitiveBytes>,
+        age_identity_path: Option<String>,
+        strategy: ImportConflictStrategy,
+        rename_to: Option<String>,
+        expected_plan_hash: String,
+    ) -> Result<PortabilityImportSummary, ClientError> {
+        match client::request(Operation::CommitPackageImport {
+            expected_kind,
+            input_path,
+            transfer_password,
+            age_identity_path,
+            strategy,
+            rename_to,
+            expected_plan_hash,
+        })? {
+            Reply::PortabilityImport(summary) => Ok(summary),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    fn preview_env_import(
+        &self,
+        profile_name: String,
+        input_path: String,
+        strategy: ImportConflictStrategy,
+    ) -> Result<EnvImportPreview, ClientError> {
+        match client::request(Operation::PreviewEnvImport {
+            profile_name,
+            input_path,
+            strategy,
+        })? {
+            Reply::EnvImportPreview(preview) => Ok(preview),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    fn commit_env_import(
+        &self,
+        profile_name: String,
+        input_path: String,
+        strategy: ImportConflictStrategy,
+        expected_plan_hash: String,
+    ) -> Result<PortabilityImportSummary, ClientError> {
+        match client::request(Operation::CommitEnvImport {
+            profile_name,
+            input_path,
+            strategy,
+            expected_plan_hash,
+        })? {
+            Reply::PortabilityImport(summary) => Ok(summary),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    fn export_package(
+        &self,
+        kind: PackageKind,
+        profile_name: Option<String>,
+        output_path: String,
+        transfer_password: Option<SensitiveBytes>,
+        age_recipients: Vec<String>,
+    ) -> Result<PortabilityExportSummary, ClientError> {
+        match client::request(Operation::ExportPackage {
+            kind,
+            profile_name,
+            output_path,
+            transfer_password,
+            age_recipients,
+        })? {
+            Reply::PortabilityExport(summary) => Ok(summary),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
 }
 
 /// The screen currently in focus. Each screen owns its own selection state so
@@ -214,20 +359,141 @@ pub enum Screen {
     Profiles,
     Secrets,
     Versions,
+    Portability,
+}
+
+/// Which package or file kind a portability import/export wizard is acting
+/// on. Drives which conflict strategies are offered, matching exactly what
+/// each daemon operation accepts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PortabilityKind {
+    Profile,
+    Workspace,
+    Env,
+}
+
+impl PortabilityKind {
+    fn next(self) -> Self {
+        match self {
+            PortabilityKind::Profile => PortabilityKind::Workspace,
+            PortabilityKind::Workspace => PortabilityKind::Env,
+            PortabilityKind::Env => PortabilityKind::Profile,
+        }
+    }
+
+    fn package_kind(self) -> Option<PackageKind> {
+        match self {
+            PortabilityKind::Profile => Some(PackageKind::Profile),
+            PortabilityKind::Workspace => Some(PackageKind::Workspace),
+            PortabilityKind::Env => None,
+        }
+    }
+
+    /// The exact conflict strategy set each daemon operation accepts; the TUI
+    /// never offers a strategy an operation would reject.
+    fn allowed_strategies(self) -> &'static [ImportConflictStrategy] {
+        use ImportConflictStrategy::{Abort, Rename, Replace, Skip};
+        match self {
+            PortabilityKind::Profile => &[Abort, Skip, Replace, Rename],
+            PortabilityKind::Workspace => &[Abort, Replace],
+            PortabilityKind::Env => &[Abort, Skip, Replace],
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            PortabilityKind::Profile => "profile package",
+            PortabilityKind::Workspace => "workspace package",
+            PortabilityKind::Env => ".env file",
+        }
+    }
+}
+
+fn strategy_label(strategy: ImportConflictStrategy) -> &'static str {
+    match strategy {
+        ImportConflictStrategy::Abort => "abort",
+        ImportConflictStrategy::Skip => "skip",
+        ImportConflictStrategy::Replace => "replace",
+        ImportConflictStrategy::Rename => "rename",
+    }
+}
+
+/// The most recently displayed, not-yet-committed import preview. Holding the
+/// exact request parameters alongside the returned plan hash means commit can
+/// only ever be issued against the state the human actually reviewed.
+#[derive(Clone, Debug)]
+pub enum PortabilityPreviewState {
+    Package {
+        expected_kind: PackageKind,
+        input_path: String,
+        transfer_password: Option<SensitiveBytes>,
+        age_identity_path: Option<String>,
+        strategy: ImportConflictStrategy,
+        rename_to: Option<String>,
+        preview: PortabilityPreview,
+    },
+    Env {
+        profile_name: String,
+        input_path: String,
+        strategy: ImportConflictStrategy,
+        preview: EnvImportPreview,
+    },
+}
+
+impl PortabilityPreviewState {
+    fn plan_hash(&self) -> &str {
+        match self {
+            PortabilityPreviewState::Package { preview, .. } => &preview.plan_hash,
+            PortabilityPreviewState::Env { preview, .. } => &preview.plan_hash,
+        }
+    }
 }
 
 /// Which text field a [`Mode::TextInput`] step is collecting, and what to do
-/// once the human presses Enter on it. Holds only profile/secret names and
-/// descriptions, never a secret value.
+/// once the human presses Enter on it. Holds only names, descriptions, and
+/// paths, never a secret value.
 #[derive(Clone, Debug)]
 pub enum InputKind {
     CreateProfileName,
-    CreateProfileDescription { name: String },
-    RenameProfileNewName { old_name: String },
+    CreateProfileDescription {
+        name: String,
+    },
+    RenameProfileNewName {
+        old_name: String,
+    },
     CreateSecretName,
-    CreateSecretDescription { name: String },
-    UpdateSecretDescription { name: String },
-    RenameSecretNewName { old_name: String },
+    CreateSecretDescription {
+        name: String,
+    },
+    UpdateSecretDescription {
+        name: String,
+    },
+    RenameSecretNewName {
+        old_name: String,
+    },
+    PortabilityInputPath {
+        kind: PortabilityKind,
+    },
+    PortabilityEnvProfileName {
+        input_path: String,
+    },
+    PortabilityAgeIdentityPath {
+        kind: PortabilityKind,
+        input_path: String,
+    },
+    PortabilityRenameTo {
+        kind: PortabilityKind,
+        input_path: String,
+        transfer_password: Option<SensitiveBytes>,
+        age_identity_path: Option<String>,
+    },
+    ExportOutputPath {
+        kind: PortabilityKind,
+    },
+    ExportProfileName {
+        kind: PortabilityKind,
+        output_path: String,
+    },
 }
 
 impl InputKind {
@@ -246,6 +512,14 @@ impl InputKind {
                 "Secret description (optional, Enter to skip):"
             }
             InputKind::UpdateSecretDescription { .. } => "New secret description:",
+            InputKind::PortabilityInputPath { .. } => "Source file path:",
+            InputKind::PortabilityEnvProfileName { .. } => "Destination profile name:",
+            InputKind::PortabilityAgeIdentityPath { .. } => {
+                "Age identity file path (required when no transfer password was given):"
+            }
+            InputKind::PortabilityRenameTo { .. } => "Destination profile name for rename:",
+            InputKind::ExportOutputPath { .. } => "Destination file path:",
+            InputKind::ExportProfileName { .. } => "Profile name to export:",
         }
     }
 }
@@ -287,6 +561,15 @@ pub enum PendingAction {
     GenerateSecretValue {
         name: String,
     },
+    CommitPortability {
+        plan_hash: String,
+    },
+    ExportPackage {
+        kind: PackageKind,
+        profile_name: Option<String>,
+        output_path: String,
+        transfer_password: SensitiveBytes,
+    },
 }
 
 impl PendingAction {
@@ -312,8 +595,43 @@ impl PendingAction {
             PendingAction::GenerateSecretValue { name } => {
                 format!("rotate the value of secret '{name}'")
             }
+            PendingAction::CommitPortability { plan_hash } => {
+                format!("commit the import with plan hash {plan_hash}")
+            }
+            PendingAction::ExportPackage {
+                kind, output_path, ..
+            } => format!(
+                "export {} to '{output_path}'",
+                PortabilityKind::from(*kind).label()
+            ),
         }
     }
+}
+
+impl From<PackageKind> for PortabilityKind {
+    fn from(kind: PackageKind) -> Self {
+        match kind {
+            PackageKind::Profile => PortabilityKind::Profile,
+            PackageKind::Workspace => PortabilityKind::Workspace,
+        }
+    }
+}
+
+/// Which password a [`Mode::PasswordInput`] step is collecting, and what to
+/// do with it once submitted. Distinct from [`InputKind`] because a password
+/// buffer must never be handled by the generic text-input path.
+#[derive(Clone, Debug)]
+pub enum PasswordPurpose {
+    AdminUnlock,
+    PackageImportTransfer {
+        kind: PortabilityKind,
+        input_path: String,
+    },
+    PackageExportTransfer {
+        kind: PortabilityKind,
+        profile_name: Option<String>,
+        output_path: String,
+    },
 }
 
 /// Input focus for the terminal UI. Only [`Mode::Normal`] responds to the
@@ -321,7 +639,7 @@ impl PendingAction {
 /// cancels, so a single keypress can never both select and commit an action.
 pub enum Mode {
     Normal,
-    PasswordInput(Zeroizing<String>),
+    PasswordInput(PasswordPurpose, Zeroizing<String>),
     TextInput(InputKind, String),
     Confirm(PendingAction),
 }
@@ -330,9 +648,11 @@ impl std::fmt::Debug for Mode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Mode::Normal => write!(formatter, "Normal"),
-            Mode::PasswordInput(buffer) => {
-                write!(formatter, "PasswordInput(<redacted len={}>)", buffer.len())
-            }
+            Mode::PasswordInput(purpose, buffer) => write!(
+                formatter,
+                "PasswordInput({purpose:?}, <redacted len={}>)",
+                buffer.len()
+            ),
             Mode::TextInput(kind, _) => write!(formatter, "TextInput({kind:?}, <input>)"),
             Mode::Confirm(action) => write!(formatter, "Confirm({action:?})"),
         }
@@ -344,6 +664,9 @@ impl std::fmt::Debug for Mode {
 fn describe_error(error: &ClientError) -> String {
     match error {
         ClientError::Remote(structured) => format!("{} ({})", structured.message, structured.code),
+        ClientError::PortabilityTimeout => format!(
+            "{error} - preview current state before retrying because an atomic commit may have completed"
+        ),
         other => other.to_string(),
     }
 }
@@ -370,6 +693,9 @@ pub struct App<C: DaemonClient> {
     secret_selected: usize,
     versions: Vec<SecretVersionView>,
     version_selected: usize,
+    portability_kind: PortabilityKind,
+    portability_strategy: ImportConflictStrategy,
+    portability_preview: Option<PortabilityPreviewState>,
     status_message: Option<String>,
 }
 
@@ -388,6 +714,9 @@ impl<C: DaemonClient> App<C> {
             secret_selected: 0,
             versions: Vec::new(),
             version_selected: 0,
+            portability_kind: PortabilityKind::Profile,
+            portability_strategy: ImportConflictStrategy::Abort,
+            portability_preview: None,
             status_message: None,
         }
     }
@@ -440,6 +769,22 @@ impl<C: DaemonClient> App<C> {
 
     pub fn version_selected(&self) -> usize {
         self.version_selected
+    }
+
+    pub fn portability_kind(&self) -> PortabilityKind {
+        self.portability_kind
+    }
+
+    pub fn portability_kind_label(&self) -> &'static str {
+        self.portability_kind.label()
+    }
+
+    pub fn portability_strategy_label(&self) -> &'static str {
+        strategy_label(self.portability_strategy)
+    }
+
+    pub fn portability_preview(&self) -> Option<&PortabilityPreviewState> {
+        self.portability_preview.as_ref()
     }
 
     pub fn status_message(&self) -> Option<&str> {
@@ -509,6 +854,7 @@ impl<C: DaemonClient> App<C> {
             Screen::Profiles => self.refresh_profiles(),
             Screen::Secrets => self.refresh_secrets(),
             Screen::Versions => self.refresh_versions(),
+            Screen::Portability => {}
         }
     }
 
@@ -534,7 +880,7 @@ impl<C: DaemonClient> App<C> {
     pub fn on_key(&mut self, code: crossterm::event::KeyCode) {
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Normal => self.on_key_normal(code),
-            Mode::PasswordInput(buffer) => self.on_key_password(code, buffer),
+            Mode::PasswordInput(purpose, buffer) => self.on_key_password(code, purpose, buffer),
             Mode::TextInput(kind, buffer) => self.on_key_text(code, kind, buffer),
             Mode::Confirm(action) => self.on_key_confirm(code, action),
         }
@@ -548,18 +894,99 @@ impl<C: DaemonClient> App<C> {
             KeyCode::Char('d') => self.go_to(Screen::Dashboard),
             KeyCode::Char('p') => self.go_to(Screen::Profiles),
             KeyCode::Char('s') => self.go_to(Screen::Secrets),
+            KeyCode::Char('o') => self.go_to(Screen::Portability),
             KeyCode::Char('r') => self.go_to(self.screen),
             KeyCode::Up | KeyCode::Char('k') => self.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
             KeyCode::Enter => self.select(),
             KeyCode::Char('u') if !self.admin_lease_active() => {
                 self.status_message = None;
-                self.mode = Mode::PasswordInput(Zeroizing::new(String::new()));
+                self.mode = Mode::PasswordInput(
+                    PasswordPurpose::AdminUnlock,
+                    Zeroizing::new(String::new()),
+                );
             }
             KeyCode::Char('L') if self.admin_lease_active() => {
                 self.mode = Mode::Confirm(PendingAction::LockAdmin);
             }
+            KeyCode::Char(other) if self.screen == Screen::Portability => {
+                self.on_portability_key(other);
+            }
             KeyCode::Char(other) => self.on_admin_key(other),
+            _ => {}
+        }
+    }
+
+    fn require_admin_lease(&mut self) -> bool {
+        if self.admin_lease_active() {
+            true
+        } else {
+            self.status_message = Some("admin lease required; press 'u' to unlock".to_string());
+            false
+        }
+    }
+
+    /// Dispatches a key press scoped to the Portability screen. Kind and
+    /// strategy selection never touch the daemon, so they work even before an
+    /// admin lease is active; every action that would issue a request is
+    /// gated behind [`Self::require_admin_lease`].
+    fn on_portability_key(&mut self, key: char) {
+        match key {
+            'v' => {
+                self.portability_kind = self.portability_kind.next();
+                self.portability_strategy = ImportConflictStrategy::Abort;
+                self.portability_preview = None;
+            }
+            't' => {
+                let allowed = self.portability_kind.allowed_strategies();
+                let current = allowed
+                    .iter()
+                    .position(|candidate| *candidate == self.portability_strategy)
+                    .unwrap_or(0);
+                self.portability_strategy = allowed[(current + 1) % allowed.len()];
+                self.portability_preview = None;
+            }
+            'i' => {
+                if !self.require_admin_lease() {
+                    return;
+                }
+                self.mode = Mode::TextInput(
+                    InputKind::PortabilityInputPath {
+                        kind: self.portability_kind,
+                    },
+                    String::new(),
+                );
+            }
+            'x' => {
+                if self.portability_kind == PortabilityKind::Env {
+                    self.status_message = Some(
+                        "export is only available for profile or workspace packages".to_string(),
+                    );
+                    return;
+                }
+                if !self.require_admin_lease() {
+                    return;
+                }
+                self.mode = Mode::TextInput(
+                    InputKind::ExportOutputPath {
+                        kind: self.portability_kind,
+                    },
+                    String::new(),
+                );
+            }
+            'c' => {
+                if !self.require_admin_lease() {
+                    return;
+                }
+                let Some(preview) = self.portability_preview.as_ref() else {
+                    self.status_message =
+                        Some("no preview to commit; press 'i' to preview first".to_string());
+                    return;
+                };
+                self.mode = Mode::Confirm(PendingAction::CommitPortability {
+                    plan_hash: preview.plan_hash().to_string(),
+                });
+            }
             _ => {}
         }
     }
@@ -639,38 +1066,207 @@ impl<C: DaemonClient> App<C> {
         }
     }
 
-    fn on_key_password(&mut self, code: crossterm::event::KeyCode, mut buffer: Zeroizing<String>) {
+    fn on_key_password(
+        &mut self,
+        code: crossterm::event::KeyCode,
+        purpose: PasswordPurpose,
+        mut buffer: Zeroizing<String>,
+    ) {
         use crossterm::event::KeyCode;
         match code {
             KeyCode::Enter => {
                 let password = SensitiveBytes::new(std::mem::take(&mut *buffer).into_bytes());
-                match self
-                    .client
-                    .admin_unlock(password, DEFAULT_ADMIN_LEASE_MINUTES)
-                {
-                    Ok(status) => {
-                        self.admin_status = Some(status);
-                        self.status_message = Some("admin lease unlocked".to_string());
+                match purpose {
+                    PasswordPurpose::AdminUnlock => {
+                        match self
+                            .client
+                            .admin_unlock(password, DEFAULT_ADMIN_LEASE_MINUTES)
+                        {
+                            Ok(status) => {
+                                self.admin_status = Some(status);
+                                self.status_message = Some("admin lease unlocked".to_string());
+                            }
+                            Err(error) => self.status_message = Some(describe_error(&error)),
+                        }
+                        self.mode = Mode::Normal;
                     }
-                    Err(error) => self.status_message = Some(describe_error(&error)),
+                    PasswordPurpose::PackageImportTransfer { kind, input_path } => {
+                        self.submit_import_transfer_password(kind, input_path, password);
+                    }
+                    PasswordPurpose::PackageExportTransfer {
+                        kind,
+                        profile_name,
+                        output_path,
+                    } => {
+                        self.submit_export_transfer_password(
+                            kind,
+                            profile_name,
+                            output_path,
+                            password,
+                        );
+                    }
                 }
-                self.mode = Mode::Normal;
             }
             KeyCode::Esc => {
-                self.status_message = Some("admin unlock cancelled".to_string());
+                self.status_message = Some("cancelled".to_string());
                 self.mode = Mode::Normal;
             }
             KeyCode::Backspace => {
                 buffer.pop();
-                self.mode = Mode::PasswordInput(buffer);
+                self.mode = Mode::PasswordInput(purpose, buffer);
             }
             KeyCode::Char(character) => {
                 if !character.is_control() {
                     buffer.push(character);
                 }
-                self.mode = Mode::PasswordInput(buffer);
+                self.mode = Mode::PasswordInput(purpose, buffer);
             }
-            _ => self.mode = Mode::PasswordInput(buffer),
+            _ => self.mode = Mode::PasswordInput(purpose, buffer),
+        }
+    }
+
+    /// An empty password is a valid signal to fall back to an age identity
+    /// file, matching the CLI's "password or age identity" credential choice.
+    fn submit_import_transfer_password(
+        &mut self,
+        kind: PortabilityKind,
+        input_path: String,
+        password: SensitiveBytes,
+    ) {
+        if password.is_empty() {
+            self.mode = Mode::TextInput(
+                InputKind::PortabilityAgeIdentityPath { kind, input_path },
+                String::new(),
+            );
+        } else {
+            self.continue_package_import(kind, input_path, Some(password), None);
+        }
+    }
+
+    fn submit_export_transfer_password(
+        &mut self,
+        kind: PortabilityKind,
+        profile_name: Option<String>,
+        output_path: String,
+        password: SensitiveBytes,
+    ) {
+        if password.is_empty() {
+            self.status_message = Some(
+                "choose a transfer password to export this package; age recipients are not yet supported from the terminal UI"
+                    .to_string(),
+            );
+            self.mode = Mode::Normal;
+            return;
+        }
+        let Some(package_kind) = kind.package_kind() else {
+            self.status_message =
+                Some("export is only available for profile or workspace packages".to_string());
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.mode = Mode::Confirm(PendingAction::ExportPackage {
+            kind: package_kind,
+            profile_name,
+            output_path,
+            transfer_password: password,
+        });
+    }
+
+    /// Continues a package import wizard after credentials are known: collects
+    /// a rename target when the current strategy requires one, otherwise
+    /// issues the preview request immediately.
+    fn continue_package_import(
+        &mut self,
+        kind: PortabilityKind,
+        input_path: String,
+        transfer_password: Option<SensitiveBytes>,
+        age_identity_path: Option<String>,
+    ) {
+        if self.portability_strategy == ImportConflictStrategy::Rename {
+            self.mode = Mode::TextInput(
+                InputKind::PortabilityRenameTo {
+                    kind,
+                    input_path,
+                    transfer_password,
+                    age_identity_path,
+                },
+                String::new(),
+            );
+        } else {
+            self.mode = Mode::Normal;
+            self.request_package_preview(
+                kind,
+                input_path,
+                transfer_password,
+                age_identity_path,
+                None,
+            );
+        }
+    }
+
+    /// Issues a package import preview. Clears any previously displayed plan
+    /// hash before the request is sent, not just when the response arrives,
+    /// so there is never a window where a stale hash could be committed.
+    fn request_package_preview(
+        &mut self,
+        kind: PortabilityKind,
+        input_path: String,
+        transfer_password: Option<SensitiveBytes>,
+        age_identity_path: Option<String>,
+        rename_to: Option<String>,
+    ) {
+        self.portability_preview = None;
+        let Some(expected_kind) = kind.package_kind() else {
+            self.status_message =
+                Some("package preview requires a profile or workspace kind".to_string());
+            return;
+        };
+        let strategy = self.portability_strategy;
+        match self.client.preview_package_import(
+            expected_kind,
+            input_path.clone(),
+            transfer_password.clone(),
+            age_identity_path.clone(),
+            strategy,
+            rename_to.clone(),
+        ) {
+            Ok(preview) => {
+                self.status_message =
+                    Some(format!("preview ready: plan hash {}", preview.plan_hash));
+                self.portability_preview = Some(PortabilityPreviewState::Package {
+                    expected_kind,
+                    input_path,
+                    transfer_password,
+                    age_identity_path,
+                    strategy,
+                    rename_to,
+                    preview,
+                });
+            }
+            Err(error) => self.status_message = Some(describe_error(&error)),
+        }
+    }
+
+    /// Issues an `.env` import preview. Like [`Self::request_package_preview`],
+    /// invalidates any prior plan hash before the request is sent.
+    fn request_env_preview(&mut self, profile_name: String, input_path: String) {
+        self.portability_preview = None;
+        let strategy = self.portability_strategy;
+        match self
+            .client
+            .preview_env_import(profile_name.clone(), input_path.clone(), strategy)
+        {
+            Ok(preview) => {
+                self.status_message =
+                    Some(format!("preview ready: plan hash {}", preview.plan_hash));
+                self.portability_preview = Some(PortabilityPreviewState::Env {
+                    profile_name,
+                    input_path,
+                    strategy,
+                    preview,
+                });
+            }
+            Err(error) => self.status_message = Some(describe_error(&error)),
         }
     }
 
@@ -702,9 +1298,24 @@ impl<C: DaemonClient> App<C> {
     }
 
     /// Advances a text-input wizard: either arms the next field or, once every
-    /// field for the action is collected, arms the confirmation step. Never
-    /// sends a request itself.
+    /// field for the action is collected, arms the confirmation step or issues
+    /// the request. Never sends a mutating request itself; only preview
+    /// requests (which are non-mutating) are issued directly from here.
     fn submit_text_input(&mut self, kind: InputKind, buffer: String) {
+        match kind {
+            InputKind::PortabilityInputPath { .. }
+            | InputKind::PortabilityEnvProfileName { .. }
+            | InputKind::PortabilityAgeIdentityPath { .. }
+            | InputKind::PortabilityRenameTo { .. }
+            | InputKind::ExportOutputPath { .. }
+            | InputKind::ExportProfileName { .. } => {
+                self.submit_portability_text_input(kind, buffer);
+            }
+            _ => self.submit_profile_or_secret_text_input(kind, buffer),
+        }
+    }
+
+    fn submit_profile_or_secret_text_input(&mut self, kind: InputKind, buffer: String) {
         match kind {
             InputKind::CreateProfileName => {
                 if buffer.is_empty() {
@@ -770,6 +1381,204 @@ impl<C: DaemonClient> App<C> {
                     new_name: buffer,
                 });
             }
+            InputKind::PortabilityInputPath { .. }
+            | InputKind::PortabilityEnvProfileName { .. }
+            | InputKind::PortabilityAgeIdentityPath { .. }
+            | InputKind::PortabilityRenameTo { .. }
+            | InputKind::ExportOutputPath { .. }
+            | InputKind::ExportProfileName { .. } => {
+                unreachable!("submit_text_input routes portability inputs elsewhere")
+            }
+        }
+    }
+
+    /// Advances a portability import or export wizard. Preview requests are
+    /// non-mutating and are issued directly once every required field is
+    /// collected; export and rename-target collection instead arm the next
+    /// input step or the confirmation step.
+    fn submit_portability_text_input(&mut self, kind: InputKind, buffer: String) {
+        match kind {
+            InputKind::PortabilityInputPath { .. }
+            | InputKind::PortabilityEnvProfileName { .. }
+            | InputKind::PortabilityAgeIdentityPath { .. }
+            | InputKind::PortabilityRenameTo { .. } => {
+                self.submit_portability_import_input(kind, buffer);
+            }
+            InputKind::ExportOutputPath { .. } | InputKind::ExportProfileName { .. } => {
+                self.submit_portability_export_input(kind, buffer);
+            }
+            InputKind::CreateProfileName
+            | InputKind::CreateProfileDescription { .. }
+            | InputKind::RenameProfileNewName { .. }
+            | InputKind::CreateSecretName
+            | InputKind::CreateSecretDescription { .. }
+            | InputKind::UpdateSecretDescription { .. }
+            | InputKind::RenameSecretNewName { .. } => {
+                unreachable!("submit_text_input routes profile/secret inputs elsewhere")
+            }
+        }
+    }
+
+    fn submit_portability_import_input(&mut self, kind: InputKind, buffer: String) {
+        match kind {
+            InputKind::PortabilityInputPath { kind } => {
+                if buffer.is_empty() {
+                    self.status_message = Some("source file path cannot be empty".to_string());
+                    self.mode = Mode::TextInput(InputKind::PortabilityInputPath { kind }, buffer);
+                    return;
+                }
+                match kind {
+                    PortabilityKind::Env => {
+                        self.mode = Mode::TextInput(
+                            InputKind::PortabilityEnvProfileName { input_path: buffer },
+                            String::new(),
+                        );
+                    }
+                    PortabilityKind::Profile | PortabilityKind::Workspace => {
+                        self.mode = Mode::PasswordInput(
+                            PasswordPurpose::PackageImportTransfer {
+                                kind,
+                                input_path: buffer,
+                            },
+                            Zeroizing::new(String::new()),
+                        );
+                    }
+                }
+            }
+            InputKind::PortabilityEnvProfileName { input_path } => {
+                if buffer.is_empty() {
+                    self.status_message =
+                        Some("destination profile name cannot be empty".to_string());
+                    self.mode = Mode::TextInput(
+                        InputKind::PortabilityEnvProfileName { input_path },
+                        buffer,
+                    );
+                    return;
+                }
+                self.mode = Mode::Normal;
+                self.request_env_preview(buffer, input_path);
+            }
+            InputKind::PortabilityAgeIdentityPath { kind, input_path } => {
+                if buffer.is_empty() {
+                    self.status_message =
+                        Some("choose a transfer password or an age identity file".to_string());
+                    self.mode = Mode::TextInput(
+                        InputKind::PortabilityAgeIdentityPath { kind, input_path },
+                        buffer,
+                    );
+                    return;
+                }
+                self.continue_package_import(kind, input_path, None, Some(buffer));
+            }
+            InputKind::PortabilityRenameTo {
+                kind,
+                input_path,
+                transfer_password,
+                age_identity_path,
+            } => {
+                if buffer.is_empty() {
+                    self.status_message =
+                        Some("destination profile name cannot be empty".to_string());
+                    self.mode = Mode::TextInput(
+                        InputKind::PortabilityRenameTo {
+                            kind,
+                            input_path,
+                            transfer_password,
+                            age_identity_path,
+                        },
+                        buffer,
+                    );
+                    return;
+                }
+                self.mode = Mode::Normal;
+                self.request_package_preview(
+                    kind,
+                    input_path,
+                    transfer_password,
+                    age_identity_path,
+                    Some(buffer),
+                );
+            }
+            InputKind::ExportOutputPath { .. }
+            | InputKind::ExportProfileName { .. }
+            | InputKind::CreateProfileName
+            | InputKind::CreateProfileDescription { .. }
+            | InputKind::RenameProfileNewName { .. }
+            | InputKind::CreateSecretName
+            | InputKind::CreateSecretDescription { .. }
+            | InputKind::UpdateSecretDescription { .. }
+            | InputKind::RenameSecretNewName { .. } => {
+                unreachable!("submit_portability_text_input routes this input elsewhere")
+            }
+        }
+    }
+
+    fn submit_portability_export_input(&mut self, kind: InputKind, buffer: String) {
+        match kind {
+            InputKind::ExportOutputPath { kind } => {
+                if buffer.is_empty() {
+                    self.status_message = Some("destination file path cannot be empty".to_string());
+                    self.mode = Mode::TextInput(InputKind::ExportOutputPath { kind }, buffer);
+                    return;
+                }
+                match kind {
+                    PortabilityKind::Profile => {
+                        self.mode = Mode::TextInput(
+                            InputKind::ExportProfileName {
+                                kind,
+                                output_path: buffer,
+                            },
+                            String::new(),
+                        );
+                    }
+                    PortabilityKind::Workspace => {
+                        self.mode = Mode::PasswordInput(
+                            PasswordPurpose::PackageExportTransfer {
+                                kind,
+                                profile_name: None,
+                                output_path: buffer,
+                            },
+                            Zeroizing::new(String::new()),
+                        );
+                    }
+                    PortabilityKind::Env => {
+                        self.status_message = Some(
+                            "export is only available for profile or workspace packages"
+                                .to_string(),
+                        );
+                        self.mode = Mode::Normal;
+                    }
+                }
+            }
+            InputKind::ExportProfileName { kind, output_path } => {
+                if buffer.is_empty() {
+                    self.status_message = Some("profile name cannot be empty".to_string());
+                    self.mode =
+                        Mode::TextInput(InputKind::ExportProfileName { kind, output_path }, buffer);
+                    return;
+                }
+                self.mode = Mode::PasswordInput(
+                    PasswordPurpose::PackageExportTransfer {
+                        kind,
+                        profile_name: Some(buffer),
+                        output_path,
+                    },
+                    Zeroizing::new(String::new()),
+                );
+            }
+            InputKind::PortabilityInputPath { .. }
+            | InputKind::PortabilityEnvProfileName { .. }
+            | InputKind::PortabilityAgeIdentityPath { .. }
+            | InputKind::PortabilityRenameTo { .. }
+            | InputKind::CreateProfileName
+            | InputKind::CreateProfileDescription { .. }
+            | InputKind::RenameProfileNewName { .. }
+            | InputKind::CreateSecretName
+            | InputKind::CreateSecretDescription { .. }
+            | InputKind::UpdateSecretDescription { .. }
+            | InputKind::RenameSecretNewName { .. } => {
+                unreachable!("submit_portability_export_input routes this input elsewhere")
+            }
         }
     }
 
@@ -807,6 +1616,13 @@ impl<C: DaemonClient> App<C> {
             | PendingAction::RenameSecret { .. }
             | PendingAction::DeleteSecret { .. }
             | PendingAction::GenerateSecretValue { .. } => self.execute_secret_action(action),
+            PendingAction::CommitPortability { .. } => self.execute_portability_commit(),
+            PendingAction::ExportPackage {
+                kind,
+                profile_name,
+                output_path,
+                transfer_password,
+            } => self.execute_export_package(kind, profile_name, output_path, transfer_password),
         }
     }
 
@@ -851,7 +1667,9 @@ impl<C: DaemonClient> App<C> {
             | PendingAction::UpdateSecretDescription { .. }
             | PendingAction::RenameSecret { .. }
             | PendingAction::DeleteSecret { .. }
-            | PendingAction::GenerateSecretValue { .. } => {
+            | PendingAction::GenerateSecretValue { .. }
+            | PendingAction::CommitPortability { .. }
+            | PendingAction::ExportPackage { .. } => {
                 unreachable!("execute_pending only routes profile actions here")
             }
         }
@@ -920,9 +1738,89 @@ impl<C: DaemonClient> App<C> {
             | PendingAction::CreateProfile { .. }
             | PendingAction::RenameProfile { .. }
             | PendingAction::DeleteProfile { .. }
-            | PendingAction::ActivateProfile { .. } => {
+            | PendingAction::ActivateProfile { .. }
+            | PendingAction::CommitPortability { .. }
+            | PendingAction::ExportPackage { .. } => {
                 unreachable!("execute_pending only routes secret actions here")
             }
+        }
+    }
+
+    /// Commits the currently held preview and consumes it, whether the commit
+    /// succeeds or fails. A stale or repeated commit is impossible: after this
+    /// call there is no plan hash left in state until a fresh preview is
+    /// requested.
+    fn execute_portability_commit(&mut self) {
+        let Some(preview_state) = self.portability_preview.take() else {
+            self.status_message = Some("no preview to commit".to_string());
+            return;
+        };
+        match preview_state {
+            PortabilityPreviewState::Package {
+                expected_kind,
+                input_path,
+                transfer_password,
+                age_identity_path,
+                strategy,
+                rename_to,
+                preview,
+            } => match self.client.commit_package_import(
+                expected_kind,
+                input_path,
+                transfer_password,
+                age_identity_path,
+                strategy,
+                rename_to,
+                preview.plan_hash,
+            ) {
+                Ok(summary) => {
+                    self.status_message = Some(describe_import_summary(&summary));
+                    self.refresh_dashboard();
+                    self.refresh_profiles();
+                }
+                Err(error) => self.status_message = Some(describe_error(&error)),
+            },
+            PortabilityPreviewState::Env {
+                profile_name,
+                input_path,
+                strategy,
+                preview,
+            } => match self.client.commit_env_import(
+                profile_name,
+                input_path,
+                strategy,
+                preview.plan_hash,
+            ) {
+                Ok(summary) => {
+                    self.status_message = Some(describe_import_summary(&summary));
+                    self.refresh_secrets();
+                }
+                Err(error) => self.status_message = Some(describe_error(&error)),
+            },
+        }
+    }
+
+    fn execute_export_package(
+        &mut self,
+        kind: PackageKind,
+        profile_name: Option<String>,
+        output_path: String,
+        transfer_password: SensitiveBytes,
+    ) {
+        match self.client.export_package(
+            kind,
+            profile_name,
+            output_path,
+            Some(transfer_password),
+            Vec::new(),
+        ) {
+            Ok(summary) => {
+                self.status_message = Some(format!(
+                    "exported package {} to '{}'",
+                    summary.package_id, summary.output_path
+                ));
+            }
+            Err(error) => self.status_message = Some(describe_error(&error)),
         }
     }
 
@@ -940,7 +1838,7 @@ impl<C: DaemonClient> App<C> {
                 self.version_selected =
                     Self::move_selection_up(self.versions.len(), self.version_selected);
             }
-            Screen::Dashboard => {}
+            Screen::Dashboard | Screen::Portability => {}
         }
     }
 
@@ -958,7 +1856,7 @@ impl<C: DaemonClient> App<C> {
                 self.version_selected =
                     Self::move_selection_down(self.versions.len(), self.version_selected);
             }
-            Screen::Dashboard => {}
+            Screen::Dashboard | Screen::Portability => {}
         }
     }
 
@@ -967,4 +1865,11 @@ impl<C: DaemonClient> App<C> {
             self.go_to(Screen::Versions);
         }
     }
+}
+
+fn describe_import_summary(summary: &PortabilityImportSummary) -> String {
+    format!(
+        "import committed: {} created, {} replaced, {} skipped, {} versions appended",
+        summary.created, summary.replaced, summary.skipped, summary.versions_appended
+    )
 }
