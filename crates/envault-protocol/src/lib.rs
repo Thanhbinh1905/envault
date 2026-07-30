@@ -2,8 +2,12 @@
 
 use std::{fmt, io::Write};
 
-use envault_core::{ApprovalId, GrantId, PrincipalId};
-use envault_policy::{Action, ResourceSelector};
+pub use envault_broker::{HttpConstraint, HttpContentType, HttpMethod, HttpRequest, HttpResponse};
+use envault_core::{
+    ApprovalId, GeneratorSpec, GrantId, PrincipalId, PrincipalKind, PrincipalView, ProfileView,
+    SecretId, SecretVersionView, SecretView, VaultId,
+};
+use envault_policy::{Action, Effect, ResourceSelector, Rule};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use uuid::Uuid;
@@ -91,6 +95,7 @@ pub struct AuthenticatedRequest {
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     Status,
+    Context,
     Lock,
     Stop,
     AdminUnlock {
@@ -103,6 +108,7 @@ pub enum Operation {
         principal_id: PrincipalId,
         action: Action,
         resource: ResourceSelector,
+        http_constraint: Option<HttpConstraint>,
         ttl_minutes: u8,
         max_requests: u32,
     },
@@ -110,11 +116,97 @@ pub enum Operation {
     RevokeAgentSession {
         grant_id: GrantId,
     },
+    CreatePrincipal {
+        kind: PrincipalKind,
+        name: String,
+    },
+    ListPrincipals,
+    SetPrincipalDisabled {
+        principal_id: PrincipalId,
+        disabled: bool,
+    },
+    CreatePolicyRule {
+        principal_id: PrincipalId,
+        effect: Effect,
+        action: Action,
+        resource: ResourceSelector,
+    },
+    ListPolicyRules,
+    CreateProfile {
+        name: String,
+        description: Option<String>,
+    },
+    ShowProfile {
+        name: String,
+    },
+    ListProfiles,
+    UpdateProfile {
+        name: String,
+        description: Option<String>,
+    },
+    RenameProfile {
+        old_name: String,
+        new_name: String,
+    },
+    DeleteProfile {
+        name: String,
+    },
+    ActivateProfile {
+        name: String,
+    },
+    CreateSecret {
+        name: String,
+        description: Option<String>,
+        value: SensitiveBytes,
+    },
+    CreateGeneratedSecret {
+        name: String,
+        description: Option<String>,
+        generator: GeneratorSpec,
+    },
+    ListSecrets,
+    DescribeSecret {
+        name: String,
+    },
+    UpdateSecret {
+        name: String,
+        description: Option<String>,
+    },
+    RenameSecret {
+        old_name: String,
+        new_name: String,
+    },
+    DeleteSecret {
+        name: String,
+    },
+    SetSecretValue {
+        name: String,
+        value: SensitiveBytes,
+    },
+    GenerateSecretValue {
+        name: String,
+        generator: GeneratorSpec,
+    },
+    ListSecretVersions {
+        name: String,
+    },
+    DiscoverSecrets,
+    HttpRequest {
+        secret_id: SecretId,
+        request: HttpRequest,
+    },
 }
 
 impl Operation {
     pub const fn accepts_agent_capability(&self) -> bool {
-        matches!(self, Self::Status | Self::AgentSessionStatus)
+        matches!(
+            self,
+            Self::Status
+                | Self::Context
+                | Self::AgentSessionStatus
+                | Self::DiscoverSecrets
+                | Self::HttpRequest { .. }
+        )
     }
 }
 
@@ -154,17 +246,37 @@ pub struct AgentSessionView {
     pub principal_id: PrincipalId,
     pub action: Action,
     pub resource: ResourceSelector,
+    pub http_constraint: Option<HttpConstraint>,
     pub expires_at: i64,
     pub remaining_requests: u32,
     pub revoked: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentContext {
+    pub vault_id: VaultId,
+    pub active_profile: ProfileView,
+    pub session: AgentSessionView,
+}
+
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Reply {
     Status(DaemonStatus),
+    Context(AgentContext),
     AdminStatus(AdminLeaseStatus),
     AgentSessionCreated(AgentSessionCreated),
     AgentSessionStatus(AgentSessionView),
+    Principal(PrincipalView),
+    Principals(Vec<PrincipalView>),
+    PolicyRule(Rule),
+    PolicyRules(Vec<Rule>),
+    Profile(ProfileView),
+    Profiles(Vec<ProfileView>),
+    Secret(SecretView),
+    Secrets(Vec<SecretView>),
+    SecretVersion(SecretVersionView),
+    SecretVersions(Vec<SecretVersionView>),
+    HttpResponse(HttpResponse),
     Acknowledged,
 }
 
@@ -316,7 +428,9 @@ mod tests {
             Err(ProtocolError::UnsupportedVersion)
         ));
         assert!(Operation::Status.accepts_agent_capability());
+        assert!(Operation::Context.accepts_agent_capability());
         assert!(Operation::AgentSessionStatus.accepts_agent_capability());
+        assert!(Operation::DiscoverSecrets.accepts_agent_capability());
         assert!(!Operation::Lock.accepts_agent_capability());
         assert!(!Operation::AdminLock.accepts_agent_capability());
     }

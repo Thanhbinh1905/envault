@@ -1,15 +1,24 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    io::{self, IsTerminal, Read},
-    path::PathBuf,
+    fs,
+    io::{self, IsTerminal, Read, Write},
+    path::{Path, PathBuf},
     process::ExitCode,
 };
 
+use base64::Engine as _;
 use clap::{Parser, Subcommand, ValueEnum};
 use envault::client::{self, ClientError};
+use envault_core::{
+    GeneratorFormat, GeneratorLength, GeneratorSpec, PrincipalKind, ProfileView, SecretVersionView,
+    SecretView,
+};
+use envault_policy::{Action, Effect, ResourceSelector};
 use envault_protocol::{
-    AdminLeaseStatus, DaemonStatus, Operation, Reply, SensitiveBytes, ServiceState, StructuredError,
+    AdminLeaseStatus, AgentContext, AgentSessionCreated, AgentSessionView, DaemonStatus,
+    HttpConstraint, HttpContentType, HttpMethod, HttpRequest, HttpResponse, Operation, Reply,
+    SensitiveBytes, ServiceState, StructuredError,
 };
 use envault_service::{SensitiveInput, ServiceError};
 use serde::Serialize;
@@ -42,13 +51,23 @@ enum Command {
     Start(PasswordArgs),
     Lock,
     Stop,
-    Context,
+    Context(TokenArgs),
     Admin {
         #[command(subcommand)]
         command: AdminCommand,
     },
-    Profile,
-    Secret,
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     Request {
         #[command(subcommand)]
         command: RequestCommand,
@@ -70,16 +89,279 @@ struct AdminUnlockArgs {
     minutes: u8,
 }
 
-#[derive(Clone, Copy, Debug, Subcommand)]
+#[derive(Debug, Subcommand)]
 enum AdminCommand {
     Unlock(AdminUnlockArgs),
     Status,
     Lock,
+    Agent {
+        #[command(subcommand)]
+        command: AdminAgentCommand,
+    },
+    Grant {
+        #[command(subcommand)]
+        command: GrantCommand,
+    },
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum RequestCommand {
+    Http(HttpRequestArgs),
+}
+
+#[derive(Clone, Copy, Debug, clap::Args)]
+struct TokenArgs {
+    #[arg(long, help = "Read the capability token from standard input")]
+    token_stdin: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    Create(NameDescriptionArgs),
+    Show(NameArgs),
+    List,
+    Update(NameDescriptionArgs),
+    Rename(RenameArgs),
+    Delete(NameArgs),
+    Activate(NameArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretCommand {
+    Create(SecretCreateArgs),
+    List(SecretListArgs),
+    Describe(NameArgs),
+    Update(NameDescriptionArgs),
+    Rename(RenameArgs),
+    Delete(NameArgs),
+    Versions(NameArgs),
+    Value {
+        #[command(subcommand)]
+        command: SecretValueCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretValueCommand {
+    Set(SecretValueSetArgs),
+    Generate(SecretValueGenerateArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    Session {
+        #[command(subcommand)]
+        command: AgentSessionCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentSessionCommand {
+    Status(TokenArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminAgentCommand {
+    Create(NameArgs),
+    List,
+    Enable(PrincipalArgs),
+    Disable(PrincipalArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum GrantCommand {
+    Create(GrantCreateArgs),
+    Revoke(GrantRevokeArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    Create(PolicyCreateArgs),
+    List,
+}
+
+#[derive(Debug, clap::Args)]
+struct NameArgs {
+    name: String,
+}
+
+#[derive(Debug, clap::Args)]
+struct NameDescriptionArgs {
+    name: String,
+    #[arg(long)]
+    description: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct RenameArgs {
+    old_name: String,
+    new_name: String,
+}
+
+#[derive(Debug, clap::Args)]
+struct SecretCreateArgs {
+    name: String,
+    #[arg(long)]
+    description: Option<String>,
+    #[arg(long, conflicts_with = "generate")]
+    stdin: bool,
+    #[arg(long, value_enum, conflicts_with = "stdin")]
+    generate: Option<GeneratorFormatArg>,
+    #[command(flatten)]
+    length: GeneratorLengthArgs,
+}
+
+#[derive(Clone, Copy, Debug, clap::Args)]
+struct SecretListArgs {
+    #[arg(long)]
+    token_stdin: bool,
+    #[arg(long)]
+    describe: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct SecretValueSetArgs {
+    name: String,
+    #[arg(long, required = true)]
+    stdin: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct SecretValueGenerateArgs {
+    name: String,
+    #[arg(long, value_enum)]
+    format: GeneratorFormatArg,
+    #[command(flatten)]
+    length: GeneratorLengthArgs,
+}
+
+#[derive(Clone, Copy, Debug, Default, clap::Args)]
+struct GeneratorLengthArgs {
+    #[arg(long, conflicts_with = "bytes")]
+    chars: Option<usize>,
+    #[arg(long, conflicts_with = "chars")]
+    bytes: Option<usize>,
+    #[arg(long)]
+    allow_weak: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum GeneratorFormatArg {
+    UuidV4,
+    Base64url,
+    Base64,
+}
+
+#[derive(Debug, clap::Args)]
+struct PrincipalArgs {
+    principal_id: Uuid,
+}
+
+#[derive(Debug, clap::Args)]
+struct GrantCreateArgs {
+    #[arg(long)]
+    principal: Uuid,
+    #[arg(long, value_enum)]
+    action: GrantActionArg,
+    #[command(flatten)]
+    resource: ResourceArgs,
+    #[arg(long, default_value_t = envault_core::DEFAULT_AGENT_GRANT_MINUTES)]
+    minutes: u8,
+    #[arg(long, default_value_t = 1)]
+    max_requests: u32,
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long, default_value_t = 443)]
+    port: u16,
+    #[arg(long, value_enum, value_delimiter = ',')]
+    method: Vec<HttpMethodArg>,
+    #[arg(long, default_value = "/")]
+    path_prefix: String,
+    #[arg(long, default_value_t = 64 * 1024)]
+    max_request_bytes: usize,
+    #[arg(long, default_value_t = 256 * 1024)]
+    max_response_bytes: usize,
+}
+
+#[derive(Debug, clap::Args)]
+struct GrantRevokeArgs {
+    grant_id: Uuid,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum GrantActionArg {
+    Discover,
     Http,
+}
+
+#[derive(Debug, clap::Args)]
+struct PolicyCreateArgs {
+    #[arg(long)]
+    principal: Uuid,
+    #[arg(long, value_enum)]
+    effect: EffectArg,
+    #[arg(long, value_enum)]
+    action: PolicyActionArg,
+    #[command(flatten)]
+    resource: ResourceArgs,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EffectArg {
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PolicyActionArg {
+    Discover,
+    Http,
+}
+
+#[derive(Debug, clap::Args)]
+struct ResourceArgs {
+    #[arg(long, conflicts_with_all = ["scope", "secret"])]
+    vault: Option<Uuid>,
+    #[arg(long, conflicts_with_all = ["vault", "secret"])]
+    scope: Option<Uuid>,
+    #[arg(long, conflicts_with_all = ["vault", "scope"])]
+    secret: Option<Uuid>,
+}
+
+#[derive(Debug, clap::Args)]
+struct HttpRequestArgs {
+    url: String,
+    #[arg(long, value_enum, default_value_t = HttpMethodArg::Get)]
+    method: HttpMethodArg,
+    #[arg(long)]
+    secret: Uuid,
+    #[arg(long, required = true)]
+    token_stdin: bool,
+    #[arg(long)]
+    body_file: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    content_type: Option<HttpContentTypeArg>,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum HttpMethodArg {
+    #[default]
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum HttpContentTypeArg {
+    Json,
+    Text,
+    Form,
 }
 
 #[derive(Debug, Serialize)]
@@ -103,12 +385,13 @@ fn main() -> ExitCode {
         Command::Lock => lifecycle_request(cli.output, Operation::Lock, "locked"),
         Command::Stop => lifecycle_request(cli.output, Operation::Stop, "stopped"),
         Command::Admin { command } => admin_command(cli.output, command),
-        Command::Context => phase_pending(cli.output, "context"),
-        Command::Profile => phase_pending(cli.output, "profile"),
-        Command::Secret => phase_pending(cli.output, "secret"),
+        Command::Context(arguments) => context_command(cli.output, arguments),
+        Command::Profile { command } => profile_command(cli.output, command),
+        Command::Secret { command } => secret_command(cli.output, command),
+        Command::Agent { command } => agent_command(cli.output, &command),
         Command::Request {
-            command: RequestCommand::Http,
-        } => phase_pending(cli.output, "request http"),
+            command: RequestCommand::Http(arguments),
+        } => http_request(cli.output, arguments),
         Command::Workspace => phase_pending(cli.output, "workspace"),
     }
 }
@@ -187,6 +470,559 @@ fn admin_command(output: Output, command: AdminCommand) -> ExitCode {
             Err(error) => print_error(output, &client_error(error)),
         },
         AdminCommand::Lock => lifecycle_request(output, Operation::AdminLock, "admin_locked"),
+        AdminCommand::Agent { command } => admin_agent_command(output, command),
+        AdminCommand::Grant { command } => grant_command(output, command),
+        AdminCommand::Policy { command } => policy_command(output, command),
+    }
+}
+
+fn context_command(output: Output, arguments: TokenArgs) -> ExitCode {
+    let token = match read_capability_token(arguments.token_stdin) {
+        Ok(token) => token,
+        Err(error) => return print_error(output, &error),
+    };
+    match client::request_with_capability(Operation::Context, Some(token)) {
+        Ok(Reply::Context(context)) => print_context(output, &context),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn agent_command(output: Output, command: &AgentCommand) -> ExitCode {
+    match command {
+        AgentCommand::Session {
+            command: AgentSessionCommand::Status(arguments),
+        } => {
+            let token = match read_capability_token(arguments.token_stdin) {
+                Ok(token) => token,
+                Err(error) => return print_error(output, &error),
+            };
+            match client::request_with_capability(Operation::AgentSessionStatus, Some(token)) {
+                Ok(Reply::AgentSessionStatus(session)) => print_agent_session(output, &session),
+                Ok(_) => print_error(output, &unexpected_response()),
+                Err(error) => print_error(output, &client_error(error)),
+            }
+        }
+    }
+}
+
+fn admin_agent_command(output: Output, command: AdminAgentCommand) -> ExitCode {
+    let operation = match command {
+        AdminAgentCommand::Create(arguments) => Operation::CreatePrincipal {
+            kind: PrincipalKind::Agent,
+            name: arguments.name,
+        },
+        AdminAgentCommand::List => Operation::ListPrincipals,
+        AdminAgentCommand::Enable(arguments) => Operation::SetPrincipalDisabled {
+            principal_id: envault_core::PrincipalId(arguments.principal_id),
+            disabled: false,
+        },
+        AdminAgentCommand::Disable(arguments) => Operation::SetPrincipalDisabled {
+            principal_id: envault_core::PrincipalId(arguments.principal_id),
+            disabled: true,
+        },
+    };
+    match client::request(operation) {
+        Ok(Reply::Principal(principal)) => print_principals(output, &[principal]),
+        Ok(Reply::Principals(principals)) => print_principals(output, &principals),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn grant_command(output: Output, command: GrantCommand) -> ExitCode {
+    match command {
+        GrantCommand::Create(arguments) => create_grant(output, &arguments),
+        GrantCommand::Revoke(arguments) => lifecycle_request(
+            output,
+            Operation::RevokeAgentSession {
+                grant_id: envault_core::GrantId(arguments.grant_id),
+            },
+            "grant_revoked",
+        ),
+    }
+}
+
+fn create_grant(output: Output, arguments: &GrantCreateArgs) -> ExitCode {
+    if io::stdout().is_terminal() {
+        return print_error(
+            output,
+            &input_error(
+                "token_output_requires_pipe",
+                "new capability tokens are emitted only to piped standard output",
+            ),
+        );
+    }
+    let resource = match resource_selector(&arguments.resource) {
+        Ok(resource) => resource,
+        Err(error) => return print_error(output, &error),
+    };
+    let action = match arguments.action {
+        GrantActionArg::Discover => Action::Discover,
+        GrantActionArg::Http => Action::HttpRequest,
+    };
+    let http_constraint = match grant_http_constraint(arguments, action, resource) {
+        Ok(constraint) => constraint,
+        Err(error) => return print_error(output, &error),
+    };
+    let operation = Operation::CreateAgentSession {
+        principal_id: envault_core::PrincipalId(arguments.principal),
+        action,
+        resource,
+        http_constraint,
+        ttl_minutes: arguments.minutes,
+        max_requests: arguments.max_requests,
+    };
+    match client::request(operation) {
+        Ok(Reply::AgentSessionCreated(created)) => print_created_grant(output, created),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn policy_command(output: Output, command: PolicyCommand) -> ExitCode {
+    let operation = match command {
+        PolicyCommand::Create(arguments) => {
+            let resource = match resource_selector(&arguments.resource) {
+                Ok(resource) => resource,
+                Err(error) => return print_error(output, &error),
+            };
+            Operation::CreatePolicyRule {
+                principal_id: envault_core::PrincipalId(arguments.principal),
+                effect: match arguments.effect {
+                    EffectArg::Allow => Effect::Allow,
+                    EffectArg::Deny => Effect::Deny,
+                },
+                action: match arguments.action {
+                    PolicyActionArg::Discover => Action::Discover,
+                    PolicyActionArg::Http => Action::HttpRequest,
+                },
+                resource,
+            }
+        }
+        PolicyCommand::List => Operation::ListPolicyRules,
+    };
+    match client::request(operation) {
+        Ok(Reply::PolicyRule(rule)) => print_json_or_debug(output, &rule, "policy"),
+        Ok(Reply::PolicyRules(rules)) => print_json_or_debug(output, &rules, "policies"),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn profile_command(output: Output, command: ProfileCommand) -> ExitCode {
+    let operation = match command {
+        ProfileCommand::Create(arguments) => Operation::CreateProfile {
+            name: arguments.name,
+            description: arguments.description,
+        },
+        ProfileCommand::Show(arguments) => Operation::ShowProfile {
+            name: arguments.name,
+        },
+        ProfileCommand::List => Operation::ListProfiles,
+        ProfileCommand::Update(arguments) => Operation::UpdateProfile {
+            name: arguments.name,
+            description: arguments.description,
+        },
+        ProfileCommand::Rename(arguments) => Operation::RenameProfile {
+            old_name: arguments.old_name,
+            new_name: arguments.new_name,
+        },
+        ProfileCommand::Delete(arguments) => Operation::DeleteProfile {
+            name: arguments.name,
+        },
+        ProfileCommand::Activate(arguments) => Operation::ActivateProfile {
+            name: arguments.name,
+        },
+    };
+    match client::request(operation) {
+        Ok(Reply::Profile(profile)) => print_profiles(output, &[profile]),
+        Ok(Reply::Profiles(profiles)) => print_profiles(output, &profiles),
+        Ok(Reply::Acknowledged) => print_acknowledgement(output, "profile_deleted"),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn secret_command(output: Output, command: SecretCommand) -> ExitCode {
+    match command {
+        SecretCommand::Create(arguments) => create_secret(output, arguments),
+        SecretCommand::List(arguments) => list_secrets(output, arguments),
+        SecretCommand::Describe(arguments) => request_secret(
+            output,
+            Operation::DescribeSecret {
+                name: arguments.name,
+            },
+        ),
+        SecretCommand::Update(arguments) => request_secret(
+            output,
+            Operation::UpdateSecret {
+                name: arguments.name,
+                description: arguments.description,
+            },
+        ),
+        SecretCommand::Rename(arguments) => request_secret(
+            output,
+            Operation::RenameSecret {
+                old_name: arguments.old_name,
+                new_name: arguments.new_name,
+            },
+        ),
+        SecretCommand::Delete(arguments) => lifecycle_request(
+            output,
+            Operation::DeleteSecret {
+                name: arguments.name,
+            },
+            "secret_deleted",
+        ),
+        SecretCommand::Versions(arguments) => {
+            match client::request(Operation::ListSecretVersions {
+                name: arguments.name,
+            }) {
+                Ok(Reply::SecretVersions(versions)) => print_versions(output, &versions),
+                Ok(_) => print_error(output, &unexpected_response()),
+                Err(error) => print_error(output, &client_error(error)),
+            }
+        }
+        SecretCommand::Value { command } => secret_value_command(output, command),
+    }
+}
+
+fn create_secret(output: Output, arguments: SecretCreateArgs) -> ExitCode {
+    let operation = match (arguments.stdin, arguments.generate) {
+        (true, None) => {
+            let value = match read_secret_value() {
+                Ok(value) => value,
+                Err(error) => return print_error(output, &error),
+            };
+            Operation::CreateSecret {
+                name: arguments.name,
+                description: arguments.description,
+                value,
+            }
+        }
+        (false, Some(format)) => {
+            let generator = match generator_spec(format, arguments.length) {
+                Ok(generator) => generator,
+                Err(error) => return print_error(output, &error),
+            };
+            Operation::CreateGeneratedSecret {
+                name: arguments.name,
+                description: arguments.description,
+                generator,
+            }
+        }
+        _ => {
+            return print_error(
+                output,
+                &input_error(
+                    "secret_input_required",
+                    "choose exactly one of `--stdin` or `--generate`",
+                ),
+            );
+        }
+    };
+    request_secret(output, operation)
+}
+
+fn list_secrets(output: Output, arguments: SecretListArgs) -> ExitCode {
+    let result = if arguments.token_stdin {
+        let token = match read_capability_token(true) {
+            Ok(token) => token,
+            Err(error) => return print_error(output, &error),
+        };
+        client::request_with_capability(Operation::DiscoverSecrets, Some(token))
+    } else {
+        client::request(Operation::ListSecrets)
+    };
+    match result {
+        Ok(Reply::Secrets(mut secrets)) => {
+            if !arguments.describe {
+                for secret in &mut secrets {
+                    secret.description = None;
+                }
+            }
+            print_secrets(output, &secrets)
+        }
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn secret_value_command(output: Output, command: SecretValueCommand) -> ExitCode {
+    let operation = match command {
+        SecretValueCommand::Set(arguments) => {
+            if !arguments.stdin {
+                return print_error(
+                    output,
+                    &input_error("secret_stdin_required", "use `--stdin`"),
+                );
+            }
+            let value = match read_secret_value() {
+                Ok(value) => value,
+                Err(error) => return print_error(output, &error),
+            };
+            Operation::SetSecretValue {
+                name: arguments.name,
+                value,
+            }
+        }
+        SecretValueCommand::Generate(arguments) => {
+            let generator = match generator_spec(arguments.format, arguments.length) {
+                Ok(generator) => generator,
+                Err(error) => return print_error(output, &error),
+            };
+            Operation::GenerateSecretValue {
+                name: arguments.name,
+                generator,
+            }
+        }
+    };
+    match client::request(operation) {
+        Ok(Reply::SecretVersion(version)) => print_versions(output, &[version]),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn request_secret(output: Output, operation: Operation) -> ExitCode {
+    match client::request(operation) {
+        Ok(Reply::Secret(secret)) => print_secrets(output, &[secret]),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn http_request(output: Output, arguments: HttpRequestArgs) -> ExitCode {
+    let token = match read_capability_token(arguments.token_stdin) {
+        Ok(token) => token,
+        Err(error) => return print_error(output, &error),
+    };
+    let body = match arguments.body_file {
+        Some(path) => match read_bounded_file(&path, envault_protocol::MAX_FRAME_BYTES / 2) {
+            Ok(body) => body,
+            Err(error) => return print_error(output, &error),
+        },
+        None => Vec::new(),
+    };
+    let request = HttpRequest {
+        url: arguments.url,
+        method: http_method(arguments.method),
+        body,
+        content_type: arguments.content_type.map(http_content_type),
+    };
+    match client::request_with_capability(
+        Operation::HttpRequest {
+            secret_id: envault_core::SecretId(arguments.secret),
+            request,
+        },
+        Some(token),
+    ) {
+        Ok(Reply::HttpResponse(response)) => print_http_response(output, &response),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn read_capability_token(from_stdin: bool) -> Result<SensitiveBytes, StructuredError> {
+    use zeroize::Zeroize;
+
+    if !from_stdin {
+        return Err(input_error(
+            "token_stdin_required",
+            "capability tokens are accepted only through `--token-stdin`",
+        ));
+    }
+    if io::stdin().is_terminal() {
+        return Err(input_error(
+            "token_stdin_requires_pipe",
+            "`--token-stdin` requires piped standard input",
+        ));
+    }
+    let mut encoded = Vec::new();
+    io::stdin()
+        .take(257)
+        .read_to_end(&mut encoded)
+        .map_err(|_| input_error("io_error", "failed to read the capability token"))?;
+    if encoded.len() > 256 {
+        encoded.zeroize();
+        return Err(input_error(
+            "invalid_capability_token",
+            "capability token input is too large",
+        ));
+    }
+    while encoded.last().is_some_and(u8::is_ascii_whitespace) {
+        encoded.pop();
+    }
+    let first = encoded
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(encoded.len());
+    if first > 0 {
+        encoded.drain(..first);
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&encoded);
+    encoded.zeroize();
+    let decoded = decoded.map_err(|_| {
+        input_error(
+            "invalid_capability_token",
+            "capability token is not valid base64url",
+        )
+    })?;
+    let decoded = SensitiveBytes::new(decoded);
+    if decoded.len() != 32 {
+        return Err(input_error(
+            "invalid_capability_token",
+            "capability token must decode to exactly 32 bytes",
+        ));
+    }
+    Ok(decoded)
+}
+
+fn read_secret_value() -> Result<SensitiveBytes, StructuredError> {
+    if io::stdin().is_terminal() {
+        return Err(input_error(
+            "secret_stdin_requires_pipe",
+            "secret values are accepted only through piped standard input",
+        ));
+    }
+    let maximum = envault_protocol::MAX_FRAME_BYTES / 2;
+    let mut value = Vec::new();
+    io::stdin()
+        .take(u64::try_from(maximum + 1).expect("bounded input limit"))
+        .read_to_end(&mut value)
+        .map_err(|_| input_error("io_error", "failed to read the secret value"))?;
+    let value = SensitiveBytes::new(value);
+    if value.is_empty() || value.len() > maximum {
+        return Err(input_error(
+            "invalid_secret_value",
+            "secret value must contain between 1 byte and 512 KiB",
+        ));
+    }
+    Ok(value)
+}
+
+fn read_bounded_file(path: &Path, maximum: usize) -> Result<Vec<u8>, StructuredError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| input_error("io_error", "unable to inspect the request body file"))?;
+    if !metadata.file_type().is_file() || metadata.len() > maximum as u64 {
+        return Err(input_error(
+            "invalid_request_body",
+            "request body must be a regular file no larger than 512 KiB",
+        ));
+    }
+    let body = fs::read(path)
+        .map_err(|_| input_error("io_error", "unable to read the request body file"))?;
+    if body.len() > maximum {
+        return Err(input_error(
+            "invalid_request_body",
+            "request body exceeds the maximum size",
+        ));
+    }
+    Ok(body)
+}
+
+fn generator_spec(
+    format: GeneratorFormatArg,
+    length: GeneratorLengthArgs,
+) -> Result<GeneratorSpec, StructuredError> {
+    let allow_weak = length.allow_weak;
+    let format = match format {
+        GeneratorFormatArg::UuidV4 => GeneratorFormat::UuidV4,
+        GeneratorFormatArg::Base64url => GeneratorFormat::Base64Url,
+        GeneratorFormatArg::Base64 => GeneratorFormat::Base64,
+    };
+    let length = match (length.chars, length.bytes) {
+        (None, None) => GeneratorLength::Default,
+        (Some(chars), None) => GeneratorLength::Chars(chars),
+        (None, Some(bytes)) => GeneratorLength::Bytes(bytes),
+        (Some(_), Some(_)) => {
+            return Err(input_error(
+                "invalid_generator_length",
+                "choose only one generator length unit",
+            ));
+        }
+    };
+    let spec = GeneratorSpec {
+        format,
+        length,
+        allow_weak,
+    };
+    envault_core::validate_generator(spec).map_err(|_| {
+        input_error(
+            "invalid_generator",
+            "generator arguments violate the contract",
+        )
+    })
+}
+
+fn resource_selector(arguments: &ResourceArgs) -> Result<ResourceSelector, StructuredError> {
+    match (arguments.vault, arguments.scope, arguments.secret) {
+        (Some(id), None, None) => Ok(ResourceSelector::Vault(envault_core::VaultId(id))),
+        (None, Some(id), None) => Ok(ResourceSelector::ScopeTree(envault_core::ScopeId(id))),
+        (None, None, Some(id)) => Ok(ResourceSelector::Secret(envault_core::SecretId(id))),
+        _ => Err(input_error(
+            "resource_required",
+            "choose exactly one of `--vault`, `--scope`, or `--secret`",
+        )),
+    }
+}
+
+fn grant_http_constraint(
+    arguments: &GrantCreateArgs,
+    action: Action,
+    resource: ResourceSelector,
+) -> Result<Option<HttpConstraint>, StructuredError> {
+    if action != Action::HttpRequest {
+        if arguments.host.is_some() || !arguments.method.is_empty() {
+            return Err(input_error(
+                "invalid_grant",
+                "HTTP constraints are valid only for HTTP grants",
+            ));
+        }
+        return Ok(None);
+    }
+    if !matches!(resource, ResourceSelector::Secret(_)) {
+        return Err(input_error(
+            "invalid_grant",
+            "HTTP grants require one exact `--secret` resource",
+        ));
+    }
+    let host = arguments
+        .host
+        .clone()
+        .ok_or_else(|| input_error("invalid_grant", "HTTP grants require an exact `--host`"))?;
+    if arguments.method.is_empty() {
+        return Err(input_error(
+            "invalid_grant",
+            "HTTP grants require at least one `--method`",
+        ));
+    }
+    Ok(Some(HttpConstraint {
+        host,
+        port: arguments.port,
+        methods: arguments.method.iter().copied().map(http_method).collect(),
+        path_prefix: arguments.path_prefix.clone(),
+        max_request_bytes: arguments.max_request_bytes,
+        max_response_bytes: arguments.max_response_bytes,
+    }))
+}
+
+const fn http_method(method: HttpMethodArg) -> HttpMethod {
+    match method {
+        HttpMethodArg::Get => HttpMethod::Get,
+        HttpMethodArg::Post => HttpMethod::Post,
+        HttpMethodArg::Put => HttpMethod::Put,
+        HttpMethodArg::Patch => HttpMethod::Patch,
+        HttpMethodArg::Delete => HttpMethod::Delete,
+    }
+}
+
+const fn http_content_type(content_type: HttpContentTypeArg) -> HttpContentType {
+    match content_type {
+        HttpContentTypeArg::Json => HttpContentType::Json,
+        HttpContentTypeArg::Text => HttpContentType::Text,
+        HttpContentTypeArg::Form => HttpContentType::Form,
     }
 }
 
@@ -268,6 +1104,353 @@ fn vault_database_path() -> Result<PathBuf, StructuredError> {
     envault_platform::data_directory()
         .map(|directory| directory.join("vault.db"))
         .map_err(|_| input_error("io_error", "unable to resolve the EnVault data directory"))
+}
+
+fn print_context(output: Output, context: &AgentContext) -> ExitCode {
+    match output {
+        Output::Human => println!(
+            "vault: {} · profile: {} · principal: {} · action: {:?} · resource: {} · constraint: {} · remaining: {}",
+            context.vault_id.0,
+            context.active_profile.name,
+            context.session.principal_id.0,
+            context.session.action,
+            resource_label(context.session.resource),
+            human_http_constraint(context.session.http_constraint.as_ref()),
+            context.session.remaining_requests
+        ),
+        Output::Json => print_json(context),
+        Output::Toon => {
+            println!(
+                "context{{vault_id,profile,profile_id,scope_id,principal_id,grant_id,action,resource,expires_at,remaining_requests}}: {},{},{},{},{},{},{:?},{},{},{}",
+                context.vault_id.0,
+                toon_string(&context.active_profile.name),
+                context.active_profile.id.0,
+                context.active_profile.scope_id.0,
+                context.session.principal_id.0,
+                context.session.grant_id.0,
+                context.session.action,
+                toon_string(&resource_label(context.session.resource)),
+                context.session.expires_at,
+                context.session.remaining_requests
+            );
+            print_http_constraint_toon(context.session.http_constraint.as_ref());
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_agent_session(output: Output, session: &AgentSessionView) -> ExitCode {
+    match output {
+        Output::Human => println!(
+            "grant: {} · principal: {} · action: {:?} · resource: {} · constraint: {} · expires_at: {} · remaining: {}",
+            session.grant_id.0,
+            session.principal_id.0,
+            session.action,
+            resource_label(session.resource),
+            human_http_constraint(session.http_constraint.as_ref()),
+            session.expires_at,
+            session.remaining_requests
+        ),
+        Output::Json => print_json(session),
+        Output::Toon => {
+            println!(
+                "session{{grant_id,principal_id,action,resource,expires_at,remaining_requests,revoked}}: {},{},{:?},{},{},{},{}",
+                session.grant_id.0,
+                session.principal_id.0,
+                session.action,
+                toon_string(&resource_label(session.resource)),
+                session.expires_at,
+                session.remaining_requests,
+                session.revoked
+            );
+            print_http_constraint_toon(session.http_constraint.as_ref());
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn resource_label(resource: ResourceSelector) -> String {
+    match resource {
+        ResourceSelector::Vault(id) => format!("vault:{}", id.0),
+        ResourceSelector::ScopeTree(id) => format!("scope_tree:{}", id.0),
+        ResourceSelector::Secret(id) => format!("secret:{}", id.0),
+    }
+}
+
+fn human_http_constraint(constraint: Option<&HttpConstraint>) -> String {
+    let Some(constraint) = constraint else {
+        return "none".to_owned();
+    };
+    let methods = constraint
+        .methods
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        "https://{}:{}{} [{}; request<={}B; response<={}B]",
+        constraint.host,
+        constraint.port,
+        constraint.path_prefix,
+        methods,
+        constraint.max_request_bytes,
+        constraint.max_response_bytes
+    )
+}
+
+fn print_http_constraint_toon(constraint: Option<&HttpConstraint>) {
+    let Some(constraint) = constraint else {
+        println!("http_constraint{{present}}: false");
+        return;
+    };
+    let methods = constraint
+        .methods
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("|");
+    println!(
+        "http_constraint{{host,port,methods,path_prefix,max_request_bytes,max_response_bytes}}: {},{},{},{},{},{}",
+        toon_string(&constraint.host),
+        constraint.port,
+        toon_string(&methods),
+        toon_string(&constraint.path_prefix),
+        constraint.max_request_bytes,
+        constraint.max_response_bytes
+    );
+}
+
+fn print_created_grant(output: Output, created: AgentSessionCreated) -> ExitCode {
+    use zeroize::Zeroize;
+
+    let mut raw = created.token.into_vec();
+    let mut token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw);
+    raw.zeroize();
+    match output {
+        Output::Human => println!(
+            "token: {}\ngrant: {}\napproval: {}\nexpires_at: {}\nmax_requests: {}",
+            token,
+            created.grant_id.0,
+            created.approval_id.0,
+            created.expires_at,
+            created.max_requests
+        ),
+        Output::Json => println!(
+            "{}",
+            serde_json::json!({
+                "token": token,
+                "grant_id": created.grant_id,
+                "approval_id": created.approval_id,
+                "expires_at": created.expires_at,
+                "max_requests": created.max_requests,
+            })
+        ),
+        Output::Toon => println!(
+            "grant{{token,grant_id,approval_id,expires_at,max_requests}}: {},{},{},{},{}",
+            toon_string(&token),
+            created.grant_id.0,
+            created.approval_id.0,
+            created.expires_at,
+            created.max_requests
+        ),
+    }
+    token.zeroize();
+    ExitCode::SUCCESS
+}
+
+fn print_profiles(output: Output, profiles: &[ProfileView]) -> ExitCode {
+    if matches!(output, Output::Json) {
+        print_json(profiles);
+    } else if matches!(output, Output::Toon) {
+        println!(
+            "profiles[{}]{{id,scope_id,name,description,activate_on_start,generation}}:",
+            profiles.len()
+        );
+        for profile in profiles {
+            println!(
+                "  {},{},{},{},{},{}",
+                profile.id.0,
+                profile.scope_id.0,
+                toon_string(&profile.name),
+                optional_toon(profile.description.as_deref()),
+                profile.activate_on_start,
+                profile.generation
+            );
+        }
+    } else {
+        for profile in profiles {
+            println!(
+                "{} · id: {} · scope: {} · startup: {} · description: {}",
+                profile.name,
+                profile.id.0,
+                profile.scope_id.0,
+                profile.activate_on_start,
+                profile.description.as_deref().unwrap_or("none")
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_secrets(output: Output, secrets: &[SecretView]) -> ExitCode {
+    if matches!(output, Output::Json) {
+        print_json(secrets);
+    } else if matches!(output, Output::Toon) {
+        println!(
+            "secrets[{}]{{id,scope_id,name,description,current_version,status}}:",
+            secrets.len()
+        );
+        for secret in secrets {
+            println!(
+                "  {},{},{},{},{},{:?}",
+                secret.id.0,
+                secret.scope_id.0,
+                toon_string(&secret.name),
+                optional_toon(secret.description.as_deref()),
+                secret.current_version,
+                secret.status
+            );
+        }
+    } else {
+        for secret in secrets {
+            println!(
+                "{} · id: {} · scope: {} · version: {} · status: {:?} · description: {}",
+                secret.name,
+                secret.id.0,
+                secret.scope_id.0,
+                secret.current_version,
+                secret.status,
+                secret.description.as_deref().unwrap_or("none")
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_versions(output: Output, versions: &[SecretVersionView]) -> ExitCode {
+    if matches!(output, Output::Json) {
+        print_json(versions);
+    } else if matches!(output, Output::Toon) {
+        println!(
+            "versions[{}]{{id,secret_id,version,generator,generated_length,entropy_bits}}:",
+            versions.len()
+        );
+        for version in versions {
+            println!(
+                "  {},{},{},{:?},{},{}",
+                version.id.0,
+                version.secret_id.0,
+                version.version,
+                version.generator,
+                optional_number(version.generated_length),
+                optional_number(version.entropy_bits)
+            );
+        }
+    } else {
+        for version in versions {
+            println!(
+                "version: {} · id: {} · generator: {:?} · length: {} · entropy_bits: {}",
+                version.version,
+                version.id.0,
+                version.generator,
+                optional_number(version.generated_length),
+                optional_number(version.entropy_bits)
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_principals(output: Output, principals: &[envault_core::PrincipalView]) -> ExitCode {
+    if matches!(output, Output::Json) {
+        print_json(principals);
+    } else if matches!(output, Output::Toon) {
+        println!(
+            "principals[{}]{{id,kind,name,disabled,generation}}:",
+            principals.len()
+        );
+        for principal in principals {
+            println!(
+                "  {},{:?},{},{},{}",
+                principal.id.0,
+                principal.kind,
+                toon_string(&principal.name),
+                principal.disabled,
+                principal.generation
+            );
+        }
+    } else {
+        for principal in principals {
+            println!(
+                "{} · id: {} · kind: {:?} · disabled: {}",
+                principal.name, principal.id.0, principal.kind, principal.disabled
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_http_response(output: Output, response: &HttpResponse) -> ExitCode {
+    match output {
+        Output::Human => {
+            println!("status: {}", response.status);
+            println!(
+                "content-type: {}",
+                response.content_type.as_deref().unwrap_or("none")
+            );
+            print!("{}", response.body);
+            let _ = io::stdout().flush();
+        }
+        Output::Json => print_json(response),
+        Output::Toon => println!(
+            "http{{status,content_type,body}}: {},{},{}",
+            response.status,
+            optional_toon(response.content_type.as_deref()),
+            toon_string(&response.body)
+        ),
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_json_or_debug<T: Serialize + core::fmt::Debug>(
+    output: Output,
+    value: &T,
+    label: &str,
+) -> ExitCode {
+    match output {
+        Output::Human => println!("{label}: {value:#?}"),
+        Output::Json => print_json(value),
+        Output::Toon => println!(
+            "{}{{json}}: {}",
+            label,
+            toon_string(&serde_json::to_string(value).expect("value serializes"))
+        ),
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_acknowledgement(output: Output, state: &str) -> ExitCode {
+    match output {
+        Output::Human => println!("status: {state}"),
+        Output::Json => println!("{{\"status\":{}}}", toon_string(state)),
+        Output::Toon => println!("status{{state}}: {}", toon_string(state)),
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_json<T: Serialize + ?Sized>(value: &T) {
+    println!(
+        "{}",
+        serde_json::to_string(value).expect("value serializes")
+    );
+}
+
+fn optional_toon(value: Option<&str>) -> String {
+    value.map_or_else(|| "null".into(), toon_string)
+}
+
+fn optional_number<T: ToString>(value: Option<T>) -> String {
+    value.map_or_else(|| "null".into(), |number| number.to_string())
 }
 
 fn print_status(output: Output) -> ExitCode {
@@ -489,12 +1672,17 @@ fn unexpected_response() -> StructuredError {
 }
 
 fn input_error(code: &str, message: &str) -> StructuredError {
+    let retryable = code == "io_error";
     StructuredError {
         code: code.into(),
         message: message.into(),
-        help: vec!["Use a trusted terminal or `--password-stdin`".into()],
+        help: vec![if retryable {
+            "Check the trusted local input source and retry".into()
+        } else {
+            "Correct the command input before retrying".into()
+        }],
         request_id: Uuid::new_v4(),
-        retryable: true,
+        retryable,
     }
 }
 
@@ -516,10 +1704,11 @@ fn not_implemented(output: Output, action: &str) -> ExitCode {
 fn print_error(output: Output, error: &StructuredError) -> ExitCode {
     match output {
         Output::Human => eprintln!(
-            "error: {} · {} · request_id: {} · help: {}",
+            "error: {} · {} · request_id: {} · retryable: {} · help: {}",
             error.code,
             error.message,
             error.request_id,
+            error.retryable,
             error.help.join("; ")
         ),
         Output::Json => eprintln!(
@@ -549,7 +1738,25 @@ fn toon_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct Contract {
+        command: Vec<ContractCommand>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ContractCommand {
+        path: String,
+        #[serde(default = "implemented_by_default")]
+        implemented: bool,
+    }
+
+    const fn implemented_by_default() -> bool {
+        true
+    }
 
     #[test]
     fn bootstrap_command_surface_is_stable() {
@@ -572,6 +1779,7 @@ mod tests {
                 "admin",
                 "profile",
                 "secret",
+                "agent",
                 "request",
                 "workspace"
             ]
@@ -583,5 +1791,70 @@ mod tests {
         let contract = include_str!("../../../commands.toml");
         assert!(!contract.contains("--value"));
         assert!(!contract.contains("get_secret"));
+    }
+
+    #[test]
+    fn generator_arguments_preserve_format_length_and_weak_override() {
+        assert_eq!(
+            generator_spec(
+                GeneratorFormatArg::Base64url,
+                GeneratorLengthArgs::default()
+            )
+            .expect("default generator"),
+            GeneratorSpec {
+                format: GeneratorFormat::Base64Url,
+                length: GeneratorLength::Default,
+                allow_weak: false,
+            }
+        );
+        assert_eq!(
+            generator_spec(
+                GeneratorFormatArg::Base64url,
+                GeneratorLengthArgs {
+                    chars: Some(12),
+                    bytes: None,
+                    allow_weak: true,
+                },
+            )
+            .expect("explicit weak generator"),
+            GeneratorSpec {
+                format: GeneratorFormat::Base64Url,
+                length: GeneratorLength::Chars(12),
+                allow_weak: true,
+            }
+        );
+    }
+
+    #[test]
+    fn implemented_cli_leaf_paths_match_the_canonical_contract() {
+        use clap::CommandFactory;
+
+        let mut actual = BTreeSet::new();
+        collect_leaf_paths(&Cli::command(), "", &mut actual);
+        actual.remove("workspace");
+        let contract: Contract = toml::from_str(include_str!("../../../commands.toml"))
+            .expect("canonical command contract");
+        let expected = contract
+            .command
+            .into_iter()
+            .filter(|command| command.implemented)
+            .map(|command| command.path)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    fn collect_leaf_paths(command: &clap::Command, prefix: &str, paths: &mut BTreeSet<String>) {
+        for child in command.get_subcommands() {
+            let path = if prefix.is_empty() {
+                child.get_name().to_owned()
+            } else {
+                format!("{prefix} {}", child.get_name())
+            };
+            if child.has_subcommands() {
+                collect_leaf_paths(child, &path, paths);
+            } else {
+                paths.insert(path);
+            }
+        }
     }
 }
