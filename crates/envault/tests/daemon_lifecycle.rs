@@ -800,20 +800,32 @@ fn malformed_local_clients_fail_closed_without_crashing_daemon() {
     repeated
         .write_all(&encode_frame(&first_request).expect("first frame"))
         .expect("first request");
-    repeated
-        .write_all(&encode_frame(&second_request).expect("second frame"))
-        .expect("second request");
+    // The daemon serves exactly one request per connection and then drops the
+    // stream, closing it. Depending on scheduling, that close can race far
+    // enough ahead of this client that the *second* write (not just the
+    // subsequent read) observes the closed pipe. Both landing spots are
+    // benign evidence of the same "connection rejected after one request"
+    // contract, so both are tolerated; anything else still fails the test.
+    let second_write = repeated.write_all(&encode_frame(&second_request).expect("second frame"));
     let response = read_response(&mut repeated);
     assert_eq!(response.request_id, first_request.request_id);
-    let mut extra = [0; 1];
-    match repeated.read(&mut extra) {
-        Ok(0) => {}
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
-            ) => {}
-        result => panic!("second request was not rejected by connection close: {result:?}"),
+    let is_closed_error = |error: &std::io::Error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+        )
+    };
+    match second_write {
+        Ok(()) => {
+            let mut extra = [0; 1];
+            match repeated.read(&mut extra) {
+                Ok(0) => {}
+                Err(error) if is_closed_error(&error) => {}
+                result => panic!("second request was not rejected by connection close: {result:?}"),
+            }
+        }
+        Err(error) if is_closed_error(&error) => {}
+        Err(error) => panic!("second request write failed unexpectedly: {error:?}"),
     }
 
     let status = fixture.json(&["--output", "json", "status"]);

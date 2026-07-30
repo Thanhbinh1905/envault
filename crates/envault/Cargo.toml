@@ -13,11 +13,13 @@ default-run = "envault"
 [dependencies]
 base64.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 envault-core = { version = "=0.0.1", path = "../envault-core" }
 envault-platform = { version = "=0.0.1", path = "../envault-platform" }
 envault-policy = { version = "=0.0.1", path = "../envault-policy" }
 envault-protocol = { version = "=0.0.1", path = "../envault-protocol" }
 envault-service = { version = "=0.0.1", path = "../envault-service" }
+ratatui.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
