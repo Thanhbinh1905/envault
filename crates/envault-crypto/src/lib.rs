@@ -98,7 +98,7 @@ pub fn encrypt(key: &SecretKey, plaintext: &[u8], aad: &[u8]) -> Result<Cipherte
     getrandom::fill(&mut nonce).map_err(|_| CryptoError::Random)?;
     let bytes = cipher
         .encrypt(
-            XNonce::from_slice(&nonce),
+            &XNonce::from(nonce),
             Payload {
                 msg: plaintext,
                 aad,
@@ -116,7 +116,7 @@ pub fn decrypt(
     let cipher = XChaCha20Poly1305::new(key.expose().into());
     cipher
         .decrypt(
-            XNonce::from_slice(&ciphertext.nonce),
+            &XNonce::from(ciphertext.nonce),
             Payload {
                 msg: &ciphertext.bytes,
                 aad,
