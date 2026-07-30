@@ -15,11 +15,14 @@ clap.workspace = true
 envault-core = { version = "=0.0.1", path = "../envault-core" }
 envault-platform = { version = "=0.0.1", path = "../envault-platform" }
 envault-protocol = { version = "=0.0.1", path = "../envault-protocol" }
+envault-service = { version = "=0.0.1", path = "../envault-service" }
+rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 toml.workspace = true
 
 [lints]

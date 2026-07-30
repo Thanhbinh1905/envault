@@ -27,7 +27,26 @@ cargo xtask verify
 
 The pinned toolchain is Rust 1.97.1 with Rust Edition 2024.
 
+## Bootstrap
+
+Initialize a vault from an interactive masked terminal prompt:
+
+```sh
+cargo run -p envault -- init
+```
+
+Automation may provide the master password only through piped standard input:
+
+```sh
+read -r -s bootstrap_password
+printf '%s\n' "$bootstrap_password" | cargo run -p envault -- init --password-stdin
+unset bootstrap_password
+```
+
+The shell variable is not exported and is never read as an environment input by EnVault.
+Do not place a real password directly in shell history.
+Profile, secret, lifecycle, and broker commands remain fail-closed until the authenticated daemon and IPC phases are complete.
+
 ## License
 
 Licensed under either the Apache License, Version 2.0 or the MIT license, at your option.
-

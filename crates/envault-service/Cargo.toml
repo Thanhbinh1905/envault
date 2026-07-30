@@ -1,0 +1,29 @@
+[package]
+name = "envault-service"
+description = "Application services and encrypted vault workflows for EnVault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+base64.workspace = true
+blake3.workspace = true
+ciborium.workspace = true
+envault-core = { version = "=0.0.1", path = "../envault-core" }
+envault-crypto = { version = "=0.0.1", path = "../envault-crypto" }
+envault-platform = { version = "=0.0.1", path = "../envault-platform" }
+envault-store = { version = "=0.0.1", path = "../envault-store" }
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
