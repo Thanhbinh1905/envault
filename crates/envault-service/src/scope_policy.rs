@@ -496,7 +496,7 @@ impl VaultSession {
         self.resource_context(resource).map(|_| ())
     }
 
-    fn resource_context(
+    pub(super) fn resource_context(
         &self,
         resource: ResourceSelector,
     ) -> Result<(Vec<ScopeId>, Option<SecretId>), ServiceError> {

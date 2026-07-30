@@ -26,6 +26,10 @@ const DAEMON_TRANSITION_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const DAEMON_TRANSITION_INTERVAL: Duration = Duration::from_millis(100);
 
+#[cfg(unix)]
+const IPC_RESPONSE_TIMEOUT: Duration =
+    Duration::from_secs(envault_protocol::DEFAULT_REQUEST_TIMEOUT_SECONDS + 1);
+
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("EnVault daemon is not running")]
@@ -99,9 +103,7 @@ pub fn request_at(
 
     let mut stream = UnixStream::connect(path).map_err(|_| ClientError::NotRunning)?;
     authenticate_server(path, &stream)?;
-    let timeout = Some(Duration::from_secs(
-        envault_protocol::DEFAULT_REQUEST_TIMEOUT_SECONDS,
-    ));
+    let timeout = Some(IPC_RESPONSE_TIMEOUT);
     stream
         .set_read_timeout(timeout)
         .map_err(|_| ClientError::Protocol)?;

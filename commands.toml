@@ -73,20 +73,204 @@ outputs = ["human", "json", "toon"]
 errors = ["envault_not_running", "envault_locked", "admin_auth_required"]
 
 [[command]]
-path = "profile"
+path = "admin agent create"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "conflict", "invalid_input"]
+
+[[command]]
+path = "admin agent list"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required"]
+
+[[command]]
+path = "admin agent enable"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found"]
+
+[[command]]
+path = "admin agent disable"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found"]
+
+[[command]]
+path = "admin grant create"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "invalid_grant", "token_output_requires_pipe"]
+
+[[command]]
+path = "admin grant revoke"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found"]
+
+[[command]]
+path = "admin policy create"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "invalid_input", "not_found"]
+
+[[command]]
+path = "admin policy list"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required"]
+
+[[command]]
+path = "profile create"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "conflict", "invalid_input"]
+
+[[command]]
+path = "profile show"
 auth = "service"
 daemon = "required"
 agent = false
 outputs = ["human", "json", "toon"]
-errors = ["envault_not_running", "envault_locked", "admin_auth_required"]
+errors = ["envault_locked", "not_found"]
 
 [[command]]
-path = "secret"
+path = "profile list"
 auth = "service"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["envault_locked"]
+
+[[command]]
+path = "profile update"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found", "invalid_input"]
+
+[[command]]
+path = "profile rename"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found", "conflict"]
+
+[[command]]
+path = "profile delete"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found", "conflict"]
+
+[[command]]
+path = "profile activate"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found"]
+
+[[command]]
+path = "secret create"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "conflict", "invalid_input"]
+
+[[command]]
+path = "secret list"
+auth = "service_or_agent"
 daemon = "required"
 agent = "discovery_only"
 outputs = ["human", "json", "toon"]
-errors = ["envault_not_running", "envault_locked", "admin_auth_required", "secret_not_found"]
+errors = ["envault_locked", "permission_denied"]
+
+[[command]]
+path = "secret describe"
+auth = "service"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["envault_locked", "not_found"]
+
+[[command]]
+path = "secret update"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found", "invalid_input"]
+
+[[command]]
+path = "secret rename"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found", "conflict"]
+
+[[command]]
+path = "secret delete"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found"]
+
+[[command]]
+path = "secret versions"
+auth = "service"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["envault_locked", "not_found"]
+
+[[command]]
+path = "secret value set"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found", "invalid_input"]
+
+[[command]]
+path = "secret value generate"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found", "invalid_input"]
+
+[[command]]
+path = "agent session status"
+auth = "agent"
+daemon = "required"
+agent = true
+outputs = ["human", "json", "toon"]
+errors = ["envault_locked", "permission_denied"]
 
 [[command]]
 path = "request http"
@@ -94,10 +278,11 @@ auth = "agent"
 daemon = "required"
 agent = true
 outputs = ["human", "json", "toon"]
-errors = ["envault_not_running", "envault_locked", "permission_denied", "request_rejected"]
+errors = ["envault_locked", "permission_denied", "request_rejected", "response_rejected", "provider_error", "network_error"]
 
 [[command]]
 path = "profile export"
+implemented = false
 auth = "admin"
 daemon = "required"
 agent = false
@@ -106,9 +291,9 @@ errors = ["admin_auth_required", "package_error"]
 
 [[command]]
 path = "workspace import"
+implemented = false
 auth = "admin"
 daemon = "required"
 agent = false
 outputs = ["human", "json", "toon"]
 errors = ["admin_auth_required", "package_error", "conflict"]
-

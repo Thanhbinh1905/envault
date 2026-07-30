@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fs};
 
+use envault_broker::{HttpConstraint, HttpMethod, HttpRequest};
 use envault_core::{
     ApprovalId, GeneratorFormat, GeneratorLength, GrantId, PrincipalKind, PrincipalView, ScopeKind,
     SecretStatus,
@@ -651,4 +652,107 @@ fn policy_deny_precedence_bounded_grant_and_audit_chain_hold() {
     assert_eq!(grant.uses, 0);
     session.verify_audit_chain().expect("audit chain");
     assert_audit_deletion_is_detected(&session, &path);
+}
+
+#[test]
+fn agent_discovery_consumes_one_use_and_filters_explicit_denies() {
+    let (_directory, _path, _password, mut session) = initialized();
+    let visible = session
+        .create_secret(
+            "VISIBLE_TOKEN",
+            Some("Agent-visible metadata"),
+            SensitiveInput::copy_from_slice(b"visible-secret-value"),
+        )
+        .expect("visible secret");
+    let hidden = session
+        .create_secret(
+            "HIDDEN_TOKEN",
+            Some("Denied metadata"),
+            SensitiveInput::copy_from_slice(b"hidden-secret-value"),
+        )
+        .expect("hidden secret");
+    let principal = session
+        .create_principal(PrincipalKind::Agent, "agent:discovery")
+        .expect("principal");
+    session
+        .create_policy_rule(
+            principal.id,
+            Effect::Deny,
+            Action::Discover,
+            ResourceSelector::Secret(hidden.id),
+        )
+        .expect("deny hidden secret");
+    let mut grant = Grant {
+        id: GrantId(Uuid::new_v4()),
+        principal_id: principal.id,
+        action: Action::Discover,
+        resource: ResourceSelector::Vault(session.vault_id()),
+        issued_at: 100,
+        expires_at: 200,
+        max_uses: 1,
+        uses: 0,
+        revoked: false,
+        nonce: [4; 32],
+        approval_id: ApprovalId(Uuid::new_v4()),
+    };
+    let discovered = session
+        .discover_secrets(&mut grant, 150, Uuid::new_v4())
+        .expect("discover");
+    assert_eq!(discovered, vec![visible]);
+    assert_eq!(grant.uses, 1);
+    assert_eq!(session.audit_events().expect("audit").len(), 1);
+}
+
+#[test]
+fn http_preparation_authorizes_exact_secret_without_exposing_credential() {
+    let (_directory, _path, _password, mut session) = initialized();
+    let secret = session
+        .create_secret(
+            "HTTP_TOKEN",
+            None,
+            SensitiveInput::copy_from_slice(b"broker-token-1234"),
+        )
+        .expect("secret");
+    let principal = session
+        .create_principal(PrincipalKind::Agent, "agent:http")
+        .expect("principal");
+    let mut grant = Grant {
+        id: GrantId(Uuid::new_v4()),
+        principal_id: principal.id,
+        action: Action::HttpRequest,
+        resource: ResourceSelector::Secret(secret.id),
+        issued_at: 100,
+        expires_at: 200,
+        max_uses: 1,
+        uses: 0,
+        revoked: false,
+        nonce: [5; 32],
+        approval_id: ApprovalId(Uuid::new_v4()),
+    };
+    let prepared = session
+        .prepare_agent_http_request(
+            &mut grant,
+            HttpConstraint {
+                host: "api.example.com".into(),
+                port: 443,
+                methods: vec![HttpMethod::Get],
+                path_prefix: "/v1".into(),
+                max_request_bytes: 1024,
+                max_response_bytes: 4096,
+            },
+            secret.id,
+            HttpRequest {
+                url: "https://api.example.com/v1/status".into(),
+                method: HttpMethod::Get,
+                body: Vec::new(),
+                content_type: None,
+            },
+            150,
+            Uuid::new_v4(),
+        )
+        .expect("prepare request");
+    let debug = format!("{prepared:?}");
+    assert_eq!(debug, "AgentHttpRequest([REDACTED])");
+    assert!(!debug.contains("broker-token-1234"));
+    assert_eq!(grant.uses, 1);
 }

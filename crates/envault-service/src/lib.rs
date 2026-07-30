@@ -17,8 +17,16 @@ use envault_store::{
 use thiserror::Error;
 use uuid::Uuid;
 
+mod broker;
+mod capability;
 mod internal;
 mod scope_policy;
+
+pub use broker::{
+    AgentHttpRequest, BrokerFailure, classify_broker_failure, execute_agent_http_request,
+    normalize_agent_http_constraint,
+};
+pub use capability::{CapabilityTokenKey, IssuedCapabilityMaterial};
 
 use internal::{
     GeneratorMetadata, decode_cbor, encode_cbor, encrypt_text, generate_value, generator_code,
@@ -53,7 +61,17 @@ impl SensitiveInput {
     }
 
     pub fn matches(&self, other: &Self) -> bool {
-        self.0.as_ref() == other.0.as_ref()
+        if self.0.as_ref().len() != other.0.as_ref().len() {
+            return false;
+        }
+        self.0
+            .as_ref()
+            .iter()
+            .zip(other.0.as_ref())
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
+            == 0
     }
 
     fn secret(&self) -> &SecretBytes {
@@ -113,6 +131,8 @@ pub enum ServiceError {
     Conflict,
     #[error("resource was not found")]
     NotFound,
+    #[error("the principal is not permitted to perform this operation")]
+    PermissionDenied,
     #[error("the startup profile cannot be deleted")]
     StartupProfileRequired,
     #[error("vault data is corrupt")]
@@ -135,6 +155,8 @@ pub enum ServiceError {
     Platform(#[from] envault_platform::PlatformError),
     #[error(transparent)]
     Policy(#[from] envault_policy::PolicyError),
+    #[error(transparent)]
+    Broker(#[from] envault_broker::BrokerError),
     #[error("filesystem operation failed")]
     Io(#[from] std::io::Error),
 }

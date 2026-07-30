@@ -180,6 +180,241 @@ fn concurrent_start_commands_converge_on_one_unlocked_daemon() {
     );
 }
 
+#[test]
+fn phase_four_cli_filters_discovery_and_rejects_private_http_targets() {
+    let fixture = DaemonFixture::initialize_and_start();
+    let setup = setup_phase_four(&fixture);
+    assert_phase_four_discovery(&fixture, &setup);
+    assert_phase_four_private_http_rejection(&fixture, &setup);
+    assert_tree_has_no_bytes(&fixture.data_home, b"phase4-e2e-credential");
+    assert_tree_has_no_bytes(&fixture.data_home, b"hidden-phase4-credential");
+    assert_tree_has_no_bytes(&fixture.data_home, setup.discovery_token.as_bytes());
+}
+
+struct PhaseFourSetup {
+    visible_id: String,
+    principal_id: String,
+    discovery_token: String,
+}
+
+fn setup_phase_four(fixture: &DaemonFixture) -> PhaseFourSetup {
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+    let credential = b"phase4-e2e-credential";
+    let visible_output = fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "VISIBLE_TOKEN",
+            "--description",
+            "Visible metadata",
+            "--stdin",
+        ],
+        Some(credential),
+    );
+    assert_success(&visible_output);
+    assert_no_bytes(&visible_output.stdout, credential);
+    let visible: Value = serde_json::from_slice(&visible_output.stdout).expect("visible secret");
+    let visible_id = visible[0]["id"].as_str().expect("visible id").to_owned();
+    let scope_id = visible[0]["scope_id"]
+        .as_str()
+        .expect("scope id")
+        .to_owned();
+    let hidden = fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "HIDDEN_TOKEN",
+            "--stdin",
+        ],
+        Some(b"hidden-phase4-credential"),
+    );
+    assert_success(&hidden);
+    let hidden: Value = serde_json::from_slice(&hidden.stdout).expect("hidden secret");
+    let hidden_id = hidden[0]["id"].as_str().expect("hidden id").to_owned();
+    let principal = fixture.json(&[
+        "--output",
+        "json",
+        "admin",
+        "agent",
+        "create",
+        "agent:phase4-e2e",
+    ]);
+    let principal_id = principal[0]["id"]
+        .as_str()
+        .expect("principal id")
+        .to_owned();
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "admin",
+            "policy",
+            "create",
+            "--principal",
+            &principal_id,
+            "--effect",
+            "deny",
+            "--action",
+            "discover",
+            "--secret",
+            &hidden_id,
+        ],
+        None,
+    ));
+
+    let grant = fixture.run(
+        &[
+            "--output",
+            "json",
+            "admin",
+            "grant",
+            "create",
+            "--principal",
+            &principal_id,
+            "--action",
+            "discover",
+            "--scope",
+            &scope_id,
+            "--max-requests",
+            "3",
+        ],
+        None,
+    );
+    assert_success(&grant);
+    let grant: Value = serde_json::from_slice(&grant.stdout).expect("grant");
+    let discovery_token = grant["token"].as_str().expect("token").to_owned();
+    PhaseFourSetup {
+        visible_id,
+        principal_id,
+        discovery_token,
+    }
+}
+
+fn assert_phase_four_discovery(fixture: &DaemonFixture, setup: &PhaseFourSetup) {
+    let token = setup.discovery_token.as_bytes();
+    let context = fixture.run(
+        &["--output", "json", "context", "--token-stdin"],
+        Some(token),
+    );
+    assert_success(&context);
+    assert_no_bytes(&context.stdout, token);
+    let context: Value = serde_json::from_slice(&context.stdout).expect("context");
+    assert_eq!(context["session"]["remaining_requests"], 3);
+    let toon_context = fixture.run(
+        &["--output", "toon", "context", "--token-stdin"],
+        Some(token),
+    );
+    assert_success(&toon_context);
+    let toon_context = String::from_utf8(toon_context.stdout).expect("TOON context");
+    assert!(toon_context.contains("resource"));
+    assert!(toon_context.contains("http_constraint{present}: false"));
+
+    let discovery = fixture.run(
+        &[
+            "--output",
+            "toon",
+            "secret",
+            "list",
+            "--describe",
+            "--token-stdin",
+        ],
+        Some(token),
+    );
+    assert_success(&discovery);
+    assert!(
+        discovery
+            .stdout
+            .windows(b"VISIBLE_TOKEN".len())
+            .any(|window| window == b"VISIBLE_TOKEN")
+    );
+    assert_no_bytes(&discovery.stdout, b"HIDDEN_TOKEN");
+    assert_no_bytes(&discovery.stdout, token);
+    let session = fixture.run(
+        &[
+            "--output",
+            "json",
+            "agent",
+            "session",
+            "status",
+            "--token-stdin",
+        ],
+        Some(token),
+    );
+    assert_success(&session);
+    let session: Value = serde_json::from_slice(&session.stdout).expect("session");
+    assert_eq!(session["remaining_requests"], 2);
+}
+
+fn assert_phase_four_private_http_rejection(fixture: &DaemonFixture, setup: &PhaseFourSetup) {
+    let http_grant = fixture.run(
+        &[
+            "--output",
+            "json",
+            "admin",
+            "grant",
+            "create",
+            "--principal",
+            &setup.principal_id,
+            "--action",
+            "http",
+            "--secret",
+            &setup.visible_id,
+            "--host",
+            "localhost",
+            "--method",
+            "get",
+            "--path-prefix",
+            "/v1",
+        ],
+        None,
+    );
+    assert_success(&http_grant);
+    let http_grant: Value = serde_json::from_slice(&http_grant.stdout).expect("HTTP grant");
+    let http_token = http_grant["token"].as_str().expect("HTTP token");
+    let rejected = fixture.run(
+        &[
+            "--output",
+            "json",
+            "request",
+            "http",
+            "https://localhost/v1/status",
+            "--method",
+            "get",
+            "--secret",
+            &setup.visible_id,
+            "--token-stdin",
+        ],
+        Some(http_token.as_bytes()),
+    );
+    assert!(!rejected.status.success());
+    assert_no_bytes(&rejected.stderr, http_token.as_bytes());
+    assert_no_bytes(&rejected.stderr, b"phase4-e2e-credential");
+    let error: Value = serde_json::from_slice(&rejected.stderr).expect("structured error");
+    assert_eq!(error["code"], "request_rejected");
+    let session = fixture.run(
+        &[
+            "--output",
+            "json",
+            "agent",
+            "session",
+            "status",
+            "--token-stdin",
+        ],
+        Some(http_token.as_bytes()),
+    );
+    assert_success(&session);
+    let session: Value = serde_json::from_slice(&session.stdout).expect("HTTP session");
+    assert_eq!(session["remaining_requests"], 0);
+    assert_tree_has_no_bytes(&fixture.data_home, http_token.as_bytes());
+}
+
 fn assert_initial_runtime(fixture: &DaemonFixture) -> u32 {
     let status = fixture.json(&["--output", "json", "status"]);
     assert_eq!(status["daemon"], "running");
@@ -458,6 +693,7 @@ fn agent_capabilities_are_narrow_hashed_revocable_and_never_admin() {
             principal_id: principal.id,
             action: Action::Reveal,
             resource: ResourceSelector::Vault(vault_id),
+            http_constraint: None,
             ttl_minutes: 15,
             max_requests: 2,
         },
@@ -471,6 +707,7 @@ fn agent_capabilities_are_narrow_hashed_revocable_and_never_admin() {
             principal_id: principal.id,
             action: Action::Discover,
             resource: ResourceSelector::Vault(vault_id),
+            http_constraint: None,
             ttl_minutes: 15,
             max_requests: 2,
         },
