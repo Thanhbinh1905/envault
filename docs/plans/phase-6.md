@@ -2,12 +2,13 @@
 
 ## Objective
 
-Deliver `envault-tui`, an interactive terminal dashboard for scopes, profiles, secret metadata, admin leases, agent sessions, and portability workflows, built entirely on the existing authenticated daemon IPC surface.
+Deliver `envault-tui`, an interactive terminal dashboard for profiles, secret metadata, admin leases, agent sessions, and portability workflows, built entirely on the existing authenticated daemon IPC surface.
 The terminal UI never renders secret plaintext and introduces no new protocol operation, storage access, or cryptographic dependency.
 
 ## Ownership
 
-`envault-core` contributes no new stable types; the terminal UI renders the existing redacted `ScopeView`, `ProfileView`, `SecretView`, `SecretVersionView`, `PortabilityPreview`, and status types unchanged.
+`envault-core` contributes no new stable types; the terminal UI renders the existing redacted `ProfileView`, `SecretView`, `SecretVersionView`, `PortabilityPreview`, and status types unchanged.
+No protocol operation returns a `ScopeView` listing today, so the terminal UI browses profiles and their secrets directly rather than through an invented scope tree; introducing scope listing is deferred to whichever phase actually needs it rather than added incidentally here.
 `envault-crypto`, `envault-store`, and `envault-platform` are not linked into the terminal UI binary.
 `envault-service` and `envault-protocol` gain no new operations; every terminal UI action maps to an `Operation` variant already dispatched by the daemon for the CLI.
 `envault-service`'s application boundary and the daemon's admin-lease enforcement, agent-capability rules, and structured error mapping apply identically regardless of which client issued the request.
@@ -19,15 +20,15 @@ The CLI and terminal UI remain IPC-only clients with no direct storage or crypto
 `envault-tui` is a new `[[bin]]` target in the existing `envault` crate, replacing the placeholder in `src/bin/envault-tui.rs`.
 The binary depends on `ratatui` for layout and widgets and `crossterm` for the terminal backend, both added as new workspace dependencies pinned to exact versions.
 The terminal UI reuses `envault::client` for every daemon call, so socket discovery, CBOR framing, the one-megabyte frame cap, and the portability response deadline are identical to the CLI's behavior.
-The application owns one `tokio` runtime, drives daemon calls on it, and keeps the render loop on the main thread; a background call never blocks input handling for more than one frame interval.
+The daemon IPC client is a synchronous blocking call over a Unix socket, matching the existing `envault::client` used by the CLI, so the terminal UI issues each request inline on the input loop rather than spawning an async runtime; daemon round trips are local and fast enough that this does not visibly stall input handling.
 Raw mode and the alternate screen are entered only after the terminal is confirmed interactive and are unconditionally restored on every exit path, including panics, through a panic hook installed before raw mode begins and a guard type whose `Drop` restores the terminal.
 The terminal UI never writes its own log file and never persists a session state file; all state is in-memory for the process lifetime.
 
 ## Read surface
 
-The dashboard's default view shows daemon status, lock state, the active profile, and the admin lease and agent session summaries already exposed by `Status`, `AdminStatus`, and `AgentSessionStatus`.
-A scope and profile browser lists `ScopeView` and `ProfileView` records in a tree matching the scope hierarchy, with secret counts per scope.
-A secret list for the selected scope shows `SecretView` fields only: name, description, current version, and status, with no value field to omit because the type carries none.
+The dashboard's default view shows daemon status, lock state, the active profile, and the admin lease status and agent session count already exposed by `Status` and `AdminStatus`; `AgentSessionStatus` reports only the calling session's own state through its capability token and is not an admin-wide listing, so the dashboard counter comes from `DaemonStatus` instead.
+A profile browser lists `ProfileView` records.
+A secret list for the selected profile shows `SecretView` fields only: name, description, current version, and status, with no value field to omit because the type carries none.
 A version history view for a selected secret lists `SecretVersionView` entries: version number, creation time, and generator metadata, again with no plaintext field to omit.
 Every list and detail view is read-only and requires no admin lease, matching the same authorization the CLI's read commands already use.
 
