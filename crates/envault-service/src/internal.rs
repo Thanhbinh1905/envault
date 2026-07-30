@@ -163,6 +163,7 @@ pub(super) fn metadata_aad(vault_id: VaultId, kind: EntityKind, id: Uuid, field:
         EntityKind::Scope => b"scope".as_slice(),
         EntityKind::Secret => b"secret".as_slice(),
         EntityKind::SecretVersion => b"secret-version".as_slice(),
+        EntityKind::Principal => b"principal".as_slice(),
     };
     encode_aad(&[
         b"envault-metadata",

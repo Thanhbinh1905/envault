@@ -8,8 +8,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+envault-core = { version = "=0.0.1", path = "../envault-core" }
 serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true
-

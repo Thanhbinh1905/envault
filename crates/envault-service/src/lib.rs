@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use envault_core::{
     EntityKind, GeneratorSpec, InvariantError, ProfileId, ProfileSummary, ProfileView, ScopeId,
-    SecretId, SecretVersionId, SecretVersionView, SecretView, VaultId, normalize_name,
-    validate_startup_profile,
+    ScopeKind, SecretId, SecretStatus, SecretVersionId, SecretVersionView, SecretView, VaultId,
+    normalize_name, validate_startup_profile,
 };
 use envault_crypto::{
     Ciphertext, CryptoError, KdfParameters, SALT_BYTES, SecretBytes, SecretKey, decrypt,
@@ -18,6 +18,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod internal;
+mod scope_policy;
 
 use internal::{
     GeneratorMetadata, decode_cbor, encode_cbor, encrypt_text, generate_value, generator_code,
@@ -132,6 +133,8 @@ pub enum ServiceError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Platform(#[from] envault_platform::PlatformError),
+    #[error(transparent)]
+    Policy(#[from] envault_policy::PolicyError),
     #[error("filesystem operation failed")]
     Io(#[from] std::io::Error),
 }
@@ -218,6 +221,7 @@ fn initialize_temporary(
     let base_profile = ProfileRecord {
         id: base_profile_id,
         vault_id,
+        scope_id: root_scope_id,
         encrypted_name: encrypt_text(
             &master_key,
             vault_id,
@@ -236,6 +240,7 @@ fn initialize_temporary(
     let mut store = Store::open(database_path)?;
     envault_platform::set_private_file_permissions(database_path)?;
     store.initialize(&vault, &root_scope, &base_profile)?;
+    store.initialize_audit_state(scope_policy::audit_state_mac(&master_key, 0, &[0; 32]))?;
     store.integrity_check()?;
     store.checkpoint()?;
     drop(store);
@@ -254,7 +259,7 @@ impl VaultSession {
             return Err(ServiceError::NotInitialized);
         }
         envault_platform::set_private_file_permissions(database_path)?;
-        let store = Store::open(database_path)?;
+        let mut store = Store::open(database_path)?;
         let vault = store.vault().map_err(map_store_initialization)?;
         let parameters: KdfParameters = decode_cbor(&vault.kdf_parameters)?;
         let salt: [u8; SALT_BYTES] = vault
@@ -266,7 +271,8 @@ impl VaultSession {
         let wrapped = Ciphertext::decode(&vault.wrapped_master_key)?;
         let master_key = unwrap_key(&kek, &wrapped, &vmk_aad(vault.id))
             .map_err(|_| ServiceError::AuthenticationFailed)?;
-        let root_scope = store.root_scope()?;
+        store.initialize_audit_state(scope_policy::audit_state_mac(&master_key, 0, &[0; 32]))?;
+        let root_scope = store.root_scope().map_err(|_| ServiceError::Corrupt)?;
         let profiles = store.profiles()?;
         let summaries = profiles
             .iter()
@@ -320,9 +326,33 @@ impl VaultSession {
             return Err(ServiceError::Conflict);
         }
         let id = ProfileId(Uuid::new_v4());
+        let scope_id = ScopeId(Uuid::new_v4());
+        let root = self.store.root_scope()?;
+        let root_path =
+            self.decrypt_entity_text(EntityKind::Scope, root.id.0, "path", &root.encrypted_path)?;
+        let scope_path = format!("{root_path}/profile/{}", scope_id.0);
+        let scope = ScopeRecord {
+            id: scope_id,
+            vault_id: self.vault_id,
+            parent_id: Some(self.root_scope_id),
+            kind: scope_policy::scope_kind_code(ScopeKind::Profile),
+            encrypted_path: self.encrypt_entity_text(
+                EntityKind::Scope,
+                scope_id.0,
+                "path",
+                &scope_path,
+            )?,
+            path_lookup: lookup_digest(
+                &self.master_key,
+                SCOPE_LOOKUP_DOMAIN,
+                scope_path.as_bytes(),
+            )
+            .to_vec(),
+        };
         let record = ProfileRecord {
             id,
             vault_id: self.vault_id,
+            scope_id,
             encrypted_name: self.encrypt_entity_text(
                 EntityKind::Profile,
                 id.0,
@@ -339,7 +369,7 @@ impl VaultSession {
             activate_on_start: false,
             generation: 1,
         };
-        self.store.insert_profile(&record)?;
+        self.store.insert_scope_with_profile(&scope, &record)?;
         self.profile_view(&record)
     }
 
@@ -422,7 +452,21 @@ impl VaultSession {
         if record.activate_on_start {
             return Err(ServiceError::StartupProfileRequired);
         }
-        self.store.delete_profile(record.id)?;
+        if self.policy_rules()?.iter().any(|rule| {
+            matches!(
+                rule.resource,
+                envault_policy::ResourceSelector::ScopeTree(scope_id)
+                    if scope_id == record.scope_id
+            )
+        }) {
+            return Err(ServiceError::Conflict);
+        }
+        if record.scope_id == self.root_scope_id {
+            self.store.delete_profile(record.id)?;
+        } else {
+            self.store
+                .delete_profile_and_scope(record.id, record.scope_id)?;
+        }
         Ok(())
     }
 
@@ -432,7 +476,13 @@ impl VaultSession {
         description: Option<&str>,
         value: SensitiveInput,
     ) -> Result<SecretView, ServiceError> {
-        self.create_secret_inner(name, description, value.into_secret(), None)
+        self.create_secret_inner(
+            self.root_scope_id,
+            name,
+            description,
+            value.into_secret(),
+            None,
+        )
     }
 
     pub fn create_generated_secret(
@@ -442,7 +492,13 @@ impl VaultSession {
         spec: GeneratorSpec,
     ) -> Result<SecretView, ServiceError> {
         let generated = generate_value(spec)?;
-        self.create_secret_inner(name, description, generated.value, Some(generated.metadata))
+        self.create_secret_inner(
+            self.root_scope_id,
+            name,
+            description,
+            generated.value,
+            Some(generated.metadata),
+        )
     }
 
     pub fn secrets(&self) -> Result<Vec<SecretView>, ServiceError> {
@@ -465,6 +521,9 @@ impl VaultSession {
     ) -> Result<SecretView, ServiceError> {
         validate_optional_description(description)?;
         let mut record = self.secret_by_name(name)?;
+        if record.status != 0 {
+            return Err(ServiceError::Conflict);
+        }
         record.encrypted_description = self.encrypt_optional_entity_text(
             EntityKind::Secret,
             record.id.0,
@@ -561,6 +620,12 @@ impl VaultSession {
             .map_err(|_| ServiceError::Corrupt)?;
         for secret in self.store.secrets()? {
             let versions = self.store.secret_versions(secret.id)?;
+            if (secret.status == 0 && secret.current_version == 0)
+                || (secret.status == 1 && secret.current_version != 0)
+                || secret.status > 1
+            {
+                return Err(ServiceError::Corrupt);
+            }
             if usize::try_from(secret.current_version).ok() != Some(versions.len()) {
                 return Err(ServiceError::Corrupt);
             }
@@ -584,6 +649,7 @@ impl VaultSession {
                 );
             }
         }
+        self.verify_audit_chain()?;
         Ok(())
     }
 
@@ -594,6 +660,7 @@ impl VaultSession {
 
     fn create_secret_inner(
         &mut self,
+        scope_id: ScopeId,
         name: &str,
         description: Option<&str>,
         value: SecretBytes,
@@ -606,17 +673,13 @@ impl VaultSession {
             SECRET_LOOKUP_DOMAIN,
             normalized.as_bytes(),
         );
-        if self
-            .store
-            .secret_by_lookup(self.root_scope_id, &lookup)?
-            .is_some()
-        {
+        if self.store.secret_by_lookup(scope_id, &lookup)?.is_some() {
             return Err(ServiceError::Conflict);
         }
         let id = SecretId(Uuid::new_v4());
         let secret = SecretRecord {
             id,
-            scope_id: self.root_scope_id,
+            scope_id,
             encrypted_name: self.encrypt_entity_text(
                 EntityKind::Secret,
                 id.0,
@@ -644,6 +707,9 @@ impl VaultSession {
         value: SecretBytes,
         generator: Option<GeneratorMetadata>,
     ) -> Result<SecretVersionView, ServiceError> {
+        if secret.status != 0 || secret.current_version == 0 {
+            return Err(ServiceError::Conflict);
+        }
         let next_version = secret
             .current_version
             .checked_add(1)
@@ -725,6 +791,18 @@ impl VaultSession {
     }
 
     fn validate_encrypted_metadata(&self) -> Result<(), ServiceError> {
+        self.validate_root_scope()?;
+        self.validate_scopes()?;
+        self.validate_profiles()?;
+        self.validate_secrets()?;
+        self.validate_principals()?;
+        self.validate_policy_rules()?;
+        self.audit_events()?;
+        self.verify_audit_chain()?;
+        Ok(())
+    }
+
+    fn validate_root_scope(&self) -> Result<(), ServiceError> {
         let root = self.store.root_scope()?;
         if root.vault_id != self.vault_id || root.parent_id.is_some() || root.kind != 0 {
             return Err(ServiceError::Corrupt);
@@ -739,8 +817,39 @@ impl VaultSession {
         {
             return Err(ServiceError::Corrupt);
         }
+        Ok(())
+    }
+
+    fn validate_scopes(&self) -> Result<(), ServiceError> {
+        for scope in self.store.scopes()? {
+            if scope.vault_id != self.vault_id
+                || (scope.id != self.root_scope_id && scope.parent_id.is_none())
+                || (scope.id == self.root_scope_id && scope.kind != 0)
+                || (scope.id != self.root_scope_id && scope.kind == 0)
+            {
+                return Err(ServiceError::Corrupt);
+            }
+            let path = self.decrypt_entity_text(
+                EntityKind::Scope,
+                scope.id.0,
+                "path",
+                &scope.encrypted_path,
+            )?;
+            if scope.path_lookup
+                != lookup_digest(&self.master_key, SCOPE_LOOKUP_DOMAIN, path.as_bytes()).as_slice()
+            {
+                return Err(ServiceError::Corrupt);
+            }
+            self.scope_chain(scope.id)?;
+        }
+        Ok(())
+    }
+
+    fn validate_profiles(&self) -> Result<(), ServiceError> {
         for record in self.store.profiles()? {
-            if record.vault_id != self.vault_id {
+            if record.vault_id != self.vault_id
+                || self.store.scope_by_id(record.scope_id)?.is_none()
+            {
                 return Err(ServiceError::Corrupt);
             }
             let view = self.profile_view(&record)?;
@@ -757,8 +866,16 @@ impl VaultSession {
                 return Err(ServiceError::Corrupt);
             }
         }
+        Ok(())
+    }
+
+    fn validate_secrets(&self) -> Result<(), ServiceError> {
         for record in self.store.secrets()? {
-            if record.scope_id != self.root_scope_id || record.status != 0 {
+            if self.store.scope_by_id(record.scope_id)?.is_none()
+                || (record.status == 0 && record.current_version == 0)
+                || (record.status == 1 && record.current_version != 0)
+                || record.status > 1
+            {
                 return Err(ServiceError::Corrupt);
             }
             let view = self.secret_view(&record)?;
@@ -778,6 +895,40 @@ impl VaultSession {
         Ok(())
     }
 
+    fn validate_principals(&self) -> Result<(), ServiceError> {
+        for record in self.store.principals()? {
+            if record.vault_id != self.vault_id {
+                return Err(ServiceError::Corrupt);
+            }
+            let view = self.principal_view(&record)?;
+            let normalized = normalize_name(&view.name)?;
+            if record.name_lookup
+                != lookup_digest(
+                    &self.master_key,
+                    scope_policy::PRINCIPAL_LOOKUP_DOMAIN,
+                    normalized.as_bytes(),
+                )
+                .as_slice()
+            {
+                return Err(ServiceError::Corrupt);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_policy_rules(&self) -> Result<(), ServiceError> {
+        for record in self.store.policy_rules()? {
+            if record.vault_id != self.vault_id
+                || self.store.principal_by_id(record.principal_id)?.is_none()
+            {
+                return Err(ServiceError::Corrupt);
+            }
+            let rule = scope_policy::policy_rule(&record)?;
+            self.validate_resource(rule.resource)?;
+        }
+        Ok(())
+    }
+
     fn secret_by_name(&self, name: &str) -> Result<SecretRecord, ServiceError> {
         let normalized = normalize_name(name)?;
         let lookup = lookup_digest(
@@ -793,6 +944,7 @@ impl VaultSession {
     fn profile_view(&self, record: &ProfileRecord) -> Result<ProfileView, ServiceError> {
         Ok(ProfileView {
             id: record.id,
+            scope_id: record.scope_id,
             name: self.decrypt_entity_text(
                 EntityKind::Profile,
                 record.id.0,
@@ -827,6 +979,11 @@ impl VaultSession {
                 record.encrypted_description.as_deref(),
             )?,
             current_version: record.current_version,
+            status: match record.status {
+                0 => SecretStatus::Active,
+                1 => SecretStatus::Tombstone,
+                _ => return Err(ServiceError::Corrupt),
+            },
         })
     }
 

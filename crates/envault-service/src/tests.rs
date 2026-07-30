@@ -1,6 +1,10 @@
-use std::fs;
+use std::{collections::BTreeMap, fs};
 
-use envault_core::{GeneratorFormat, GeneratorLength};
+use envault_core::{
+    ApprovalId, GeneratorFormat, GeneratorLength, GrantId, PrincipalKind, PrincipalView, ScopeKind,
+    SecretStatus,
+};
+use envault_policy::{Action, Decision, Effect, Grant, ResourceSelector};
 
 use super::*;
 
@@ -44,6 +48,7 @@ fn initialization_is_atomic_and_wrong_password_fails() {
         session.profiles().expect("profiles"),
         vec![ProfileView {
             id: initialization.base_profile_id,
+            scope_id: initialization.root_scope_id,
             name: "base".into(),
             description: None,
             activate_on_start: true,
@@ -364,4 +369,286 @@ fn cryptographic_integrity_check_detects_secret_value_tamper() {
         session.integrity_check(),
         Err(ServiceError::Corrupt)
     ));
+}
+
+#[test]
+fn scope_override_tombstone_and_profile_binding_are_deterministic() {
+    let (_directory, _path, _password, mut session) = initialized();
+    session
+        .create_secret(
+            "SHARED_TOKEN",
+            Some("root value"),
+            SensitiveInput::copy_from_slice(b"root-secret"),
+        )
+        .expect("root secret");
+    let profile = session
+        .create_profile("Development", Some("Development profile"))
+        .expect("profile");
+    let environment_before = std::env::vars_os().collect::<BTreeMap<_, _>>();
+    let binding = session.bind_profile("development").expect("bind");
+    let environment_after = std::env::vars_os().collect::<BTreeMap<_, _>>();
+    assert_eq!(environment_before, environment_after);
+    assert_eq!(binding.profile_id, profile.id);
+    assert_eq!(binding.scope_id, profile.scope_id);
+
+    let inherited = session
+        .resolve_secret(profile.scope_id, "shared_token")
+        .expect("inherited");
+    assert_eq!(inherited.source_scope_id, session.root_scope_id());
+    session
+        .create_secret_in_scope(
+            profile.scope_id,
+            "SHARED_TOKEN",
+            Some("profile override"),
+            SensitiveInput::copy_from_slice(b"profile-secret"),
+        )
+        .expect("override");
+    let overridden = session
+        .resolve_secret(profile.scope_id, "shared_token")
+        .expect("overridden");
+    assert_eq!(overridden.source_scope_id, profile.scope_id);
+    assert_eq!(
+        overridden.secret.description.as_deref(),
+        Some("profile override")
+    );
+
+    let tombstone = session
+        .tombstone_secret(profile.scope_id, "SHARED_TOKEN")
+        .expect("tombstone");
+    assert_eq!(tombstone.status, SecretStatus::Tombstone);
+    assert!(matches!(
+        session.resolve_secret(profile.scope_id, "shared_token"),
+        Err(ServiceError::NotFound)
+    ));
+    session.integrity_check().expect("integrity");
+}
+
+#[test]
+fn nested_scope_cycles_fail_unlock_closed() {
+    let (_directory, path, password, mut session) = initialized();
+    let workspace = session
+        .create_scope(session.root_scope_id(), ScopeKind::Workspace, "workspace")
+        .expect("workspace");
+    let project = session
+        .create_scope(workspace.id, ScopeKind::Project, "project")
+        .expect("project");
+    drop(session);
+    let connection = rusqlite::Connection::open(&path).expect("open database");
+    connection
+        .execute(
+            "UPDATE scope SET parent_id = ?1 WHERE id = ?2",
+            rusqlite::params![project.id.0.as_bytes(), workspace.id.0.as_bytes()],
+        )
+        .expect("create cycle");
+    drop(connection);
+    assert!(matches!(
+        VaultSession::unlock(&path, &password),
+        Err(ServiceError::Corrupt)
+    ));
+}
+
+#[test]
+fn scope_depth_is_bounded_at_sixty_four_nodes() {
+    let (_directory, _path, _password, mut session) = initialized();
+    let mut parent = session.root_scope_id();
+    for depth in 1..envault_core::MAX_SCOPE_DEPTH {
+        parent = session
+            .create_scope(parent, ScopeKind::Project, &format!("level-{depth}"))
+            .expect("scope within depth limit")
+            .id;
+    }
+    assert!(matches!(
+        session.create_scope(parent, ScopeKind::Project, "too-deep"),
+        Err(ServiceError::Invariant(
+            envault_core::InvariantError::InvalidScopeChain
+        ))
+    ));
+}
+
+fn create_policy_test_fixture(session: &mut VaultSession) -> (SecretView, PrincipalView) {
+    let secret = session
+        .create_secret(
+            "BROKER_TOKEN",
+            None,
+            SensitiveInput::copy_from_slice(b"policy-secret-sentinel"),
+        )
+        .expect("secret");
+    let principal = session
+        .create_principal(PrincipalKind::Agent, "agent:codex")
+        .expect("principal");
+    assert!(matches!(
+        session.create_policy_rule(
+            principal.id,
+            Effect::Allow,
+            Action::Reveal,
+            ResourceSelector::Vault(session.vault_id()),
+        ),
+        Err(ServiceError::Policy(
+            envault_policy::PolicyError::PrivilegedAgentRule
+        ))
+    ));
+    session
+        .create_policy_rule(
+            principal.id,
+            Effect::Allow,
+            Action::HttpRequest,
+            ResourceSelector::Vault(session.vault_id()),
+        )
+        .expect("allow rule");
+    session
+        .create_policy_rule(
+            principal.id,
+            Effect::Deny,
+            Action::HttpRequest,
+            ResourceSelector::Secret(secret.id),
+        )
+        .expect("deny rule");
+    (secret, principal)
+}
+
+fn assert_profile_scope_is_protected(session: &mut VaultSession, principal: &PrincipalView) {
+    let protected_profile = session
+        .create_profile("Protected", None)
+        .expect("protected profile");
+    session
+        .create_policy_rule(
+            principal.id,
+            Effect::Deny,
+            Action::Discover,
+            ResourceSelector::ScopeTree(protected_profile.scope_id),
+        )
+        .expect("scope rule");
+    assert!(matches!(
+        session.delete_profile("protected"),
+        Err(ServiceError::Conflict)
+    ));
+}
+
+fn assert_audit_is_redacted(path: &Path) {
+    let persisted = fs::read(path).expect("database");
+    for forbidden in ["BROKER_TOKEN", "policy-secret-sentinel", "agent:codex"] {
+        assert!(
+            !persisted
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes())
+        );
+    }
+}
+
+fn assert_audit_deletion_is_detected(session: &VaultSession, path: &Path) {
+    let connection = rusqlite::Connection::open(path).expect("open database");
+    connection
+        .execute(
+            "DELETE FROM audit_event WHERE sequence = (SELECT MAX(sequence) FROM audit_event)",
+            [],
+        )
+        .expect("truncate audit");
+    drop(connection);
+    assert!(session.verify_audit_chain().is_err());
+    let connection = rusqlite::Connection::open(path).expect("open database");
+    connection
+        .execute_batch("DELETE FROM audit_event; DELETE FROM audit_state;")
+        .expect("erase audit");
+    drop(connection);
+    assert!(session.verify_audit_chain().is_err());
+}
+
+#[test]
+fn failed_audit_append_does_not_consume_grant() {
+    let (_directory, path, _password, mut session) = initialized();
+    let secret = session
+        .create_secret(
+            "ATOMIC_GRANT",
+            None,
+            SensitiveInput::copy_from_slice(b"atomic-secret"),
+        )
+        .expect("secret");
+    let principal = session
+        .create_principal(PrincipalKind::Agent, "agent:atomic")
+        .expect("principal");
+    let mut grant = Grant {
+        id: GrantId(Uuid::new_v4()),
+        principal_id: principal.id,
+        action: Action::UseSecret,
+        resource: ResourceSelector::Secret(secret.id),
+        issued_at: 100,
+        expires_at: 200,
+        max_uses: 1,
+        uses: 0,
+        revoked: false,
+        nonce: [3; 32],
+        approval_id: ApprovalId(Uuid::new_v4()),
+    };
+    let connection = rusqlite::Connection::open(&path).expect("open database");
+    connection
+        .execute("UPDATE audit_state SET state_mac = zeroblob(32)", [])
+        .expect("corrupt audit state");
+    drop(connection);
+    assert!(
+        session
+            .explain_policy(
+                principal.id,
+                Action::UseSecret,
+                ResourceSelector::Secret(secret.id),
+                Some(&mut grant),
+                150,
+                Uuid::new_v4(),
+            )
+            .is_err()
+    );
+    assert_eq!(grant.uses, 0);
+}
+
+#[test]
+fn policy_deny_precedence_bounded_grant_and_audit_chain_hold() {
+    let (_directory, path, _password, mut session) = initialized();
+    let (secret, principal) = create_policy_test_fixture(&mut session);
+    assert_profile_scope_is_protected(&mut session, &principal);
+    let mut grant = Grant {
+        id: GrantId(Uuid::new_v4()),
+        principal_id: principal.id,
+        action: Action::HttpRequest,
+        resource: ResourceSelector::Secret(secret.id),
+        issued_at: 100,
+        expires_at: 200,
+        max_uses: 1,
+        uses: 0,
+        revoked: false,
+        nonce: [9; 32],
+        approval_id: ApprovalId(Uuid::new_v4()),
+    };
+    let denied = session
+        .explain_policy(
+            principal.id,
+            Action::HttpRequest,
+            ResourceSelector::Secret(secret.id),
+            Some(&mut grant),
+            150,
+            Uuid::new_v4(),
+        )
+        .expect("deny");
+    assert_eq!(denied.decision, Decision::DenyExplicit);
+    assert_eq!(grant.uses, 0);
+    session.verify_audit_chain().expect("audit chain");
+    let audit = session.audit_events().expect("audit");
+    assert_eq!(audit.len(), 1);
+    assert_audit_is_redacted(&path);
+
+    session
+        .set_principal_disabled(principal.id, true)
+        .expect("disable");
+    let disabled = session
+        .explain_policy(
+            principal.id,
+            Action::HttpRequest,
+            ResourceSelector::Secret(secret.id),
+            Some(&mut grant),
+            151,
+            Uuid::new_v4(),
+        )
+        .expect("disabled");
+    assert_eq!(disabled.decision, Decision::DenyDefault);
+    assert_eq!(grant.uses, 0);
+    session.verify_audit_chain().expect("audit chain");
+    assert_audit_deletion_is_detected(&session, &path);
 }
