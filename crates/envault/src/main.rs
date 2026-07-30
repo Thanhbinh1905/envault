@@ -1,9 +1,14 @@
 #![forbid(unsafe_code)]
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+    io::{self, IsTerminal, Read},
+    path::PathBuf,
+    process::ExitCode,
+};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use envault_protocol::StructuredError;
+use envault_service::{SensitiveInput, ServiceError};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -29,7 +34,7 @@ enum Output {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Init,
+    Init(InitArgs),
     Status,
     Start,
     Lock,
@@ -46,6 +51,12 @@ enum Command {
         command: RequestCommand,
     },
     Workspace,
+}
+
+#[derive(Clone, Copy, Debug, clap::Args)]
+struct InitArgs {
+    #[arg(long, help = "Read the master password from standard input")]
+    password_stdin: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -73,7 +84,7 @@ fn main() -> ExitCode {
     let command = cli.command.unwrap_or(Command::Status);
     match command {
         Command::Status => print_status(cli.output),
-        Command::Init => not_implemented(cli.output, "init"),
+        Command::Init(arguments) => initialize_vault(cli.output, arguments),
         Command::Start => not_implemented(cli.output, "start"),
         Command::Lock
         | Command::Stop
@@ -92,6 +103,146 @@ fn main() -> ExitCode {
             };
             not_implemented(cli.output, action)
         }
+    }
+}
+
+fn initialize_vault(output: Output, arguments: InitArgs) -> ExitCode {
+    let password = match read_master_password(arguments.password_stdin) {
+        Ok(password) => password,
+        Err(error) => return print_error(output, &error),
+    };
+    let database_path = match vault_database_path() {
+        Ok(path) => path,
+        Err(error) => return print_error(output, &error),
+    };
+    match envault_service::initialize_with_recommended_kdf(&database_path, &password) {
+        Ok(initialization) => {
+            match output {
+                Output::Human => println!(
+                    "vault: initialized · profile: base · id: {} · database: {}",
+                    initialization.vault_id.0,
+                    database_path.display()
+                ),
+                Output::Json => println!(
+                    "{}",
+                    serde_json::to_string(&initialization).expect("initialization serializes")
+                ),
+                Output::Toon => println!(
+                    "vault{{status,id,profile,database}}: initialized,{},base,{}",
+                    initialization.vault_id.0,
+                    database_path.display()
+                ),
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => print_error(output, &service_error(&error)),
+    }
+}
+
+fn read_master_password(from_stdin: bool) -> Result<SensitiveInput, StructuredError> {
+    if from_stdin {
+        if io::stdin().is_terminal() {
+            return Err(input_error(
+                "password_stdin_requires_pipe",
+                "`--password-stdin` requires piped standard input",
+            ));
+        }
+        let mut bytes = Vec::new();
+        io::stdin()
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .map_err(|_| input_error("io_error", "failed to read the master password"))?;
+        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+            bytes.pop();
+        }
+        return validate_password(SensitiveInput::new(bytes));
+    }
+    if !io::stdin().is_terminal() {
+        return Err(input_error(
+            "interactive_terminal_required",
+            "use `--password-stdin` when standard input is not a terminal",
+        ));
+    }
+    let password = SensitiveInput::new(
+        rpassword::prompt_password("Master password: ")
+            .map_err(|_| input_error("io_error", "failed to read the master password"))?
+            .into_bytes(),
+    );
+    let confirmation = SensitiveInput::new(
+        rpassword::prompt_password("Confirm master password: ")
+            .map_err(|_| input_error("io_error", "failed to confirm the master password"))?
+            .into_bytes(),
+    );
+    if !password.matches(&confirmation) {
+        return Err(input_error(
+            "password_confirmation_mismatch",
+            "master password confirmation does not match",
+        ));
+    }
+    validate_password(password)
+}
+
+fn validate_password(password: SensitiveInput) -> Result<SensitiveInput, StructuredError> {
+    if password.len() < 12 || password.len() > 4096 {
+        Err(input_error(
+            "invalid_password_length",
+            "master password must contain between 12 and 4096 bytes",
+        ))
+    } else {
+        Ok(password)
+    }
+}
+
+fn vault_database_path() -> Result<PathBuf, StructuredError> {
+    envault_platform::data_directory()
+        .map(|directory| directory.join("vault.db"))
+        .map_err(|_| input_error("io_error", "unable to resolve the EnVault data directory"))
+}
+
+fn service_error(error: &ServiceError) -> StructuredError {
+    let (code, message, retryable) = match error {
+        ServiceError::AlreadyInitialized => (
+            "vault_already_initialized",
+            "EnVault is already initialized",
+            false,
+        ),
+        ServiceError::NotInitialized => {
+            ("vault_not_initialized", "EnVault is not initialized", false)
+        }
+        ServiceError::AuthenticationFailed => (
+            "authentication_failed",
+            "master password authentication failed",
+            true,
+        ),
+        ServiceError::InvalidPasswordLength => (
+            "invalid_password_length",
+            "master password must contain between 12 and 4096 bytes",
+            false,
+        ),
+        ServiceError::Conflict => ("conflict", "resource conflict", false),
+        ServiceError::NotFound => ("not_found", "resource was not found", false),
+        ServiceError::Invariant(_) => ("invalid_input", "input violates the vault contract", false),
+        ServiceError::Corrupt | ServiceError::Store(_) => {
+            ("vault_corrupt", "vault integrity validation failed", false)
+        }
+        _ => ("io_error", "vault initialization failed", true),
+    };
+    StructuredError {
+        code: code.into(),
+        message: message.into(),
+        help: vec!["Run `envault status` for current state".into()],
+        request_id: Uuid::new_v4(),
+        retryable,
+    }
+}
+
+fn input_error(code: &str, message: &str) -> StructuredError {
+    StructuredError {
+        code: code.into(),
+        message: message.into(),
+        help: vec!["Run `envault init --help` for safe password input".into()],
+        request_id: Uuid::new_v4(),
+        retryable: true,
     }
 }
 
