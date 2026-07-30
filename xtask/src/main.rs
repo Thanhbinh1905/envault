@@ -93,6 +93,7 @@ fn verify_contract() -> Result<()> {
         "docs/adr/0005-encrypted-portability-packages.md",
         "docs/adr/0006-agent-blind-broker.md",
         "docs/adr/0007-application-service-boundary.md",
+        "docs/adr/0008-deterministic-scope-policy.md",
     ] {
         if !Path::new(path).is_file() {
             bail!("required architecture document is missing: {path}");
