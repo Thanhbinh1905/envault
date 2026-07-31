@@ -16,8 +16,8 @@ use envault_protocol::{
     SensitiveBytes, ServiceState, StructuredError, validate_version,
 };
 use envault_service::{
-    BrokerFailure, PackageImportOptions, SensitiveInput, ServiceError, VaultSession,
-    classify_broker_failure, execute_agent_http_request,
+    BrokerFailure, CapabilityTokenKey, PackageImportOptions, SensitiveInput, ServiceError,
+    VaultSession, classify_broker_failure, execute_agent_http_request,
 };
 use thiserror::Error;
 #[cfg(unix)]
@@ -102,25 +102,32 @@ struct AdminLease {
     /// ends via `lock`/`stop` or an explicit `admin lock`.
     deadline: Option<Instant>,
     expires_at: Option<i64>,
+    /// Set only once a connection has re-proven the vault password via
+    /// `IssueRevealToken`; cleared along with the rest of the lease, so a
+    /// same-uid process that merely observes an active lease can never
+    /// reveal a value without independently supplying the password.
+    reveal_token_digest: Option<[u8; 32]>,
 }
 
 struct RuntimeState {
     vault: Option<VaultSession>,
     database_path: PathBuf,
     admin_lease: Option<AdminLease>,
+    reveal_token_key: CapabilityTokenKey,
     rate_limits: BTreeMap<(u32, u32), RateWindow>,
     global_rate_limit: RateWindow,
 }
 
 impl RuntimeState {
-    fn new(vault: VaultSession, database_path: PathBuf) -> Self {
-        Self {
+    fn new(vault: VaultSession, database_path: PathBuf) -> Result<Self, DaemonError> {
+        Ok(Self {
             vault: Some(vault),
             database_path,
             admin_lease: None,
+            reveal_token_key: CapabilityTokenKey::generate()?,
             rate_limits: BTreeMap::new(),
             global_rate_limit: RateWindow::new(),
-        }
+        })
     }
 
     fn status(&mut self, peer: PeerIdentity) -> Result<DaemonStatus, RuntimeFailure> {
@@ -197,6 +204,7 @@ impl RuntimeState {
             uid: peer.uid,
             deadline,
             expires_at,
+            reveal_token_digest: None,
         });
         Ok(AdminLeaseStatus {
             active: true,
@@ -208,6 +216,47 @@ impl RuntimeState {
         self.require_admin(peer)?;
         self.admin_lease = None;
         Ok(())
+    }
+
+    /// Mints a fresh reveal token bound to the current admin lease, but only
+    /// once the caller has re-proven the vault password (checked by the
+    /// caller, `issue_reveal_token`, before this runs) - an active lease
+    /// alone is not enough. Any previously issued token for this lease is
+    /// invalidated by construction, since only one digest is kept.
+    fn mint_reveal_token(&mut self, peer: PeerIdentity) -> Result<SensitiveBytes, RuntimeFailure> {
+        self.require_admin(peer)?;
+        let material = self
+            .reveal_token_key
+            .issue()
+            .map_err(|error| map_service_failure(&error))?;
+        self.admin_lease
+            .as_mut()
+            .ok_or(RuntimeFailure::AdminRequired)?
+            .reveal_token_digest = Some(material.digest());
+        Ok(SensitiveBytes::new(material.into_token()))
+    }
+
+    /// Requires both an active admin lease and a token whose digest matches
+    /// the one minted for that lease - a same-uid process that never called
+    /// `IssueRevealToken` (and so never supplied the password) has no way to
+    /// produce a token that passes this check.
+    fn verify_reveal_token(
+        &mut self,
+        peer: PeerIdentity,
+        token: &SensitiveBytes,
+    ) -> Result<(), RuntimeFailure> {
+        self.require_admin(peer)?;
+        let expected_digest = self
+            .admin_lease
+            .as_ref()
+            .and_then(|lease| lease.reveal_token_digest)
+            .ok_or(RuntimeFailure::AdminRequired)?;
+        let digest = self.reveal_token_key.digest(token.as_slice());
+        if envault_crypto::constant_time_eq(&digest, &expected_digest) {
+            Ok(())
+        } else {
+            Err(RuntimeFailure::AdminRequired)
+        }
     }
 
     /// Admin-gated: loads `profile` and configures the HTTP allowlist rule
@@ -451,25 +500,36 @@ struct Server {
     authentication: Arc<Semaphore>,
 }
 
+/// Shared by the Unix and Windows `Server::prepare` impls: creates the
+/// private runtime directory, acquires the single-instance lock file, and
+/// unlocks the vault. Only listener/transport creation differs by platform.
+fn prepare_runtime_lock_and_state(
+    config: &DaemonConfig,
+    password: SensitiveBytes,
+) -> Result<(std::fs::File, RuntimeState), DaemonError> {
+    envault_platform::create_private_directory(&config.runtime_directory)?;
+    let lock_file = envault_platform::open_private_lock_file(&config.lock_path)?;
+    match lock_file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(DaemonError::AlreadyRunning),
+        Err(std::fs::TryLockError::Error(error)) => return Err(DaemonError::Io(error)),
+    }
+    let sensitive = SensitiveInput::new(password.into_vec());
+    let vault = VaultSession::unlock(&config.database_path, &sensitive)?;
+    drop(sensitive);
+    let state = RuntimeState::new(vault, config.database_path.clone())?;
+    Ok((lock_file, state))
+}
+
 #[cfg(unix)]
 impl Server {
     fn prepare(config: &DaemonConfig, password: SensitiveBytes) -> Result<Self, DaemonError> {
-        envault_platform::create_private_directory(&config.runtime_directory)?;
-        let lock_file = envault_platform::open_private_lock_file(&config.lock_path)?;
-        match lock_file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Err(DaemonError::AlreadyRunning),
-            Err(std::fs::TryLockError::Error(error)) => return Err(DaemonError::Io(error)),
-        }
-        let sensitive = SensitiveInput::new(password.into_vec());
-        let vault = VaultSession::unlock(&config.database_path, &sensitive)?;
-        drop(sensitive);
+        let (lock_file, state) = prepare_runtime_lock_and_state(config, password)?;
         remove_stale_socket(&config.socket_path)?;
         let listener = UnixListener::bind(&config.socket_path)?;
         envault_platform::set_private_socket_permissions(&config.socket_path)?;
         let socket_guard = SocketGuard::new(config.socket_path.clone())?;
         let owner_uid = std::fs::metadata(&config.runtime_directory)?.uid();
-        let state = RuntimeState::new(vault, config.database_path.clone());
         Ok(Self {
             listener,
             state: Arc::new(Mutex::new(state)),
@@ -543,19 +603,9 @@ impl Server {
 #[cfg(windows)]
 impl Server {
     fn prepare(config: &DaemonConfig, password: SensitiveBytes) -> Result<Self, DaemonError> {
-        envault_platform::create_private_directory(&config.runtime_directory)?;
-        let lock_file = envault_platform::open_private_lock_file(&config.lock_path)?;
-        match lock_file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Err(DaemonError::AlreadyRunning),
-            Err(std::fs::TryLockError::Error(error)) => return Err(DaemonError::Io(error)),
-        }
-        let sensitive = SensitiveInput::new(password.into_vec());
-        let vault = VaultSession::unlock(&config.database_path, &sensitive)?;
-        drop(sensitive);
+        let (lock_file, state) = prepare_runtime_lock_and_state(config, password)?;
         let pipe_name = crate::client::windows_pipe_name(&config.socket_path);
         let listener = envault_windows_ffi::create_named_pipe_server(&pipe_name, true)?;
-        let state = RuntimeState::new(vault, config.database_path.clone());
         Ok(Self {
             listener,
             pipe_name,
@@ -792,11 +842,17 @@ async fn process_decoded_request(
     let request_id = request.request_id;
     validate_version(request.version)
         .map_err(|_| (request_id, RuntimeFailure::ProtocolMismatch))?;
-    if let Operation::AdminUnlock { ttl_minutes, .. } = &request.body.operation {
-        if let Some(ttl_minutes) = ttl_minutes {
-            validate_admin_lease(*ttl_minutes)
-                .map_err(|_| (request_id, RuntimeFailure::InvalidTtl))?;
-        }
+    if let Operation::AdminUnlock {
+        ttl_minutes: Some(ttl_minutes),
+        ..
+    } = &request.body.operation
+    {
+        validate_admin_lease(*ttl_minutes).map_err(|_| (request_id, RuntimeFailure::InvalidTtl))?;
+    }
+    if matches!(
+        &request.body.operation,
+        Operation::AdminUnlock { .. } | Operation::IssueRevealToken { .. }
+    ) {
         state
             .try_lock()
             .map_err(|_| (request_id, RuntimeFailure::Busy))?
@@ -817,6 +873,11 @@ async fn process_decoded_request(
         )
         .await
         .map(|status| (Reply::AdminStatus(status), false)),
+        Operation::IssueRevealToken { password } => {
+            issue_reveal_token(state, peer, password, Arc::clone(authentication))
+                .await
+                .map(|token| (Reply::RevealToken(token), false))
+        }
         Operation::HttpRequest {
             profile,
             name,
@@ -908,8 +969,9 @@ impl RuntimeState {
                 profile,
                 name,
                 version,
+                token,
             } => {
-                self.require_admin(peer)?;
+                self.verify_reveal_token(peer, &token)?;
                 let value = self
                     .vault
                     .as_ref()
@@ -950,9 +1012,9 @@ impl RuntimeState {
             | Operation::PreviewEnvImport { .. }
             | Operation::CommitEnvImport { .. }
             | Operation::ExportPlaintextEnv { .. }) => self.handle_portability(peer, operation),
-            Operation::HttpRequest { .. } | Operation::AdminUnlock { .. } => {
-                Err(RuntimeFailure::Internal)
-            }
+            Operation::HttpRequest { .. }
+            | Operation::AdminUnlock { .. }
+            | Operation::IssueRevealToken { .. } => Err(RuntimeFailure::Internal),
         }
     }
 
@@ -1075,13 +1137,7 @@ impl RuntimeState {
         peer: PeerIdentity,
         operation: Operation,
     ) -> Result<(Reply, bool), RuntimeFailure> {
-        if matches!(
-            operation,
-            Operation::ListSecrets
-                | Operation::ListResolvedSecrets { .. }
-                | Operation::DescribeSecret { .. }
-                | Operation::ListSecretVersions { .. }
-        ) {
+        if is_secret_read_only(&operation) {
             return self.handle_secret_read(operation);
         }
         self.require_admin(peer)?;
@@ -1377,6 +1433,62 @@ async fn authenticate_admin(
         .try_lock()
         .map_err(|_| RuntimeFailure::Busy)?
         .issue_admin_lease(peer, ttl_minutes)
+}
+
+/// Re-verifies the vault password (same cost/rate-limit shape as
+/// `authenticate_admin`) before minting a reveal token, so holding an
+/// active admin lease is never sufficient on its own to obtain one.
+async fn issue_reveal_token(
+    state: &Arc<Mutex<RuntimeState>>,
+    peer: PeerIdentity,
+    password: SensitiveBytes,
+    authentication: Arc<Semaphore>,
+) -> Result<SensitiveBytes, RuntimeFailure> {
+    let database_path = {
+        let mut state = state.try_lock().map_err(|_| RuntimeFailure::Busy)?;
+        state.require_admin(peer)?;
+        state.database_path.clone()
+    };
+    let permit = authentication
+        .acquire_owned()
+        .await
+        .map_err(|_| RuntimeFailure::Internal)?;
+    let authenticated = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let input = SensitiveInput::new(password.into_vec());
+        let result = VaultSession::unlock(&database_path, &input);
+        drop(input);
+        result
+    })
+    .await
+    .map_err(|_| RuntimeFailure::Internal)?
+    .map_err(|error| map_service_failure(&error))?;
+    drop(authenticated);
+    state
+        .try_lock()
+        .map_err(|_| RuntimeFailure::Busy)?
+        .mint_reveal_token(peer)
+}
+
+/// Named, explicit categorization of every `Operation` variant `handle`'s
+/// outer match routes to `handle_secret` (the `CreateSecret | ... |
+/// ListSecretVersions` group). Kept as one deliberate list rather than an
+/// inline `matches!` so the read/mutation split for a new secret operation
+/// is a conscious choice made here, next to every existing one, instead of
+/// a copy-pasted addition to whichever arm looked closest by analogy.
+/// Anything not listed defaults fail-closed to mutation (admin-gated).
+fn is_secret_read_only(operation: &Operation) -> bool {
+    match operation {
+        Operation::ListSecrets
+        | Operation::ListResolvedSecrets { .. }
+        | Operation::DescribeSecret { .. }
+        | Operation::ListSecretVersions { .. } => true,
+        // Mutations (`CreateSecret`, `CreateGeneratedSecret`, `UpdateSecret`,
+        // `RenameSecret`, `DeleteSecret`, `SetSecretValue`,
+        // `GenerateSecretValue`) and anything not yet listed both fall
+        // through here, fail-closed to admin-gated.
+        _ => false,
+    }
 }
 
 fn map_service_failure(error: &ServiceError) -> RuntimeFailure {
@@ -1783,7 +1895,11 @@ mod tests {
         let password = SensitiveInput::copy_from_slice(b"daemon test password");
         envault_service::initialize_with_recommended_kdf(&path, &password).expect("initialize");
         let vault = VaultSession::unlock(&path, &password).expect("unlock");
-        (directory, RuntimeState::new(vault, path), password)
+        (
+            directory,
+            RuntimeState::new(vault, path).expect("runtime state"),
+            password,
+        )
     }
 
     #[test]
@@ -1811,6 +1927,67 @@ mod tests {
         state.lock();
         assert!(state.vault.is_none());
         assert!(state.admin_lease.is_none());
+    }
+
+    #[test]
+    fn is_secret_read_only_matches_exactly_the_four_read_operations() {
+        assert!(is_secret_read_only(&Operation::ListSecrets));
+        assert!(is_secret_read_only(&Operation::ListResolvedSecrets {
+            profile: "base".to_string(),
+        }));
+        assert!(is_secret_read_only(&Operation::DescribeSecret {
+            profile: "base".to_string(),
+            name: "x".to_string(),
+        }));
+        assert!(is_secret_read_only(&Operation::ListSecretVersions {
+            profile: "base".to_string(),
+            name: "x".to_string(),
+        }));
+
+        assert!(!is_secret_read_only(&Operation::CreateSecret {
+            profile: "base".to_string(),
+            name: "x".to_string(),
+            description: None,
+            value: SensitiveBytes::new(b"v".to_vec()),
+        }));
+        assert!(!is_secret_read_only(&Operation::DeleteSecret {
+            profile: "base".to_string(),
+            name: "x".to_string(),
+        }));
+        assert!(!is_secret_read_only(&Operation::SetSecretValue {
+            profile: "base".to_string(),
+            name: "x".to_string(),
+            value: SensitiveBytes::new(b"v".to_vec()),
+        }));
+    }
+
+    #[test]
+    fn reveal_requires_a_token_minted_for_this_lease_not_just_an_active_lease() {
+        let (_directory, mut state, _password) = state();
+        state.issue_admin_lease(peer(), Some(5)).expect("lease");
+
+        // An active lease alone (e.g. observed by another same-uid process
+        // that never called `IssueRevealToken`) must not be enough.
+        assert_eq!(
+            state.verify_reveal_token(peer(), &SensitiveBytes::new(b"guessed".to_vec())),
+            Err(RuntimeFailure::AdminRequired)
+        );
+
+        let token = state.mint_reveal_token(peer()).expect("mint token");
+        assert!(state.verify_reveal_token(peer(), &token).is_ok());
+
+        // A different, unrelated token must not verify.
+        assert_eq!(
+            state.verify_reveal_token(peer(), &SensitiveBytes::new(b"wrong-token".to_vec())),
+            Err(RuntimeFailure::AdminRequired)
+        );
+
+        // Clearing the lease invalidates the token with it.
+        state.clear_admin_lease(peer()).expect("clear lease");
+        assert_eq!(
+            state.verify_reveal_token(peer(), &token),
+            Err(RuntimeFailure::AdminRequired)
+        );
     }
 
     #[cfg(unix)]

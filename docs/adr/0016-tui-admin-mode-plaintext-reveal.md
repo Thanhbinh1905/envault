@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for Phase 7 of the 2026-07-31 rework.
+Accepted for Phase 7.
 Supersedes ADR 0012.
 
 ## Context
@@ -29,3 +29,14 @@ The value is shown in a transient modal; any keypress (including but not limited
 The TUI remains the only client that can render a decrypted secret value; every CLI output path, including `envault run`'s child-process env injection, still never prints plaintext to its own stdout or logs.
 Reveal has no independent TTL, max-uses, or audit trail beyond the admin lease itself: it is authorized by the same step-up credential as every other admin action, consistent with Phase 4's removal of Grant/Principal/capability-token machinery in favor of coarser, session-level trust.
 A future desktop app that also needs to render plaintext should follow this same shape (admin-lease-gated, transient, no independent token) rather than reinvent one.
+
+## Amendment: reveal is bound to a fresh password proof, not just the lease
+
+A security review found the "TUI remains the only client" claim above did not hold at the protocol level: the admin lease is scoped by uid alone (Phase 5), so any same-uid process - not only the TUI - could open the daemon socket directly and send a hand-built `Operation::RevealSecretValue` once some connection had unlocked admin, bypassing the TUI entirely.
+
+`Operation::RevealSecretValue` now additionally requires a `token` minted by a new operation, `Operation::IssueRevealToken { password }`, which re-verifies the vault password with the same cost and rate-limit shape as `AdminUnlock` before minting anything.
+The token's digest is stored on the current `AdminLease` (via `CapabilityTokenKey`, previously unused dead code) and is cleared whenever that lease clears.
+Holding an active admin lease is therefore no longer sufficient on its own to reveal a value - a connection must independently prove it knows the password, every time it wants a token.
+
+In the TUI, this means `require_admin_on_entry` now always re-prompts for the password on Dashboard entry unless this process already holds a token from earlier in the same run, even if some other same-uid connection already holds an admin lease - the earlier "skip the prompt if a lease is already active" convenience no longer applies to reveal.
+This is a deliberate, narrow UX cost for closing the gap the original wording claimed was already closed.

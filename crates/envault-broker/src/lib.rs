@@ -490,7 +490,19 @@ fn accepted_content_type(value: Option<&HeaderValue>) -> Result<Option<String>, 
     Ok(Some(media_type))
 }
 
-fn response_contains_credential(body: &[u8], credential: &[u8]) -> bool {
+/// How many extra decode passes are applied on top of the raw body: round 0
+/// is the body as received, round 1 is each single decoding applied once,
+/// round 2 is each decoding applied again to round 1's output (catches
+/// line-wrapped/double-encoded base64 and percent-encoded HTML entities).
+/// Bounded to keep worst-case work small and predictable, not to be "smart"
+/// about arbitrarily deep obfuscation.
+const MAX_DECODE_ROUNDS: usize = 2;
+/// Hard cap on how many decoded candidate buffers can accumulate across
+/// rounds, so a pathological response body can't blow up round-over-round
+/// fan-out into a denial-of-service.
+const MAX_DECODE_CANDIDATES: usize = 64;
+
+fn credential_patterns(credential: &[u8]) -> Zeroizing<Vec<Vec<u8>>> {
     let mut patterns = Zeroizing::new(Vec::<Vec<u8>>::new());
     patterns.push(credential.to_vec());
     patterns.push(
@@ -503,6 +515,8 @@ fn response_contains_credential(body: &[u8], credential: &[u8]) -> bool {
             .encode(credential)
             .into_bytes(),
     );
+    patterns.push(hex_encode(credential, false));
+    patterns.push(hex_encode(credential, true));
     let mut json_escaped = Vec::with_capacity(credential.len());
     for byte in credential {
         if *byte == b'/' {
@@ -511,21 +525,74 @@ fn response_contains_credential(body: &[u8], credential: &[u8]) -> bool {
         json_escaped.push(*byte);
     }
     patterns.push(json_escaped);
-
-    if patterns.iter().any(|pattern| contains_bytes(body, pattern)) {
-        return true;
-    }
-    let decoded = Zeroizing::new(percent_decode(body).collect::<Vec<_>>());
-    if patterns
-        .iter()
-        .any(|pattern| contains_bytes(&decoded, pattern))
-    {
-        return true;
-    }
-    let json_decoded = decode_json_ascii_escapes(body);
     patterns
-        .iter()
-        .any(|pattern| contains_bytes(&json_decoded, pattern))
+}
+
+/// Checks the response body - and a bounded number of rounds of decoding it
+/// (percent-encoding, JSON `\uXXXX`/`\/` escapes, numeric HTML entities,
+/// base64) - for every encoded form a credential might appear in, so a
+/// provider echoing the bearer credential back in an unexpected encoding
+/// still gets caught before `envault run`'s HTTP path returns the response.
+fn response_contains_credential(body: &[u8], credential: &[u8]) -> bool {
+    let patterns = credential_patterns(credential);
+    let matches = |candidate: &[u8]| {
+        patterns
+            .iter()
+            .any(|pattern| contains_bytes(candidate, pattern))
+    };
+
+    let mut candidates: Vec<Zeroizing<Vec<u8>>> = vec![Zeroizing::new(body.to_vec())];
+    for _ in 0..MAX_DECODE_ROUNDS {
+        if candidates.iter().any(|candidate| matches(candidate)) {
+            return true;
+        }
+        let mut next = Vec::new();
+        'candidates: for candidate in &candidates {
+            next.push(Zeroizing::new(
+                percent_decode(candidate).collect::<Vec<_>>(),
+            ));
+            next.push(decode_json_ascii_escapes(candidate));
+            next.push(decode_html_entities(candidate));
+            let stripped = strip_ascii_whitespace(candidate);
+            if let Ok(decoded) =
+                base64::engine::general_purpose::STANDARD.decode(stripped.as_slice())
+            {
+                next.push(Zeroizing::new(decoded));
+            }
+            if let Ok(decoded) =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(stripped.as_slice())
+            {
+                next.push(Zeroizing::new(decoded));
+            }
+            if next.len() >= MAX_DECODE_CANDIDATES {
+                break 'candidates;
+            }
+        }
+        candidates = next;
+    }
+    candidates.iter().any(|candidate| matches(candidate))
+}
+
+fn strip_ascii_whitespace(bytes: &[u8]) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(
+        bytes
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect(),
+    )
+}
+
+fn hex_encode(bytes: &[u8], upper: bool) -> Vec<u8> {
+    const LOWER: &[u8; 16] = b"0123456789abcdef";
+    const UPPER: &[u8; 16] = b"0123456789ABCDEF";
+    let table = if upper { UPPER } else { LOWER };
+    let mut encoded = Vec::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(table[usize::from(byte >> 4)]);
+        encoded.push(table[usize::from(byte & 0x0f)]);
+    }
+    encoded
 }
 
 fn decode_json_ascii_escapes(body: &[u8]) -> Zeroizing<Vec<u8>> {
@@ -539,11 +606,12 @@ fn decode_json_ascii_escapes(body: &[u8]) -> Zeroizing<Vec<u8>> {
         }
         if body[index] == b'\\'
             && body.get(index + 1) == Some(&b'u')
-            && body.get(index + 2..index + 4) == Some(b"00")
-            && let Some(encoded) = body.get(index + 4..index + 6)
-            && let (Some(high), Some(low)) = (hex_value(encoded[0]), hex_value(encoded[1]))
+            && let Some(hex_digits) = body.get(index + 2..index + 6)
+            && let Some(code_unit) = parse_hex4(hex_digits)
+            && let Some(codepoint) = char::from_u32(u32::from(code_unit))
         {
-            decoded.push((high << 4) | low);
+            let mut buffer = [0_u8; 4];
+            decoded.extend_from_slice(codepoint.encode_utf8(&mut buffer).as_bytes());
             index += 6;
             continue;
         }
@@ -551,6 +619,68 @@ fn decode_json_ascii_escapes(body: &[u8]) -> Zeroizing<Vec<u8>> {
         index += 1;
     }
     decoded
+}
+
+/// Decodes numeric HTML/XML character references (`&#DDD;` decimal,
+/// `&#xHH;`/`&#XHH;` hex) - named entities like `&amp;` are left alone since
+/// a bearer credential's alphabet never needs them to round-trip.
+fn decode_html_entities(body: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut decoded = Zeroizing::new(Vec::with_capacity(body.len()));
+    let mut index = 0;
+    while index < body.len() {
+        if let Some(entity) = parse_numeric_entity(&body[index..]) {
+            let mut buffer = [0_u8; 4];
+            decoded.extend_from_slice(entity.codepoint.encode_utf8(&mut buffer).as_bytes());
+            index += entity.consumed;
+            continue;
+        }
+        decoded.push(body[index]);
+        index += 1;
+    }
+    decoded
+}
+
+struct NumericEntity {
+    codepoint: char,
+    consumed: usize,
+}
+
+fn parse_numeric_entity(bytes: &[u8]) -> Option<NumericEntity> {
+    if bytes.first() != Some(&b'&') || bytes.get(1) != Some(&b'#') {
+        return None;
+    }
+    let hex = matches!(bytes.get(2), Some(b'x' | b'X'));
+    let digits_start = if hex { 3 } else { 2 };
+    let mut end = digits_start;
+    while bytes.get(end).is_some_and(|byte| {
+        if hex {
+            byte.is_ascii_hexdigit()
+        } else {
+            byte.is_ascii_digit()
+        }
+    }) {
+        end += 1;
+    }
+    if end == digits_start || bytes.get(end) != Some(&b';') {
+        return None;
+    }
+    let digits = std::str::from_utf8(&bytes[digits_start..end]).ok()?;
+    let value = u32::from_str_radix(digits, if hex { 16 } else { 10 }).ok()?;
+    let codepoint = char::from_u32(value)?;
+    Some(NumericEntity {
+        codepoint,
+        consumed: end + 1,
+    })
+}
+
+fn parse_hex4(bytes: &[u8]) -> Option<u16> {
+    let mut value: u16 = 0;
+    for &byte in bytes {
+        value = value
+            .checked_shl(4)?
+            .checked_add(u16::from(hex_value(byte)?))?;
+    }
+    Some(value)
 }
 
 const fn hex_value(byte: u8) -> Option<u8> {
@@ -761,6 +891,48 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(credential);
         assert!(response_contains_credential(encoded.as_bytes(), credential));
         assert!(!response_contains_credential(b"safe response", credential));
+    }
+
+    #[test]
+    fn response_firewall_blocks_hex_html_entity_and_nested_base64_encodings() {
+        let credential = b"secret/token";
+        assert!(response_contains_credential(
+            &hex_encode(credential, false),
+            credential
+        ));
+        assert!(response_contains_credential(
+            &hex_encode(credential, true),
+            credential
+        ));
+        assert!(response_contains_credential(
+            b"secret&#x2f;token",
+            credential
+        ));
+        assert!(response_contains_credential(
+            b"secret&#47;token",
+            credential
+        ));
+        // Line-wrapped (double newline-split) base64 of the credential.
+        let encoded = base64::engine::general_purpose::STANDARD.encode(credential);
+        let wrapped = encoded
+            .as_bytes()
+            .chunks(4)
+            .map(|chunk| std::str::from_utf8(chunk).expect("ascii"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(response_contains_credential(wrapped.as_bytes(), credential));
+        // Base64-of-base64 (double-encoded).
+        let double_encoded = base64::engine::general_purpose::STANDARD.encode(&encoded);
+        assert!(response_contains_credential(
+            double_encoded.as_bytes(),
+            credential
+        ));
+        // Percent-encoded HTML entity: decode round yields `&#47;` first,
+        // then the following round decodes that to `/`.
+        assert!(response_contains_credential(
+            b"secret%26%2347%3Btoken",
+            credential
+        ));
     }
 
     #[test]

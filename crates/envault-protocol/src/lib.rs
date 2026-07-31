@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{fmt, io::Write};
+use std::io::Write;
 
 pub use envault_broker::{HttpConstraint, HttpContentType, HttpMethod, HttpRequest, HttpResponse};
 use envault_core::{
@@ -13,7 +13,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 5;
 pub const PORTABILITY_REQUEST_TIMEOUT_SECONDS: u64 = 60;
@@ -59,16 +59,7 @@ impl SensitiveBytes {
     }
 
     pub fn matches(&self, other: &Self) -> bool {
-        if self.0.len() != other.0.len() {
-            return false;
-        }
-        self.0
-            .iter()
-            .zip(&other.0)
-            .fold(0_u8, |difference, (left, right)| {
-                difference | (left ^ right)
-            })
-            == 0
+        envault_crypto::constant_time_eq(&self.0, &other.0)
     }
 
     pub fn into_vec(mut self) -> Vec<u8> {
@@ -76,11 +67,7 @@ impl SensitiveBytes {
     }
 }
 
-impl fmt::Debug for SensitiveBytes {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("SensitiveBytes([REDACTED])")
-    }
-}
+envault_crypto::redacted_debug!(SensitiveBytes);
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BootstrapRequest {
@@ -207,13 +194,23 @@ pub enum Operation {
     RunEnv {
         profiles: Vec<String>,
     },
+    /// Mints a bearer token proving the caller just supplied the vault
+    /// password, independent of and in addition to the coarser uid-scoped
+    /// admin lease. Only a connection holding this token can call
+    /// `RevealSecretValue` - a same-uid process that merely observes an
+    /// active admin lease cannot mint one for itself without the password.
+    IssueRevealToken {
+        password: SensitiveBytes,
+    },
     /// Decrypts a secret's value for the TUI's admin-gated `Reveal` popup -
     /// the sole path that hands plaintext to a human's eyes. `version`
     /// selects a historical version; `None` means the current version.
+    /// `token` must be a still-valid token from `IssueRevealToken`.
     RevealSecretValue {
         profile: String,
         name: String,
         version: Option<u64>,
+        token: SensitiveBytes,
     },
     ExportPackage {
         kind: PackageKind,
@@ -321,6 +318,7 @@ pub enum Reply {
     EnvImportPreview(EnvImportPreview),
     PlaintextExport(PlaintextExportSummary),
     RunEnv(Vec<EnvVar>),
+    RevealToken(SensitiveBytes),
     SecretPlaintext(SensitiveBytes),
     Acknowledged { no_op: bool },
 }

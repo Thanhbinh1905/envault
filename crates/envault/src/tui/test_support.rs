@@ -38,6 +38,7 @@ pub(crate) struct FakeClient {
     pub secrets: RefCell<VecDeque<Result<Vec<SecretView>, ClientError>>>,
     pub versions: RefCell<VecDeque<Result<Vec<SecretVersionView>, ClientError>>>,
     pub reveal: RefCell<VecDeque<Result<SensitiveBytes, ClientError>>>,
+    pub reveal_token: RefCell<VecDeque<Result<SensitiveBytes, ClientError>>>,
     pub admin_unlock: RefCell<VecDeque<Result<AdminLeaseStatus, ClientError>>>,
     pub preview_package: RefCell<VecDeque<Result<PortabilityPreview, ClientError>>>,
     pub commit_package: RefCell<VecDeque<Result<PortabilityImportSummary, ClientError>>>,
@@ -70,8 +71,13 @@ impl DaemonClient for FakeClient {
         &self,
         _name: &str,
         _version: Option<u64>,
+        _token: &SensitiveBytes,
     ) -> Result<SensitiveBytes, ClientError> {
         pop(&self.reveal)
+    }
+
+    fn issue_reveal_token(&self, _password: SensitiveBytes) -> Result<SensitiveBytes, ClientError> {
+        pop(&self.reveal_token)
     }
 
     fn admin_unlock(

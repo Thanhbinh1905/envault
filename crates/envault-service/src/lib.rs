@@ -66,17 +66,7 @@ impl SensitiveInput {
     }
 
     pub fn matches(&self, other: &Self) -> bool {
-        if self.0.as_ref().len() != other.0.as_ref().len() {
-            return false;
-        }
-        self.0
-            .as_ref()
-            .iter()
-            .zip(other.0.as_ref())
-            .fold(0_u8, |difference, (left, right)| {
-                difference | (left ^ right)
-            })
-            == 0
+        envault_crypto::constant_time_eq(self.0.as_ref(), other.0.as_ref())
     }
 
     fn secret(&self) -> &SecretBytes {
@@ -88,11 +78,7 @@ impl SensitiveInput {
     }
 }
 
-impl core::fmt::Debug for SensitiveInput {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str("SensitiveInput([REDACTED])")
-    }
-}
+envault_crypto::redacted_debug!(SensitiveInput);
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct Initialization {
