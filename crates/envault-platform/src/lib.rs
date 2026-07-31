@@ -278,10 +278,25 @@ pub fn data_directory() -> Result<PathBuf, PlatformError> {
     if let Some(path) = env::var_os("XDG_DATA_HOME") {
         return Ok(PathBuf::from(path).join("envault"));
     }
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|path| path.join(".local/share/envault"))
-        .ok_or(PlatformError::MissingDataDirectory)
+    if let Some(path) = env::var_os("HOME") {
+        return Ok(PathBuf::from(path).join(".local/share/envault"));
+    }
+    // Windows has no `HOME`/XDG convention; `%LOCALAPPDATA%` is the standard
+    // per-user, non-roaming application data location, with `%USERPROFILE%`
+    // as a fallback on the rare host where it is unset.
+    #[cfg(windows)]
+    {
+        if let Some(path) = env::var_os("LOCALAPPDATA") {
+            return Ok(PathBuf::from(path).join("envault"));
+        }
+        if let Some(path) = env::var_os("USERPROFILE") {
+            return Ok(PathBuf::from(path)
+                .join("AppData")
+                .join("Local")
+                .join("envault"));
+        }
+    }
+    Err(PlatformError::MissingDataDirectory)
 }
 
 pub fn runtime_directory() -> Result<PathBuf, PlatformError> {
