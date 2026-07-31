@@ -24,8 +24,10 @@ The transport and peer-authentication layers are platform-specific and separatel
 Windows peer authentication is a materially different security primitive than `SO_PEERCRED`; equivalence is a design goal enforced by a parallel test matrix, not an assumption.
 CI gains a Windows runtime job that exercises real daemon startup and IPC round trips on `windows-latest`, in addition to the existing Windows compile check.
 
-**Implementation status**: the named-pipe listener, the pipe's security descriptor, and process-token-based peer authentication all require raw Win32 FFI.
-`envault-platform`'s Windows path-validation and same-file-identity hardening (file/directory reparse-point rejection, `file_index`/`volume_serial_number`-based identity checks) needs no `unsafe` code and is implemented without exception.
+**Implementation status**: `envault-windows-ffi` implements the owner-only security descriptor, named-pipe instance creation, named-pipe client connect, and peer-SID resolution and comparison for both the client-connecting-to-server and server-connecting-to-client directions.
+`envault-platform`'s Windows private-path hardening now calls into it to restrict access control lists on private files, directories, and the daemon's transport endpoint, replacing what was previously verification without restriction; its reparse-point rejection and same-file-identity checks (via `GetFileInformationByHandle`, not the unstable `windows_by_handle` std feature an earlier pass mistakenly relied on) need no `unsafe` code and remain outside this crate.
+`crates/envault`'s client transport connects to a named pipe and authenticates the server's peer SID before trusting anything it sends.
+Deferred: the daemon-side async named-pipe listener and accept loop (`daemon.rs` remains Unix-only), since restructuring its full accept loop without any way to exercise the result on real Windows runtime in a Linux-only development sandbox was judged too risky to do blind; and a client-side read/write timeout equivalent to the Unix socket's `set_read_timeout`/`set_write_timeout`, since a `File`-wrapped named-pipe handle has no synchronous timeout primitive in `std` (a watchdog thread or overlapped I/O would be needed). Both are tracked follow-ups, not silently dropped scope.
 
 ## Unsafe-code policy resolution
 

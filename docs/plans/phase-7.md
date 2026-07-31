@@ -9,7 +9,7 @@ A graphical desktop application is explicitly out of scope; it is deferred to a 
 ## Ownership
 
 `envault-platform` replaces its current `cfg(not(unix))` fallbacks, which compile but provide no real hardening, with genuine Windows implementations of private file and directory creation, path validation, and permission hardening using Windows ACLs.
-`envault` owns the Windows named-pipe listener and stream types behind the same conditional-compilation seam that already isolates Unix socket types, and owns Windows peer-identity derivation.
+`envault` owns the Windows named-pipe client connect path behind the same conditional-compilation seam that already isolates Unix socket types; the daemon-side listener remains a deferred follow-up (see "Windows named-pipe IPC transport" below).
 `envault-protocol`'s length-prefixed CBOR framing is transport-agnostic and requires no change; it already operates over any reader and writer.
 `envault-service` gains one new bounded capability: reading and writing an opt-in OS-keystore-backed unlock credential, gated by the same admin-lease and explicit-acknowledgement discipline the plaintext export escape hatch established in Phase 5.
 CI gains a Windows runtime job that runs the workspace test suite on `windows-latest`, alongside the existing Windows compile check.
@@ -22,6 +22,9 @@ Both ends read and write through the existing length-prefixed CBOR framing uncha
 The pipe is created with an explicit security descriptor restricting access to the owning user, mirroring the Unix socket's directory-permission-based restriction rather than relying on default pipe ACLs.
 Connection handling preserves the existing one-request-per-connection contract; a client that sends a second request on an already-answered connection observes the connection close, exactly as the Unix transport already behaves.
 Constructing the named-pipe security descriptor requires raw Win32 FFI with no adequate safe published wrapper; ADR 0013 grants one narrowly scoped `unsafe`-code exception for this, isolated to a new, dedicated, Windows-only crate (`envault-windows-ffi`) rather than relaxing the no-unsafe-code policy of any existing crate.
+The client side of this transport is implemented: it connects to a named pipe and authenticates the server's peer security identifier before trusting anything it sends.
+The daemon-side async named-pipe listener and accept loop is deferred to a follow-up pass; `daemon.rs` remains Unix-only rather than being restructured blind with no Windows runtime available to exercise the result, and `envaultd` continues to report Windows runtime support as unavailable until that listener exists.
+The client transport also has a known, tracked gap: it does not yet enforce a read/write timeout equivalent to the Unix socket's `set_read_timeout`/`set_write_timeout`, since a `File`-wrapped named-pipe handle has no synchronous timeout primitive in `std`.
 
 ## Windows peer authentication
 
@@ -35,7 +38,7 @@ Because this sandbox has no Windows runtime, this code cannot be exercised end-t
 
 ## Windows filesystem and permission hardening
 
-Path validation rejects reparse points (the Windows analog of symbolic links) on every component between the stable parent and the target, mirroring the no-follow discipline the Unix implementation already applies, and same-file identity after creation, opening, or publication is verified using `file_index` and `volume_serial_number`, the safe `std`-exposed equivalent of the Unix `(dev, ino)` pair.
+Path validation rejects reparse points (the Windows analog of symbolic links) on every component between the stable parent and the target, mirroring the no-follow discipline the Unix implementation already applies, and same-file identity after creation, opening, or publication is verified using a volume-serial-number and file-index pair read via `GetFileInformationByHandle` through `envault-windows-ffi`, the Unix `(dev, ino)` pair's Windows equivalent; an earlier pass had instead relied on `std`'s `file_index`/`volume_serial_number`, which remain behind the unstable `windows_by_handle` feature and do not compile on stable Rust, so this was corrected rather than left broken.
 Every platform test that currently exercises Unix symlink-rejection and same-file-identity behavior gains a Windows-native counterpart.
 Restricting a private file or directory's access control list to the owning user's security identifier uses the same isolated `envault-windows-ffi` crate ADR 0013 establishes for the named-pipe security descriptor and peer-token comparison, rather than a second, separately reviewed exception.
 
