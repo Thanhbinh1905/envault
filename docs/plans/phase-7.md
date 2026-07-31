@@ -21,6 +21,7 @@ The daemon listens on a named pipe instead of a Unix domain socket when compiled
 Both ends read and write through the existing length-prefixed CBOR framing unchanged, since framing operates on any `Read` and `Write` implementation rather than on socket-specific types.
 The pipe is created with an explicit security descriptor restricting access to the owning user, mirroring the Unix socket's directory-permission-based restriction rather than relying on default pipe ACLs.
 Connection handling preserves the existing one-request-per-connection contract; a client that sends a second request on an already-answered connection observes the connection close, exactly as the Unix transport already behaves.
+**Status: not yet implemented.** Constructing a custom named-pipe security descriptor requires `unsafe` FFI, which this workspace forbids crate-wide; this transport is blocked on the same decision noted under "Windows filesystem and permission hardening" and is deferred to a follow-up pass once that decision is made.
 
 ## Windows peer authentication
 
@@ -28,12 +29,17 @@ Unix peer authentication compares the connecting socket's credential-derived UID
 Windows named pipes have no equivalent kernel-supplied UID; peer identity is instead derived by resolving the connecting client's process token and comparing its owning security identifier against the daemon's own security identifier before any request is dispatched.
 A mismatched or unresolvable client identity is rejected before any operation reaches the application service, with the same fail-closed posture the Unix path already requires.
 This is a materially different security primitive from `SO_PEERCRED`, not a drop-in substitution, and is treated as such in the implementation and its tests rather than assumed equivalent by construction.
+**Status: not yet implemented.** Resolving a named pipe's connected client process and its token's security identifier requires `unsafe` FFI (`GetNamedPipeClientProcessId`, `OpenProcessToken`, `GetTokenInformation`), which this workspace forbids crate-wide.
+This is the central, safety-critical decision the whole named-pipe transport depends on and it is deliberately not guessed at under time and verification constraints that would have prevented real review: this sandbox has no Windows runtime to test an unverified implementation against, and shipping an unreviewed, untested peer-authentication primitive in a secret-vault daemon is a worse outcome than shipping nothing.
+The daemon's Windows entry point continues to report that Windows runtime support is not yet available and exits rather than starting a transport with no peer authentication behind it.
 
 ## Windows filesystem and permission hardening
 
-Private file and directory creation on Windows applies an explicit access control list granting access only to the owning user's security identifier, replacing today's unrestricted fallback.
-Path validation rejects reparse points (the Windows analog of symbolic links) on every component between the stable parent and the target, mirroring the no-follow discipline the Unix implementation already applies.
-Every platform test that currently exercises Unix permission and symlink-rejection behavior gains a Windows-native counterpart exercising the ACL and reparse-point equivalent, rather than being skipped or assumed equivalent on Windows.
+Path validation rejects reparse points (the Windows analog of symbolic links) on every component between the stable parent and the target, mirroring the no-follow discipline the Unix implementation already applies, and same-file identity after creation, opening, or publication is verified using `file_index` and `volume_serial_number`, the safe `std`-exposed equivalent of the Unix `(dev, ino)` pair.
+Every platform test that currently exercises Unix symlink-rejection and same-file-identity behavior gains a Windows-native counterpart.
+Restricting a private file or directory's access control list to the owning user's security identifier requires `unsafe` FFI, which this workspace forbids crate-wide (`unsafe_code = "forbid"` in `[workspace.lints.rust]`, restated in every crate).
+This is a known, explicitly tracked gap rather than parity with the Unix mode-0600 guarantee: Windows private-path functions verify the path is a stable, non-reparse regular file or directory, but do not yet restrict its access control list.
+Closing this gap requires either adopting a vetted safe wrapper crate whose own internals carry the `unsafe` FFI, or a narrowly scoped and heavily reviewed exception to this workspace's no-unsafe-code policy for one small, isolated module; that decision is deferred to whoever picks up the remaining Windows peer-authentication and named-pipe transport work below, rather than made unilaterally by this pass.
 
 ## Windows runtime CI
 
