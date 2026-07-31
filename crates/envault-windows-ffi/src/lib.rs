@@ -31,7 +31,7 @@ use windows_sys::Win32::{
             SetNamedSecurityInfoW,
         },
         DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
         TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
     Storage::FileSystem::{
@@ -374,16 +374,40 @@ fn verify_pid_is_current_user(pid: u32) -> io::Result<bool> {
     // valid and requires no `CloseHandle`.
     let current_process = unsafe { GetCurrentProcess() };
     let current_sid = token_owner_sid(current_process, false)?;
-    // SAFETY: both `peer_sid` and `current_sid` are well-formed SID buffers
-    // produced by `token_owner_sid`, which validates the `TOKEN_USER`
-    // structure `GetTokenInformation` populated before returning them. Both
-    // buffers outlive this call.
-    let equal = unsafe { EqualSid(peer_sid.as_ptr() as *mut _, current_sid.as_ptr() as *mut _) };
+    // SAFETY: both `peer_sid` and `current_sid` are `OwnedSid` values whose
+    // `as_psid()` returns a pointer to the actual SID bytes embedded in each
+    // owning buffer (not the buffer's start), validated non-null when the
+    // buffer was constructed. Both buffers outlive this call.
+    let equal = unsafe { EqualSid(peer_sid.as_psid(), current_sid.as_psid()) };
     Ok(equal != 0)
 }
 
+/// A `TOKEN_USER` query result: the raw buffer `GetTokenInformation` filled
+/// (a `TOKEN_USER` header followed by the SID bytes it points into), plus the
+/// byte offset of those SID bytes within that same buffer. `TOKEN_USER::Sid`
+/// is a `PSID` pointing *inside* this buffer, not a separate allocation, so
+/// storing an offset (rather than re-deriving the pointer from a possibly
+/// moved struct) and recomputing it from the buffer's live address is what
+/// keeps `as_psid()` valid for the buffer's lifetime.
+struct OwnedSid {
+    buffer: Vec<u8>,
+    sid_offset: usize,
+}
+
+impl OwnedSid {
+    #[allow(unsafe_code)]
+    fn as_psid(&self) -> PSID {
+        // SAFETY: `sid_offset` was computed at construction time as an
+        // in-bounds offset into `buffer` pointing at the start of the SID
+        // bytes `GetTokenInformation` wrote, and `buffer` is never mutated
+        // or reallocated after that, so this offset remains valid and
+        // in-bounds for as long as `self` is alive.
+        unsafe { self.buffer.as_ptr().add(self.sid_offset) as PSID }
+    }
+}
+
 #[allow(unsafe_code)]
-fn process_owner_sid(pid: u32) -> io::Result<Vec<u8>> {
+fn process_owner_sid(pid: u32) -> io::Result<OwnedSid> {
     // SAFETY: `pid` is caller-supplied but `OpenProcess` itself validates it;
     // a failure returns a null handle, checked immediately below, and no
     // handle is used before that check.
@@ -402,7 +426,7 @@ fn process_owner_sid(pid: u32) -> io::Result<Vec<u8>> {
 }
 
 #[allow(unsafe_code)]
-fn token_owner_sid(process: HANDLE, close_token: bool) -> io::Result<Vec<u8>> {
+fn token_owner_sid(process: HANDLE, close_token: bool) -> io::Result<OwnedSid> {
     let mut token: HANDLE = ptr::null_mut();
     // SAFETY: `process` is a valid, open process handle for the duration of
     // this call (either the current pseudo-handle, which needs no closing,
@@ -424,7 +448,7 @@ fn token_owner_sid(process: HANDLE, close_token: bool) -> io::Result<Vec<u8>> {
 }
 
 #[allow(unsafe_code)]
-fn read_token_user_sid(token: HANDLE) -> io::Result<Vec<u8>> {
+fn read_token_user_sid(token: HANDLE) -> io::Result<OwnedSid> {
     let mut needed: u32 = 0;
     // SAFETY: passing a zero-length buffer with `TokenUser` is the
     // documented way to ask `GetTokenInformation` how large a buffer is
@@ -458,10 +482,8 @@ fn read_token_user_sid(token: HANDLE) -> io::Result<Vec<u8>> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `buffer` was populated by the successful call above with a
-    // valid `TOKEN_USER` at its start, whose `Sid` field points inside a
-    // buffer of at least `needed` bytes; the returned `Vec` retains that
-    // same buffer so the pointer relationship used by `EqualSid` callers
-    // stays valid for as long as this `Vec` is alive.
+    // valid `TOKEN_USER` at its start, whose `Sid` field points inside the
+    // same buffer of at least `needed` bytes.
     let token_user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
     if token_user.User.Sid.is_null() {
         return Err(io::Error::new(
@@ -469,7 +491,22 @@ fn read_token_user_sid(token: HANDLE) -> io::Result<Vec<u8>> {
             "token user SID pointer was null",
         ));
     }
-    Ok(buffer)
+    // The `Sid` field is a `PSID` pointing *inside* `buffer` itself (this is
+    // how `GetTokenInformation` lays out `TokenUser`: the SID bytes follow
+    // the fixed `TOKEN_USER` header in the same allocation). Callers must
+    // dereference this pointer, not the buffer's start, when passing it to
+    // an API like `EqualSid` that expects an actual SID structure rather
+    // than the `TOKEN_USER` header that merely points at one.
+    let sid_offset = (token_user.User.Sid as usize)
+        .checked_sub(buffer.as_ptr() as usize)
+        .filter(|&offset| offset < buffer.len())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "token user SID pointer did not point inside the returned buffer",
+            )
+        })?;
+    Ok(OwnedSid { buffer, sid_offset })
 }
 
 /// Returns `(volume_serial_number, file_index)` for an open file or
