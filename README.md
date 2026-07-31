@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/assets/logo.svg" width="120" height="120" alt="EnVault logo">
-</p>
-
 <h1 align="center">EnVault</h1>
 
 <p align="center">
