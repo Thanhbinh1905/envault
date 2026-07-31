@@ -58,14 +58,7 @@ pub fn socket_path() -> Result<PathBuf, ClientError> {
 }
 
 pub fn request(operation: Operation) -> Result<Reply, ClientError> {
-    request_with_capability(operation, None)
-}
-
-pub fn request_with_capability(
-    operation: Operation,
-    capability_token: Option<SensitiveBytes>,
-) -> Result<Reply, ClientError> {
-    request_at(&socket_path()?, operation, capability_token)
+    request_at(&socket_path()?, operation)
 }
 
 #[cfg(unix)]
@@ -140,11 +133,7 @@ pub fn start(_password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
 }
 
 #[cfg(unix)]
-pub fn request_at(
-    path: &std::path::Path,
-    operation: Operation,
-    capability_token: Option<SensitiveBytes>,
-) -> Result<Reply, ClientError> {
+pub fn request_at(path: &std::path::Path, operation: Operation) -> Result<Reply, ClientError> {
     use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(path).map_err(|_| ClientError::NotRunning)?;
@@ -165,10 +154,7 @@ pub fn request_at(
     let request = Request {
         version: PROTOCOL_VERSION,
         request_id,
-        body: AuthenticatedRequest {
-            capability_token,
-            operation,
-        },
+        body: AuthenticatedRequest { operation },
     };
     write_sync_frame(&mut stream, &request).map_err(|_| ClientError::Protocol)?;
     let response: Response<Reply> = read_sync_frame(&mut stream).map_err(|error| {
@@ -471,11 +457,7 @@ pub(crate) fn windows_pipe_name(socket_path: &std::path::Path) -> String {
 /// follow-up alongside the daemon-side listener this transport currently has
 /// nothing to connect to.
 #[cfg(windows)]
-pub fn request_at(
-    path: &std::path::Path,
-    operation: Operation,
-    capability_token: Option<SensitiveBytes>,
-) -> Result<Reply, ClientError> {
+pub fn request_at(path: &std::path::Path, operation: Operation) -> Result<Reply, ClientError> {
     let pipe_name = windows_pipe_name(path);
     let mut stream =
         envault_windows_ffi::connect_named_pipe_client(std::ffi::OsStr::new(&pipe_name))
@@ -489,10 +471,7 @@ pub fn request_at(
     let request = Request {
         version: PROTOCOL_VERSION,
         request_id,
-        body: AuthenticatedRequest {
-            capability_token,
-            operation,
-        },
+        body: AuthenticatedRequest { operation },
     };
     write_sync_frame(&mut stream, &request).map_err(|_| ClientError::Protocol)?;
     let response: Response<Reply> = read_sync_frame(&mut stream).map_err(|error| {

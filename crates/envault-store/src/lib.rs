@@ -2,9 +2,7 @@
 
 use std::{path::Path, time::Duration};
 
-use envault_core::{
-    AuditEventId, PolicyRuleId, PrincipalId, ProfileId, ScopeId, SecretId, SecretVersionId, VaultId,
-};
+use envault_core::{ProfileId, ScopeId, SecretId, SecretVersionId, VaultId};
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, backup::Backup, params,
 };
@@ -60,6 +58,20 @@ pub struct SecretRecord {
     pub status: u8,
 }
 
+/// Allowlist rule binding a secret to exactly one HTTP origin/path prefix -
+/// the replacement for Grant + `HttpConstraint` (no principal/token involved,
+/// see docs/adr/0006-agent-blind-broker.md addendum).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretHttpAccessRecord {
+    pub secret_id: SecretId,
+    pub encrypted_host: Vec<u8>,
+    pub port: u16,
+    pub methods: String,
+    pub encrypted_path_prefix: Vec<u8>,
+    pub max_request_bytes: u64,
+    pub max_response_bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretVersionRecord {
     pub id: SecretVersionId,
@@ -71,30 +83,6 @@ pub struct SecretVersionRecord {
     pub generator: Option<u8>,
     pub generated_length: Option<u64>,
     pub entropy_bits: Option<u32>,
-    pub created_at: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PrincipalRecord {
-    pub id: PrincipalId,
-    pub vault_id: VaultId,
-    pub kind: u8,
-    pub encrypted_name: Vec<u8>,
-    pub name_lookup: Vec<u8>,
-    pub disabled: bool,
-    pub generation: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PolicyRuleRecord {
-    pub id: PolicyRuleId,
-    pub vault_id: VaultId,
-    pub principal_id: PrincipalId,
-    pub effect: u8,
-    pub action: u8,
-    pub resource_kind: u8,
-    pub resource_id: Vec<u8>,
-    pub disabled: bool,
     pub created_at: i64,
 }
 
@@ -128,8 +116,6 @@ pub struct ImportBatch {
     pub secrets: Vec<SecretRecord>,
     pub secret_versions: Vec<SecretVersionRecord>,
     pub version_appends: Vec<SecretVersionAppend>,
-    pub principals: Vec<PrincipalRecord>,
-    pub policy_rules: Vec<PolicyRuleRecord>,
 }
 
 impl Default for ImportBatch {
@@ -143,31 +129,8 @@ impl Default for ImportBatch {
             secrets: Vec::new(),
             secret_versions: Vec::new(),
             version_appends: Vec::new(),
-            principals: Vec::new(),
-            policy_rules: Vec::new(),
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuditEventDraft {
-    pub id: AuditEventId,
-    pub action: u8,
-    pub outcome: u8,
-    pub redacted_metadata: Vec<u8>,
-    pub created_at: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuditEventRecord {
-    pub sequence: u64,
-    pub id: AuditEventId,
-    pub action: u8,
-    pub outcome: u8,
-    pub redacted_metadata: Vec<u8>,
-    pub previous_hash: [u8; 32],
-    pub event_hash: [u8; 32],
-    pub created_at: i64,
 }
 
 #[derive(Debug, Error)]
@@ -324,28 +287,18 @@ impl Store {
         expect_single_change(changed)
     }
 
-    pub fn set_startup_profile(&mut self, profile_id: ProfileId) -> Result<(), StoreError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let deactivated = transaction.execute(
-            "UPDATE profile
-             SET activate_on_start = 0, generation = generation + 1
-             WHERE activate_on_start = 1",
-            [],
+    /// Adds or removes a single profile from the "loaded set"
+    /// (`activate_on_start`), independent of every other profile's flag.
+    pub fn set_profile_loaded(
+        &mut self,
+        profile_id: ProfileId,
+        loaded: bool,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE profile SET activate_on_start = ?1, generation = generation + 1 WHERE id = ?2",
+            params![loaded, id_bytes(profile_id.0)],
         )?;
-        if deactivated != 1 {
-            return Err(StoreError::Integrity);
-        }
-        let activated = transaction.execute(
-            "UPDATE profile SET activate_on_start = 1, generation = generation + 1 WHERE id = ?1",
-            params![id_bytes(profile_id.0)],
-        )?;
-        if activated != 1 {
-            return Err(StoreError::Integrity);
-        }
-        transaction.commit()?;
-        Ok(())
+        expect_single_change(changed)
     }
 
     pub fn delete_profile(&mut self, profile_id: ProfileId) -> Result<(), StoreError> {
@@ -403,6 +356,22 @@ impl Store {
                 "SELECT id, vault_id, parent_id, kind, encrypted_path, path_lookup
                  FROM scope WHERE id = ?1",
                 params![id_bytes(scope_id.0)],
+                map_scope,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn scope_by_path_lookup(
+        &self,
+        vault_id: VaultId,
+        path_lookup: &[u8],
+    ) -> Result<Option<ScopeRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, vault_id, parent_id, kind, encrypted_path, path_lookup
+                 FROM scope WHERE vault_id = ?1 AND path_lookup = ?2",
+                params![id_bytes(vault_id.0), path_lookup],
                 map_scope,
             )
             .optional()
@@ -469,6 +438,59 @@ impl Store {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    pub fn secret_http_access(
+        &self,
+        secret_id: SecretId,
+    ) -> Result<Option<SecretHttpAccessRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT secret_id, encrypted_host, port, methods, encrypted_path_prefix,
+                        max_request_bytes, max_response_bytes
+                 FROM secret_http_access WHERE secret_id = ?1",
+                params![id_bytes(secret_id.0)],
+                map_secret_http_access,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn set_secret_http_access(
+        &mut self,
+        record: &SecretHttpAccessRecord,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO secret_http_access
+             (secret_id, encrypted_host, port, methods, encrypted_path_prefix,
+              max_request_bytes, max_response_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(secret_id) DO UPDATE SET
+                 encrypted_host = excluded.encrypted_host,
+                 port = excluded.port,
+                 methods = excluded.methods,
+                 encrypted_path_prefix = excluded.encrypted_path_prefix,
+                 max_request_bytes = excluded.max_request_bytes,
+                 max_response_bytes = excluded.max_response_bytes",
+            params![
+                id_bytes(record.secret_id.0),
+                record.encrypted_host,
+                i64::from(record.port),
+                record.methods,
+                record.encrypted_path_prefix,
+                to_i64(record.max_request_bytes)?,
+                to_i64(record.max_response_bytes)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_secret_http_access(&mut self, secret_id: SecretId) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM secret_http_access WHERE secret_id = ?1",
+            params![id_bytes(secret_id.0)],
+        )?;
+        Ok(())
     }
 
     pub fn insert_secret_with_version(
@@ -599,6 +621,10 @@ impl Store {
             "DELETE FROM secret_version WHERE secret_id = ?1",
             params![id_bytes(secret_id.0)],
         )?;
+        transaction.execute(
+            "DELETE FROM secret_http_access WHERE secret_id = ?1",
+            params![id_bytes(secret_id.0)],
+        )?;
         let status: Option<u8> = transaction
             .query_row(
                 "SELECT status FROM secret WHERE id = ?1",
@@ -621,117 +647,6 @@ impl Store {
         }
         transaction.commit()?;
         Ok(())
-    }
-
-    pub fn principals(&self) -> Result<Vec<PrincipalRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, vault_id, kind, encrypted_name, name_lookup, disabled, generation
-             FROM principal ORDER BY rowid",
-        )?;
-        statement
-            .query_map([], map_principal)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
-    }
-
-    pub fn principal_by_lookup(
-        &self,
-        vault_id: VaultId,
-        lookup: &[u8],
-    ) -> Result<Option<PrincipalRecord>, StoreError> {
-        self.connection
-            .query_row(
-                "SELECT id, vault_id, kind, encrypted_name, name_lookup, disabled, generation
-                 FROM principal WHERE vault_id = ?1 AND name_lookup = ?2",
-                params![id_bytes(vault_id.0), lookup],
-                map_principal,
-            )
-            .optional()
-            .map_err(StoreError::from)
-    }
-
-    pub fn principal_by_id(
-        &self,
-        principal_id: PrincipalId,
-    ) -> Result<Option<PrincipalRecord>, StoreError> {
-        self.connection
-            .query_row(
-                "SELECT id, vault_id, kind, encrypted_name, name_lookup, disabled, generation
-                 FROM principal WHERE id = ?1",
-                params![id_bytes(principal_id.0)],
-                map_principal,
-            )
-            .optional()
-            .map_err(StoreError::from)
-    }
-
-    pub fn insert_principal(&mut self, principal: &PrincipalRecord) -> Result<(), StoreError> {
-        self.connection.execute(
-            "INSERT INTO principal
-             (id, vault_id, kind, encrypted_name, name_lookup, disabled, generation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                id_bytes(principal.id.0),
-                id_bytes(principal.vault_id.0),
-                i64::from(principal.kind),
-                principal.encrypted_name,
-                principal.name_lookup,
-                principal.disabled,
-                to_i64(principal.generation)?,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn update_principal(&mut self, principal: &PrincipalRecord) -> Result<(), StoreError> {
-        let changed = self.connection.execute(
-            "UPDATE principal
-             SET kind = ?1, encrypted_name = ?2, name_lookup = ?3,
-                 disabled = ?4, generation = ?5
-             WHERE id = ?6",
-            params![
-                i64::from(principal.kind),
-                principal.encrypted_name,
-                principal.name_lookup,
-                principal.disabled,
-                to_i64(principal.generation)?,
-                id_bytes(principal.id.0),
-            ],
-        )?;
-        expect_single_change(changed)
-    }
-
-    pub fn insert_policy_rule(&mut self, rule: &PolicyRuleRecord) -> Result<(), StoreError> {
-        self.connection.execute(
-            "INSERT INTO policy_rule
-             (id, vault_id, principal_id, effect, action, resource_kind, resource_id,
-              disabled, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                id_bytes(rule.id.0),
-                id_bytes(rule.vault_id.0),
-                id_bytes(rule.principal_id.0),
-                i64::from(rule.effect),
-                i64::from(rule.action),
-                i64::from(rule.resource_kind),
-                rule.resource_id,
-                rule.disabled,
-                rule.created_at,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn policy_rules(&self) -> Result<Vec<PolicyRuleRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, vault_id, principal_id, effect, action, resource_kind, resource_id,
-                    disabled, created_at
-             FROM policy_rule ORDER BY id",
-        )?;
-        statement
-            .query_map([], map_policy_rule)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
     }
 
     pub fn apply_import_batch(&mut self, batch: &ImportBatch) -> Result<(), StoreError> {
@@ -777,188 +692,9 @@ impl Store {
             }
             insert_secret_version(&transaction, &append.version)?;
         }
-        for principal in &batch.principals {
-            insert_principal(&transaction, principal)?;
-        }
-        for rule in &batch.policy_rules {
-            insert_policy_rule(&transaction, rule)?;
-        }
         validate_import_transaction(&transaction)?;
         transaction.commit()?;
         Ok(())
-    }
-
-    pub fn append_audit<EventHash, StateMac>(
-        &mut self,
-        draft: &AuditEventDraft,
-        event_hash: EventHash,
-        state_mac: StateMac,
-    ) -> Result<AuditEventRecord, StoreError>
-    where
-        EventHash: Fn(u64, &AuditEventDraft, &[u8; 32]) -> [u8; 32],
-        StateMac: Fn(u64, &[u8; 32]) -> [u8; 32],
-    {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous = transaction
-            .query_row(
-                "SELECT sequence, event_hash FROM audit_event ORDER BY sequence DESC LIMIT 1",
-                [],
-                |row| Ok((read_u64(row, 0)?, read_hash(row, 1)?)),
-            )
-            .optional()?;
-        let state = transaction
-            .query_row(
-                "SELECT event_count, head_hash, state_mac FROM audit_state WHERE singleton = 1",
-                [],
-                |row| Ok((read_u64(row, 0)?, read_hash(row, 1)?, read_hash(row, 2)?)),
-            )
-            .optional()?;
-        let (sequence, previous_hash) = match (previous, state) {
-            (Some((sequence, hash)), Some((count, head, mac)))
-                if sequence == count && hash == head && state_mac(count, &head) == mac =>
-            {
-                (
-                    sequence.checked_add(1).ok_or(StoreError::NumericRange)?,
-                    hash,
-                )
-            }
-            (None, Some((0, head, mac))) if head == [0; 32] && state_mac(0, &head) == mac => {
-                (1, [0; 32])
-            }
-            _ => return Err(StoreError::Integrity),
-        };
-        let event_hash = event_hash(sequence, draft, &previous_hash);
-        let state_mac = state_mac(sequence, &event_hash);
-        transaction.execute(
-            "INSERT INTO audit_event
-             (sequence, id, action, outcome, redacted_metadata, previous_hash, event_hash, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                to_i64(sequence)?,
-                id_bytes(draft.id.0),
-                i64::from(draft.action),
-                i64::from(draft.outcome),
-                draft.redacted_metadata,
-                previous_hash.as_slice(),
-                event_hash.as_slice(),
-                draft.created_at,
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO audit_state (singleton, event_count, head_hash, state_mac)
-             VALUES (1, ?1, ?2, ?3)
-             ON CONFLICT(singleton) DO UPDATE SET
-                 event_count = excluded.event_count,
-                 head_hash = excluded.head_hash,
-                 state_mac = excluded.state_mac",
-            params![
-                to_i64(sequence)?,
-                event_hash.as_slice(),
-                state_mac.as_slice(),
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(AuditEventRecord {
-            sequence,
-            id: draft.id,
-            action: draft.action,
-            outcome: draft.outcome,
-            redacted_metadata: draft.redacted_metadata.clone(),
-            previous_hash,
-            event_hash,
-            created_at: draft.created_at,
-        })
-    }
-
-    pub fn audit_events(&self) -> Result<Vec<AuditEventRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT sequence, id, action, outcome, redacted_metadata, previous_hash,
-                    event_hash, created_at
-             FROM audit_event ORDER BY sequence",
-        )?;
-        statement
-            .query_map([], map_audit_event)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
-    }
-
-    pub fn initialize_audit_state(&mut self, state_mac: [u8; 32]) -> Result<(), StoreError> {
-        let state_count: i64 =
-            self.connection
-                .query_row("SELECT COUNT(*) FROM audit_state", [], |row| row.get(0))?;
-        if state_count == 1 {
-            return Ok(());
-        }
-        if state_count != 0 {
-            return Err(StoreError::Integrity);
-        }
-        let event_count: i64 =
-            self.connection
-                .query_row("SELECT COUNT(*) FROM audit_event", [], |row| row.get(0))?;
-        if event_count != 0 {
-            return Err(StoreError::Integrity);
-        }
-        self.connection.execute(
-            "INSERT INTO audit_state (singleton, event_count, head_hash, state_mac)
-             VALUES (1, 0, zeroblob(32), ?1)
-             ON CONFLICT(singleton) DO NOTHING",
-            params![state_mac.as_slice()],
-        )?;
-        Ok(())
-    }
-
-    pub fn verify_audit_chain<EventHash, StateMac>(
-        &self,
-        event_hash: EventHash,
-        state_mac: StateMac,
-    ) -> Result<(), StoreError>
-    where
-        EventHash: Fn(u64, &AuditEventDraft, &[u8; 32]) -> [u8; 32],
-        StateMac: Fn(u64, &[u8; 32]) -> [u8; 32],
-    {
-        let mut previous_hash = [0; 32];
-        let events = self.audit_events()?;
-        for (index, event) in events.iter().enumerate() {
-            let expected_sequence = u64::try_from(index)
-                .map_err(|_| StoreError::NumericRange)?
-                .checked_add(1)
-                .ok_or(StoreError::NumericRange)?;
-            let draft = AuditEventDraft {
-                id: event.id,
-                action: event.action,
-                outcome: event.outcome,
-                redacted_metadata: event.redacted_metadata.clone(),
-                created_at: event.created_at,
-            };
-            if event.sequence != expected_sequence
-                || event.previous_hash != previous_hash
-                || event.event_hash != event_hash(event.sequence, &draft, &previous_hash)
-            {
-                return Err(StoreError::Integrity);
-            }
-            previous_hash = event.event_hash;
-        }
-        let state = self
-            .connection
-            .query_row(
-                "SELECT event_count, head_hash, state_mac FROM audit_state WHERE singleton = 1",
-                [],
-                |row| Ok((read_u64(row, 0)?, read_hash(row, 1)?, read_hash(row, 2)?)),
-            )
-            .optional()?;
-        let length = events.len();
-        match state {
-            Some((count, head, mac))
-                if u64::try_from(length).ok() == Some(count)
-                    && head == previous_hash
-                    && state_mac(count, &head) == mac =>
-            {
-                Ok(())
-            }
-            _ => Err(StoreError::Integrity),
-        }
     }
 
     pub fn integrity_check(&self) -> Result<(), StoreError> {
@@ -1083,8 +819,6 @@ CREATE TABLE profile (
     generation INTEGER NOT NULL CHECK (generation >= 1),
     UNIQUE(vault_id, name_lookup)
 ) STRICT;
-CREATE UNIQUE INDEX one_startup_profile_per_vault
-    ON profile(vault_id) WHERE activate_on_start = 1;
 CREATE TABLE secret (
     id BLOB PRIMARY KEY NOT NULL,
     scope_id BLOB NOT NULL REFERENCES scope(id),
@@ -1109,45 +843,15 @@ CREATE TABLE secret_version (
     created_at INTEGER NOT NULL,
     UNIQUE(secret_id, version)
 ) STRICT;
-CREATE TABLE audit_event (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    id BLOB UNIQUE NOT NULL,
-    action INTEGER NOT NULL,
-    outcome INTEGER NOT NULL,
-    redacted_metadata BLOB NOT NULL,
-    previous_hash BLOB NOT NULL,
-    event_hash BLOB NOT NULL,
-    created_at INTEGER NOT NULL
+CREATE TABLE secret_http_access (
+    secret_id BLOB PRIMARY KEY NOT NULL REFERENCES secret(id),
+    encrypted_host BLOB NOT NULL,
+    port INTEGER NOT NULL,
+    methods TEXT NOT NULL,
+    encrypted_path_prefix BLOB NOT NULL,
+    max_request_bytes INTEGER NOT NULL,
+    max_response_bytes INTEGER NOT NULL
 ) STRICT;
-CREATE TABLE audit_state (
-    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
-    event_count INTEGER NOT NULL CHECK (event_count >= 0),
-    head_hash BLOB NOT NULL,
-    state_mac BLOB NOT NULL
-) STRICT;
-CREATE TABLE principal (
-    id BLOB PRIMARY KEY NOT NULL,
-    vault_id BLOB NOT NULL REFERENCES vault(id),
-    kind INTEGER NOT NULL CHECK (kind IN (0, 1, 2)),
-    encrypted_name BLOB NOT NULL,
-    name_lookup BLOB NOT NULL,
-    disabled INTEGER NOT NULL CHECK (disabled IN (0, 1)),
-    generation INTEGER NOT NULL CHECK (generation >= 1),
-    UNIQUE(vault_id, name_lookup)
-) STRICT;
-CREATE TABLE policy_rule (
-    id BLOB PRIMARY KEY NOT NULL,
-    vault_id BLOB NOT NULL REFERENCES vault(id),
-    principal_id BLOB NOT NULL REFERENCES principal(id),
-    effect INTEGER NOT NULL CHECK (effect IN (0, 1)),
-    action INTEGER NOT NULL,
-    resource_kind INTEGER NOT NULL CHECK (resource_kind IN (0, 1, 2)),
-    resource_id BLOB NOT NULL,
-    disabled INTEGER NOT NULL CHECK (disabled IN (0, 1)),
-    created_at INTEGER NOT NULL
-) STRICT;
-CREATE INDEX policy_rule_principal_action
-    ON policy_rule(principal_id, action, disabled);
 PRAGMA user_version = 3;
 ";
 
@@ -1175,8 +879,6 @@ FROM profile;
 DROP INDEX one_startup_profile_per_vault;
 DROP TABLE profile;
 ALTER TABLE profile_v3 RENAME TO profile;
-CREATE UNIQUE INDEX one_startup_profile_per_vault
-    ON profile(vault_id) WHERE activate_on_start = 1;
 
 CREATE TABLE secret_v3 (
     id BLOB PRIMARY KEY NOT NULL,
@@ -1196,35 +898,18 @@ FROM secret;
 DROP TABLE secret;
 ALTER TABLE secret_v3 RENAME TO secret;
 
-CREATE TABLE audit_state (
-    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
-    event_count INTEGER NOT NULL CHECK (event_count >= 0),
-    head_hash BLOB NOT NULL,
-    state_mac BLOB NOT NULL
+DROP TABLE IF EXISTS audit_event;
+DROP TABLE IF EXISTS principal;
+DROP TABLE IF EXISTS policy_rule;
+CREATE TABLE secret_http_access (
+    secret_id BLOB PRIMARY KEY NOT NULL REFERENCES secret(id),
+    encrypted_host BLOB NOT NULL,
+    port INTEGER NOT NULL,
+    methods TEXT NOT NULL,
+    encrypted_path_prefix BLOB NOT NULL,
+    max_request_bytes INTEGER NOT NULL,
+    max_response_bytes INTEGER NOT NULL
 ) STRICT;
-CREATE TABLE principal (
-    id BLOB PRIMARY KEY NOT NULL,
-    vault_id BLOB NOT NULL REFERENCES vault(id),
-    kind INTEGER NOT NULL CHECK (kind IN (0, 1, 2)),
-    encrypted_name BLOB NOT NULL,
-    name_lookup BLOB NOT NULL,
-    disabled INTEGER NOT NULL CHECK (disabled IN (0, 1)),
-    generation INTEGER NOT NULL CHECK (generation >= 1),
-    UNIQUE(vault_id, name_lookup)
-) STRICT;
-CREATE TABLE policy_rule (
-    id BLOB PRIMARY KEY NOT NULL,
-    vault_id BLOB NOT NULL REFERENCES vault(id),
-    principal_id BLOB NOT NULL REFERENCES principal(id),
-    effect INTEGER NOT NULL CHECK (effect IN (0, 1)),
-    action INTEGER NOT NULL,
-    resource_kind INTEGER NOT NULL CHECK (resource_kind IN (0, 1, 2)),
-    resource_id BLOB NOT NULL,
-    disabled INTEGER NOT NULL CHECK (disabled IN (0, 1)),
-    created_at INTEGER NOT NULL
-) STRICT;
-CREATE INDEX policy_rule_principal_action
-    ON policy_rule(principal_id, action, disabled);
 PRAGMA user_version = 3;
 ";
 
@@ -1336,8 +1021,7 @@ fn apply_import_reset(
             root_scope_id,
             base_profile_id,
         } => {
-            transaction.execute("DELETE FROM policy_rule", [])?;
-            transaction.execute("DELETE FROM principal", [])?;
+            transaction.execute("DELETE FROM secret_http_access", [])?;
             transaction.execute("DELETE FROM secret_version", [])?;
             transaction.execute("DELETE FROM secret", [])?;
             transaction.execute(
@@ -1402,7 +1086,7 @@ fn validate_import_transaction(transaction: &Transaction<'_>) -> Result<(), Stor
         [],
         |row| row.get(0),
     )?;
-    if startup_profiles != 1 {
+    if startup_profiles < 1 {
         return Err(StoreError::Integrity);
     }
     let invalid_secret: Option<i64> = transaction
@@ -1419,24 +1103,6 @@ fn validate_import_transaction(transaction: &Transaction<'_>) -> Result<(), Stor
         )
         .optional()?;
     if invalid_secret.is_some() {
-        return Err(StoreError::Integrity);
-    }
-    let invalid_policy_resource: Option<i64> = transaction
-        .query_row(
-            "SELECT 1
-             FROM policy_rule
-             WHERE (resource_kind = 0 AND NOT EXISTS
-                       (SELECT 1 FROM vault WHERE vault.id = policy_rule.resource_id))
-                OR (resource_kind = 1 AND NOT EXISTS
-                       (SELECT 1 FROM scope WHERE scope.id = policy_rule.resource_id))
-                OR (resource_kind = 2 AND NOT EXISTS
-                       (SELECT 1 FROM secret WHERE secret.id = policy_rule.resource_id))
-             LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if invalid_policy_resource.is_some() {
         return Err(StoreError::Integrity);
     }
     Ok(())
@@ -1477,51 +1143,6 @@ fn update_profile(transaction: &Transaction<'_>, record: &ProfileRecord) -> Resu
         ],
     )?;
     expect_single_change(changed)
-}
-
-fn insert_principal(
-    transaction: &Transaction<'_>,
-    record: &PrincipalRecord,
-) -> Result<(), StoreError> {
-    transaction.execute(
-        "INSERT INTO principal
-         (id, vault_id, kind, encrypted_name, name_lookup, disabled, generation)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            id_bytes(record.id.0),
-            id_bytes(record.vault_id.0),
-            i64::from(record.kind),
-            record.encrypted_name,
-            record.name_lookup,
-            record.disabled,
-            to_i64(record.generation)?,
-        ],
-    )?;
-    Ok(())
-}
-
-fn insert_policy_rule(
-    transaction: &Transaction<'_>,
-    record: &PolicyRuleRecord,
-) -> Result<(), StoreError> {
-    transaction.execute(
-        "INSERT INTO policy_rule
-         (id, vault_id, principal_id, effect, action, resource_kind, resource_id,
-          disabled, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            id_bytes(record.id.0),
-            id_bytes(record.vault_id.0),
-            id_bytes(record.principal_id.0),
-            i64::from(record.effect),
-            i64::from(record.action),
-            i64::from(record.resource_kind),
-            record.resource_id,
-            record.disabled,
-            record.created_at,
-        ],
-    )?;
-    Ok(())
 }
 
 fn map_vault(row: &rusqlite::Row<'_>) -> rusqlite::Result<VaultRecord> {
@@ -1571,6 +1192,18 @@ fn map_secret(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretRecord> {
     })
 }
 
+fn map_secret_http_access(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretHttpAccessRecord> {
+    Ok(SecretHttpAccessRecord {
+        secret_id: SecretId(read_id(row, 0)?),
+        encrypted_host: row.get(1)?,
+        port: read_u16(row, 2)?,
+        methods: row.get(3)?,
+        encrypted_path_prefix: row.get(4)?,
+        max_request_bytes: read_u64(row, 5)?,
+        max_response_bytes: read_u64(row, 6)?,
+    })
+}
+
 fn map_secret_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVersionRecord> {
     Ok(SecretVersionRecord {
         id: SecretVersionId(read_id(row, 0)?),
@@ -1583,45 +1216,6 @@ fn map_secret_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVersion
         generated_length: read_optional_u64(row, 7)?,
         entropy_bits: read_optional_u32(row, 8)?,
         created_at: row.get(9)?,
-    })
-}
-
-fn map_principal(row: &rusqlite::Row<'_>) -> rusqlite::Result<PrincipalRecord> {
-    Ok(PrincipalRecord {
-        id: PrincipalId(read_id(row, 0)?),
-        vault_id: VaultId(read_id(row, 1)?),
-        kind: read_u8(row, 2)?,
-        encrypted_name: row.get(3)?,
-        name_lookup: row.get(4)?,
-        disabled: row.get(5)?,
-        generation: read_u64(row, 6)?,
-    })
-}
-
-fn map_policy_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<PolicyRuleRecord> {
-    Ok(PolicyRuleRecord {
-        id: PolicyRuleId(read_id(row, 0)?),
-        vault_id: VaultId(read_id(row, 1)?),
-        principal_id: PrincipalId(read_id(row, 2)?),
-        effect: read_u8(row, 3)?,
-        action: read_u8(row, 4)?,
-        resource_kind: read_u8(row, 5)?,
-        resource_id: row.get(6)?,
-        disabled: row.get(7)?,
-        created_at: row.get(8)?,
-    })
-}
-
-fn map_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEventRecord> {
-    Ok(AuditEventRecord {
-        sequence: read_u64(row, 0)?,
-        id: AuditEventId(read_id(row, 1)?),
-        action: read_u8(row, 2)?,
-        outcome: read_u8(row, 3)?,
-        redacted_metadata: row.get(4)?,
-        previous_hash: read_hash(row, 5)?,
-        event_hash: read_hash(row, 6)?,
-        created_at: row.get(7)?,
     })
 }
 
@@ -1698,6 +1292,17 @@ fn read_u8(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u8> {
     })
 }
 
+fn read_u16(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u16> {
+    let value: i64 = row.get(index)?;
+    u16::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
 fn read_optional_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
     row.get::<_, Option<i64>>(index)?
         .map(u64::try_from)
@@ -1724,51 +1329,7 @@ fn read_optional_u32(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<
         })
 }
 
-fn read_hash(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<[u8; 32]> {
-    let bytes: Vec<u8> = row.get(index)?;
-    bytes.try_into().map_err(|bytes: Vec<u8>| {
-        rusqlite::Error::FromSqlConversionFailure(
-            index,
-            rusqlite::types::Type::Blob,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("expected 32-byte hash, got {} bytes", bytes.len()),
-            )),
-        )
-    })
-}
-
 #[cfg(test)]
-fn audit_hash(sequence: u64, draft: &AuditEventDraft, previous_hash: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key("envault audit chain v1");
-    let sequence = sequence.to_be_bytes();
-    let action = [draft.action];
-    let outcome = [draft.outcome];
-    let created_at = draft.created_at.to_be_bytes();
-    for part in [
-        sequence.as_slice(),
-        draft.id.0.as_bytes(),
-        action.as_slice(),
-        outcome.as_slice(),
-        draft.redacted_metadata.as_slice(),
-        previous_hash.as_slice(),
-        created_at.as_slice(),
-    ] {
-        let length = u64::try_from(part.len()).expect("audit field length fits u64");
-        hasher.update(&length.to_be_bytes());
-        hasher.update(part);
-    }
-    *hasher.finalize().as_bytes()
-}
-
-#[cfg(test)]
-fn audit_state_mac(count: u64, head_hash: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key("envault audit test state v1");
-    hasher.update(&count.to_be_bytes());
-    hasher.update(head_hash);
-    *hasher.finalize().as_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1920,7 +1481,7 @@ mod tests {
             }],
             secret_versions: vec![SecretVersionRecord {
                 id: SecretVersionId(Uuid::new_v4()),
-                secret_id,
+                secret_id: SecretId(Uuid::new_v4()),
                 version: 1,
                 ciphertext: vec![3; 64],
                 wrapped_dek: vec![4; 72],
@@ -1930,61 +1491,10 @@ mod tests {
                 entropy_bits: None,
                 created_at: 1,
             }],
-            policy_rules: vec![PolicyRuleRecord {
-                id: PolicyRuleId(Uuid::new_v4()),
-                vault_id: vault.id,
-                principal_id: PrincipalId(Uuid::new_v4()),
-                effect: 0,
-                action: 0,
-                resource_kind: 0,
-                resource_id: vault.id.0.as_bytes().to_vec(),
-                disabled: false,
-                created_at: 1,
-            }],
             ..ImportBatch::default()
         };
         assert!(store.apply_import_batch(&batch).is_err());
         assert!(store.secrets().expect("rolled back").is_empty());
-        assert!(store.policy_rules().expect("rolled back").is_empty());
-    }
-
-    #[test]
-    fn portability_batch_rejects_orphaned_policy_resources_atomically() {
-        let (vault, scope, profile) = fixture();
-        let mut store = Store::open_in_memory().expect("store");
-        store
-            .initialize(&vault, &scope, &profile)
-            .expect("initialize");
-        let principal = PrincipalRecord {
-            id: PrincipalId(Uuid::new_v4()),
-            vault_id: vault.id,
-            kind: 1,
-            encrypted_name: vec![1],
-            name_lookup: vec![2; 32],
-            disabled: false,
-            generation: 1,
-        };
-        let batch = ImportBatch {
-            principals: vec![principal.clone()],
-            policy_rules: vec![PolicyRuleRecord {
-                id: PolicyRuleId(Uuid::new_v4()),
-                vault_id: vault.id,
-                principal_id: principal.id,
-                effect: 0,
-                action: 0,
-                resource_kind: 2,
-                resource_id: Uuid::new_v4().as_bytes().to_vec(),
-                disabled: false,
-                created_at: 1,
-            }],
-            ..ImportBatch::default()
-        };
-        assert!(matches!(
-            store.apply_import_batch(&batch),
-            Err(StoreError::Integrity)
-        ));
-        assert!(store.principals().expect("rolled back").is_empty());
-        assert!(store.policy_rules().expect("rolled back").is_empty());
     }
 
     #[test]
@@ -2089,109 +1599,6 @@ mod tests {
     }
 
     #[test]
-    fn audit_chain_is_append_only_and_tamper_evident() {
-        let (vault, scope, profile) = fixture();
-        let mut store = Store::open_in_memory().expect("store");
-        store
-            .initialize(&vault, &scope, &profile)
-            .expect("initialize");
-        store
-            .initialize_audit_state(audit_state_mac(0, &[0; 32]))
-            .expect("audit state");
-        for index in 0_u8..2 {
-            store
-                .append_audit(
-                    &AuditEventDraft {
-                        id: AuditEventId(Uuid::new_v4()),
-                        action: index,
-                        outcome: 0,
-                        redacted_metadata: vec![index, 7],
-                        created_at: i64::from(index) + 1,
-                    },
-                    audit_hash,
-                    audit_state_mac,
-                )
-                .expect("append");
-        }
-        store
-            .verify_audit_chain(audit_hash, audit_state_mac)
-            .expect("verify");
-        let events = store.audit_events().expect("events");
-        assert_eq!(events[0].sequence, 1);
-        assert_eq!(events[1].previous_hash, events[0].event_hash);
-        store
-            .connection
-            .execute(
-                "UPDATE audit_event SET redacted_metadata = x'00' WHERE sequence = 1",
-                [],
-            )
-            .expect("tamper");
-        assert!(matches!(
-            store.verify_audit_chain(audit_hash, audit_state_mac),
-            Err(StoreError::Integrity)
-        ));
-        store
-            .connection
-            .execute(
-                "UPDATE audit_event SET redacted_metadata = x'0007' WHERE sequence = 1",
-                [],
-            )
-            .expect("restore");
-        store
-            .verify_audit_chain(audit_hash, audit_state_mac)
-            .expect("restored chain");
-        store
-            .connection
-            .execute("DELETE FROM audit_event WHERE sequence = 2", [])
-            .expect("truncate");
-        assert!(matches!(
-            store.verify_audit_chain(audit_hash, audit_state_mac),
-            Err(StoreError::Integrity)
-        ));
-        store
-            .connection
-            .execute_batch("DELETE FROM audit_event; DELETE FROM audit_state;")
-            .expect("erase audit tables");
-        assert!(matches!(
-            store.verify_audit_chain(audit_hash, audit_state_mac),
-            Err(StoreError::Integrity)
-        ));
-    }
-
-    #[test]
-    fn principal_and_policy_records_round_trip() {
-        let (vault, scope, profile) = fixture();
-        let mut store = Store::open_in_memory().expect("store");
-        store
-            .initialize(&vault, &scope, &profile)
-            .expect("initialize");
-        let principal = PrincipalRecord {
-            id: PrincipalId(Uuid::new_v4()),
-            vault_id: vault.id,
-            kind: 1,
-            encrypted_name: vec![1],
-            name_lookup: vec![2; 32],
-            disabled: false,
-            generation: 1,
-        };
-        store.insert_principal(&principal).expect("principal");
-        let rule = PolicyRuleRecord {
-            id: PolicyRuleId(Uuid::new_v4()),
-            vault_id: vault.id,
-            principal_id: principal.id,
-            effect: 0,
-            action: 2,
-            resource_kind: 0,
-            resource_id: vault.id.0.as_bytes().to_vec(),
-            disabled: false,
-            created_at: 1,
-        };
-        store.insert_policy_rule(&rule).expect("rule");
-        assert_eq!(store.principals().expect("principals"), vec![principal]);
-        assert_eq!(store.policy_rules().expect("rules"), vec![rule]);
-    }
-
-    #[test]
     fn singleton_and_mutation_invariants_fail_closed() {
         let (vault, scope, profile) = fixture();
         let mut store = Store::open_in_memory().expect("store");
@@ -2200,7 +1607,7 @@ mod tests {
             .expect("initialize");
 
         assert!(matches!(
-            store.set_startup_profile(ProfileId(Uuid::new_v4())),
+            store.set_profile_loaded(ProfileId(Uuid::new_v4()), true),
             Err(StoreError::Integrity)
         ));
         assert!(store.profiles().expect("profiles")[0].activate_on_start);

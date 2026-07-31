@@ -70,6 +70,14 @@ pub fn draw<C: DaemonClient>(frame: &mut Frame, app: &App<C>) {
                 ),
             );
         }
+        Mode::Reveal(name, value) => {
+            draw_modal(
+                frame,
+                area,
+                "Reveal (press any key to close)",
+                &format!("{name} = {}", value.as_str()),
+            );
+        }
     }
 }
 
@@ -153,8 +161,12 @@ fn draw_dashboard<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>) 
             status.pid
         )));
         lines.push(Line::from(format!(
-            "active profile: {}",
-            status.active_profile.as_deref().unwrap_or("(none)")
+            "loaded profiles: {}",
+            if status.loaded_profiles.is_empty() {
+                "(none)".to_string()
+            } else {
+                status.loaded_profiles.join(", ")
+            }
         )));
         lines.push(Line::from(format!(
             "admin lease: {}",
@@ -163,10 +175,6 @@ fn draw_dashboard<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>) 
             } else {
                 "inactive"
             }
-        )));
-        lines.push(Line::from(format!(
-            "agent sessions: {}",
-            status.agent_session_count
         )));
     } else {
         lines.push(Line::from("daemon status unavailable"));
@@ -282,13 +290,11 @@ fn draw_portability<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>
         Some(PortabilityPreviewState::Package { preview, .. }) => {
             lines.push(Line::from(format!("plan hash: {}", preview.plan_hash)));
             lines.push(Line::from(format!(
-                "counts: scopes={} profiles={} secrets={} versions={} principals={} policy_rules={}",
+                "counts: scopes={} profiles={} secrets={} versions={}",
                 preview.counts.scopes,
                 preview.counts.profiles,
                 preview.counts.secrets,
                 preview.counts.versions,
-                preview.counts.principals,
-                preview.counts.policy_rules
             )));
             for conflict in &preview.conflicts {
                 lines.push(Line::from(format!(

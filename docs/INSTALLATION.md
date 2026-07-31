@@ -22,6 +22,12 @@ curl -fsSL https://raw.githubusercontent.com/Thanhbinh1905/envault/main/install.
 Set `ENVAULT_INSTALL_DIR` to choose another user-writable installation directory.
 Review the script before piping it to a shell when your environment requires a stricter supply-chain process.
 
+The installer reports platform detection, release discovery, archive download, checksum verification, extraction, binary installation, and `PATH` status.
+It does not print credentials or vault contents.
+
+When run from an interactive terminal, the installer also offers to run `envault init` immediately after installing the binaries, using the masked prompt on `/dev/tty`.
+Answer `n` to skip and initialize later, or set `ENVAULT_SKIP_INIT=1` to skip this step non-interactively (for example in CI or containers).
+
 1. Open the [latest GitHub Release](https://github.com/Thanhbinh1905/envault/releases/latest).
 2. Download the archive matching your operating system and CPU architecture.
 3. Download `SHA256SUMS` from the same release.
@@ -76,6 +82,23 @@ The `envault-tui` binary is an optional interactive client and does not replace 
 
 On Unix, `envault start` can spawn the daemon after the human bootstrap prompt.
 On Windows, start `envaultd.exe` from a supervised process or terminal before using client commands because automatic client-side daemon spawning is not available yet.
+
+## Shell completions
+
+`envault completions <shell>` prints a completion script for `bash`, `zsh`, `fish`, `elvish`, or `powershell`.
+
+```sh
+# bash
+envault completions bash | sudo tee /etc/bash_completion.d/envault >/dev/null
+
+# zsh (any directory on $fpath)
+envault completions zsh > "${fpath[1]}/_envault"
+
+# fish
+envault completions fish > ~/.config/fish/completions/envault.fish
+```
+
+Restart the shell, or source the generated file directly, to pick up completions immediately.
 
 ## Agent integration
 
