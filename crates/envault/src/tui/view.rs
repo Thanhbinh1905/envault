@@ -4,6 +4,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use zeroize::Zeroizing;
 
 use super::app::{App, DaemonClient, Mode, PasswordPurpose, PortabilityPreviewState, Screen};
 
@@ -71,12 +72,8 @@ pub fn draw<C: DaemonClient>(frame: &mut Frame, app: &App<C>) {
             );
         }
         Mode::Reveal(name, value) => {
-            draw_modal(
-                frame,
-                area,
-                "Reveal (press any key to close)",
-                &format!("{name} = {}", value.as_str()),
-            );
+            let line = Zeroizing::new(format!("{name} = {}", value.as_str()));
+            draw_modal(frame, area, "Reveal (press any key to close)", &line);
         }
     }
 }

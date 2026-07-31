@@ -17,6 +17,7 @@ clap_complete.workspace = true
 comfy-table.workspace = true
 crossterm.workspace = true
 envault-core = { version = "=0.0.1", path = "../envault-core" }
+envault-crypto = { version = "=0.0.1", path = "../envault-crypto" }
 envault-platform = { version = "=0.0.1", path = "../envault-platform" }
 envault-protocol = { version = "=0.0.1", path = "../envault-protocol" }
 envault-service = { version = "=0.0.1", path = "../envault-service" }

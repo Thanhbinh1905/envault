@@ -19,6 +19,20 @@ pub const MAX_KDF_MEMORY_KIB: u32 = 1024 * 1024;
 pub const MAX_KDF_ITERATIONS: u32 = 20;
 pub const MAX_KDF_PARALLELISM: u32 = 16;
 
+/// Implements a `Debug` impl that never prints a type's contents, only its
+/// name - for newtypes wrapping secret material where the derived `Debug`
+/// would otherwise leak the plaintext on the first `{:?}` format call.
+#[macro_export]
+macro_rules! redacted_debug {
+    ($type_name:ty) => {
+        impl core::fmt::Debug for $type_name {
+            fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                formatter.write_str(concat!(stringify!($type_name), "([REDACTED])"))
+            }
+        }
+    };
+}
+
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SecretKey([u8; KEY_BYTES]);
 
@@ -65,17 +79,8 @@ impl AsRef<[u8]> for SecretBytes {
     }
 }
 
-impl core::fmt::Debug for SecretBytes {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str("SecretBytes([REDACTED])")
-    }
-}
-
-impl core::fmt::Debug for SecretKey {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str("SecretKey([REDACTED])")
-    }
-}
+redacted_debug!(SecretBytes);
+redacted_debug!(SecretKey);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KdfParameters {
@@ -259,6 +264,21 @@ pub fn unwrap_key(
 pub fn lookup_digest(key: &SecretKey, domain: &str, value: &[u8]) -> [u8; 32] {
     let subkey = blake3::derive_key(domain, key.expose());
     *blake3::keyed_hash(&subkey, value).as_bytes()
+}
+
+/// Constant-time byte comparison: unequal lengths short-circuit (length is
+/// not secret in any of this crate's callers), but for equal-length inputs
+/// every byte is folded regardless of earlier mismatches.
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 #[cfg(test)]

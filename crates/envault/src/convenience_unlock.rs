@@ -70,6 +70,11 @@ pub fn disable(keystore: &dyn Keystore) -> io::Result<()> {
     remove_marker()
 }
 
+/// `keystore.get()` returns a plain, non-zeroizing `String` from the
+/// `keyring` crate's own API - outside this crate's control. `into_bytes()`
+/// below reuses that same buffer rather than copying it, so there is no
+/// extra plaintext copy to zero here; the residual exposure is bounded to
+/// whatever `keyring` itself does internally, a known and accepted risk.
 pub fn read_stored_password(keystore: &dyn Keystore) -> io::Result<SensitiveBytes> {
     let text = keystore.get()?;
     Ok(SensitiveBytes::new(text.into_bytes()))

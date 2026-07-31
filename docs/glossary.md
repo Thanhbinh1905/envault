@@ -44,7 +44,7 @@ This is the only path that lets plaintext leave the daemon into a CLI-driven pro
 
 The TUI-only action that decrypts and displays a secret's current or historical value in a transient popup.
 It is the sole path that shows plaintext to a human's eyes; every CLI output path, including `envault run`, never prints a value.
-Gated by an admin lease checked at the moment of reveal, not by a separate token or TTL.
+Gated by an admin lease and a reveal token minted by re-proving the vault password; the token has no independent TTL beyond the lease it is attached to, and clears when that lease clears.
 
 ## KEK
 

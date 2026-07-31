@@ -26,11 +26,7 @@ impl CapabilityTokenKey {
     }
 }
 
-impl core::fmt::Debug for CapabilityTokenKey {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str("CapabilityTokenKey([REDACTED])")
-    }
-}
+envault_crypto::redacted_debug!(CapabilityTokenKey);
 
 pub struct IssuedCapabilityMaterial {
     token: SecretBytes,

@@ -11,6 +11,7 @@ repository.workspace = true
 ciborium.workspace = true
 envault-broker = { version = "=0.0.1", path = "../envault-broker" }
 envault-core = { version = "=0.0.1", path = "../envault-core" }
+envault-crypto = { version = "=0.0.1", path = "../envault-crypto" }
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

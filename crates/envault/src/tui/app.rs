@@ -21,7 +21,12 @@ pub trait DaemonClient {
         &self,
         name: &str,
         version: Option<u64>,
+        token: &SensitiveBytes,
     ) -> Result<SensitiveBytes, ClientError>;
+    /// Re-proves the vault password to mint a token bound to the current
+    /// admin lease; only a connection holding this token may call
+    /// `reveal_secret_value`, so an active lease alone never suffices.
+    fn issue_reveal_token(&self, password: SensitiveBytes) -> Result<SensitiveBytes, ClientError>;
 
     fn admin_unlock(
         &self,
@@ -150,13 +155,22 @@ impl DaemonClient for RealClient {
         &self,
         name: &str,
         version: Option<u64>,
+        token: &SensitiveBytes,
     ) -> Result<SensitiveBytes, ClientError> {
         match client::request(Operation::RevealSecretValue {
             profile: "base".to_string(),
             name: name.to_string(),
             version,
+            token: token.clone(),
         })? {
             Reply::SecretPlaintext(value) => Ok(value),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    fn issue_reveal_token(&self, password: SensitiveBytes) -> Result<SensitiveBytes, ClientError> {
+        match client::request(Operation::IssueRevealToken { password })? {
+            Reply::RevealToken(token) => Ok(token),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -749,6 +763,10 @@ pub struct App<C: DaemonClient> {
     portability_strategy: ImportConflictStrategy,
     portability_preview: Option<PortabilityPreviewState>,
     status_message: Option<String>,
+    /// Held only for this process's lifetime; minted by re-proving the vault
+    /// password (`IssueRevealToken`), never persisted or logged. Cleared
+    /// whenever the admin lease is locked.
+    reveal_token: Option<SensitiveBytes>,
 }
 
 impl<C: DaemonClient> App<C> {
@@ -770,6 +788,7 @@ impl<C: DaemonClient> App<C> {
             portability_strategy: ImportConflictStrategy::Abort,
             portability_preview: None,
             status_message: None,
+            reveal_token: None,
         }
     }
 
@@ -857,11 +876,13 @@ impl<C: DaemonClient> App<C> {
         }
     }
 
-    /// Opens the admin-unlock prompt immediately if no lease is active yet,
-    /// so the TUI - the only place a human can view plaintext - always asks
-    /// for a step-up credential before the Dashboard is usable.
+    /// Opens the admin-unlock prompt immediately unless this process already
+    /// holds a reveal token, so the TUI - the only place a human can view
+    /// plaintext - always re-proves the password itself before the Dashboard
+    /// is usable, even if some other same-uid connection already holds an
+    /// admin lease. An active lease alone is never treated as sufficient.
     pub fn require_admin_on_entry(&mut self) {
-        if !self.admin_lease_active() {
+        if self.reveal_token.is_none() {
             self.mode =
                 Mode::PasswordInput(PasswordPurpose::AdminUnlock, Zeroizing::new(String::new()));
         }
@@ -962,7 +983,7 @@ impl<C: DaemonClient> App<C> {
             KeyCode::Up | KeyCode::Char('k') => self.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
             KeyCode::Enter => self.select(),
-            KeyCode::Char('u') if !self.admin_lease_active() => {
+            KeyCode::Char('u') if self.reveal_token.is_none() => {
                 self.status_message = None;
                 self.mode = Mode::PasswordInput(
                     PasswordPurpose::AdminUnlock,
@@ -1143,12 +1164,16 @@ impl<C: DaemonClient> App<C> {
         }
     }
 
-    /// Decrypts and shows a secret's plaintext in a transient popup. Re-checks
-    /// the admin lease on the daemon at the exact moment of reveal rather than
-    /// trusting the cached `admin_lease_active` flag, since a lease can expire
-    /// between key presses.
+    /// Decrypts and shows a secret's plaintext in a transient popup. The
+    /// daemon re-checks both the admin lease and this process's reveal token
+    /// at the exact moment of reveal rather than trusting any cached flag,
+    /// since either can expire or be revoked between key presses.
     fn reveal_secret(&mut self, name: String, version: Option<u64>) {
-        match self.client.reveal_secret_value(&name, version) {
+        let Some(token) = self.reveal_token.clone() else {
+            self.status_message = Some("admin lease required; press 'u' to unlock".to_string());
+            return;
+        };
+        match self.client.reveal_secret_value(&name, version, &token) {
             Ok(value) => {
                 let text = String::from_utf8_lossy(value.as_slice()).into_owned();
                 self.mode = Mode::Reveal(name, Zeroizing::new(text));
@@ -1171,11 +1196,21 @@ impl<C: DaemonClient> App<C> {
                     PasswordPurpose::AdminUnlock => {
                         match self
                             .client
-                            .admin_unlock(password, DEFAULT_ADMIN_LEASE_MINUTES)
+                            .admin_unlock(password.clone(), DEFAULT_ADMIN_LEASE_MINUTES)
                         {
                             Ok(status) => {
                                 self.admin_status = Some(status);
-                                self.status_message = Some("admin lease unlocked".to_string());
+                                match self.client.issue_reveal_token(password) {
+                                    Ok(token) => {
+                                        self.reveal_token = Some(token);
+                                        self.status_message =
+                                            Some("admin lease unlocked".to_string());
+                                    }
+                                    Err(error) => {
+                                        self.reveal_token = None;
+                                        self.status_message = Some(describe_error(&error));
+                                    }
+                                }
                             }
                             Err(error) => self.status_message = Some(describe_error(&error)),
                         }
@@ -1693,6 +1728,7 @@ impl<C: DaemonClient> App<C> {
         match action {
             PendingAction::LockAdmin => match self.client.admin_lock() {
                 Ok(()) => {
+                    self.reveal_token = None;
                     self.status_message = Some("admin lease locked".to_string());
                     self.refresh_dashboard();
                 }
@@ -2202,6 +2238,7 @@ mod tests {
             .borrow_mut()
             .push_back(Ok(SensitiveBytes::new(b"s3cr3t-value".to_vec())));
         let mut app = app_with(client);
+        app.reveal_token = Some(SensitiveBytes::new(b"reveal-token".to_vec()));
         app.on_key(KeyCode::Char('s'));
 
         app.on_key(KeyCode::Char('v'));
@@ -2235,7 +2272,10 @@ mod tests {
     }
 
     #[test]
-    fn entering_the_tui_with_an_active_lease_does_not_prompt() {
+    fn entering_the_tui_with_an_active_lease_but_no_reveal_token_still_prompts() {
+        // An admin lease active from some other same-uid connection is never
+        // sufficient on its own: this process must re-prove the password
+        // itself to mint its own reveal token.
         let client = FakeClient::default();
         client
             .status
@@ -2246,6 +2286,24 @@ mod tests {
             .borrow_mut()
             .push_back(Ok(sample_admin_status(true)));
         let mut app = app_with(client);
+
+        app.require_admin_on_entry();
+        assert!(matches!(app.mode(), Mode::PasswordInput(..)));
+    }
+
+    #[test]
+    fn entering_the_tui_with_a_cached_reveal_token_does_not_prompt() {
+        let client = FakeClient::default();
+        client
+            .status
+            .borrow_mut()
+            .push_back(Ok(sample_status(true)));
+        client
+            .admin_status
+            .borrow_mut()
+            .push_back(Ok(sample_admin_status(true)));
+        let mut app = app_with(client);
+        app.reveal_token = Some(SensitiveBytes::new(b"reveal-token".to_vec()));
 
         app.require_admin_on_entry();
         assert!(matches!(app.mode(), Mode::Normal));

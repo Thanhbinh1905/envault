@@ -21,6 +21,7 @@ use envault_protocol::{
 use envault_service::{SensitiveInput, ServiceError};
 use serde::Serialize;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 mod convenience_unlock;
 
@@ -610,6 +611,7 @@ struct StatusView {
 }
 
 fn main() -> ExitCode {
+    let _ = envault_platform::harden_sensitive_process();
     let cli = Cli::parse();
     let no_args = cli.command.is_none();
     let command = cli.command.unwrap_or(Command::Status);
@@ -1398,6 +1400,11 @@ fn export_plaintext_env(output: Output, arguments: PlaintextExportArgs) -> ExitC
     }
 }
 
+/// No arm here may issue `Operation::RevealSecretValue` or print a
+/// `Reply::SecretPlaintext` - that path is reserved for the TUI's
+/// admin-gated `Reveal` action. `no_cli_subcommand_is_named_or_aliased_reveal`
+/// guards the CLI surface for this; keep it in mind before adding a "show
+/// value" style subcommand here.
 fn secret_command(output: Output, command: SecretCommand) -> ExitCode {
     match command {
         SecretCommand::Create(arguments) => create_secret(output, arguments),
@@ -1570,6 +1577,8 @@ fn list_secrets(output: Output, arguments: &SecretListArgs) -> ExitCode {
     }
 }
 
+/// Same constraint as `secret_command`: no arm here may issue
+/// `Operation::RevealSecretValue` or print plaintext.
 fn secret_value_command(output: Output, command: SecretValueCommand) -> ExitCode {
     let operation = match command {
         SecretValueCommand::Set(arguments) => {
@@ -1676,7 +1685,7 @@ fn run_command(output: Output, arguments: RunArgs) -> ExitCode {
     let mut env_vars = Vec::with_capacity(vars.len());
     for EnvVar { name, value } in vars {
         let text = match std::str::from_utf8(value.as_slice()) {
-            Ok(text) => text.to_string(),
+            Ok(text) => Zeroizing::new(text.to_string()),
             Err(_) => {
                 return print_error(
                     output,
@@ -1693,10 +1702,13 @@ fn run_command(output: Output, arguments: RunArgs) -> ExitCode {
         .command
         .split_first()
         .expect("clap requires at least one command token");
-    let status = std::process::Command::new(program)
-        .args(args)
-        .envs(env_vars)
-        .status();
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    for (name, value) in &env_vars {
+        command.env(name, value.as_str());
+    }
+    let status = command.status();
+    drop(env_vars);
     match status {
         Ok(status) => {
             let code = u8::try_from(status.code().unwrap_or(1).clamp(0, 255)).unwrap_or(1);
@@ -1729,7 +1741,10 @@ fn read_secret_value() -> Result<SensitiveBytes, StructuredError> {
         ));
     }
     let maximum = envault_protocol::MAX_FRAME_BYTES / 2;
-    let mut value = Vec::new();
+    // Preallocated to the exact read cap so `read_to_end` never reallocates
+    // mid-read - a realloc would leave an unzeroed prefix of the plaintext
+    // behind in the freed heap chunk.
+    let mut value = Vec::with_capacity(maximum + 1);
     io::stdin()
         .take(u64::try_from(maximum + 1).expect("bounded input limit"))
         .read_to_end(&mut value)
@@ -2447,7 +2462,27 @@ fn print_acknowledgement(output: Output, state: &str, no_op: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn print_json<T: Serialize + ?Sized>(value: &T) {
+/// Marks types safe to hand to `print_json`. Deliberately **not**
+/// implemented for `Reply`, `EnvVar`, or `SensitiveBytes`-bearing types even
+/// though they derive `Serialize` for the wire protocol: a future CLI path
+/// that tried `print_json(&reply)` to shortcut its own view type would dump
+/// raw secret bytes to stdout, and this bound turns that into a compile
+/// error instead of a silent regression.
+trait JsonPrintable: Serialize {}
+
+impl<T: JsonPrintable> JsonPrintable for [T] {}
+
+impl JsonPrintable for ProfileView {}
+impl JsonPrintable for SecretView {}
+impl JsonPrintable for SecretVersionView {}
+impl JsonPrintable for PortabilityExportSummary {}
+impl JsonPrintable for PortabilityPreview {}
+impl JsonPrintable for EnvImportPreview {}
+impl JsonPrintable for PortabilityImportSummary {}
+impl JsonPrintable for PlaintextExportSummary {}
+impl JsonPrintable for HttpResponse {}
+
+fn print_json<T: JsonPrintable + ?Sized>(value: &T) {
     println!(
         "{}",
         serde_json::to_string(value).expect("value serializes")
@@ -2906,6 +2941,34 @@ mod tests {
         let contract = include_str!("../commands.toml");
         assert!(!contract.contains("--value"));
         assert!(!contract.contains("get_secret"));
+    }
+
+    /// `Operation::RevealSecretValue` is meant to be reachable only from the
+    /// TUI's admin-gated `Reveal` action (see its doc comment in
+    /// `envault-protocol`), never from a CLI subcommand - the CLI must keep
+    /// printing metadata only, even as admin. This walks the entire clap
+    /// command tree so a future subcommand added "by analogy" next to an
+    /// existing `secret`/`secret value` command fails this test the moment
+    /// it's named, before anyone has to notice it also wires up reveal.
+    #[test]
+    fn no_cli_subcommand_is_named_or_aliased_reveal() {
+        fn assert_no_reveal_subcommand(command: &clap::Command) {
+            for subcommand in command.get_subcommands() {
+                let name = subcommand.get_name();
+                assert!(
+                    !name.to_ascii_lowercase().contains("reveal"),
+                    "found a CLI subcommand named {name:?} - RevealSecretValue must stay TUI-only"
+                );
+                for alias in subcommand.get_all_aliases() {
+                    assert!(
+                        !alias.to_ascii_lowercase().contains("reveal"),
+                        "found a CLI subcommand alias {alias:?} on {name:?} - RevealSecretValue must stay TUI-only"
+                    );
+                }
+                assert_no_reveal_subcommand(subcommand);
+            }
+        }
+        assert_no_reveal_subcommand(&Cli::command());
     }
 
     #[test]
