@@ -18,11 +18,9 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::time::SystemTime;
 
-use envault_core::PrincipalKind;
-use envault_policy::{Action, ResourceSelector};
 use envault_protocol::{
     AuthenticatedRequest, MAX_FRAME_BYTES, Operation, PROTOCOL_VERSION, Reply, Request, Response,
-    ResponseBody, SensitiveBytes, encode_frame,
+    ResponseBody, encode_frame,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -210,7 +208,7 @@ fn phase_five_cli_round_trips_workspace_and_env_without_plaintext_output() {
         &[
             "--output",
             "json",
-            "workspace",
+            "portability",
             "export",
             "--output-file",
             &package_text,
@@ -229,7 +227,7 @@ fn phase_five_cli_round_trips_workspace_and_env_without_plaintext_output() {
         &[
             "--output",
             "json",
-            "workspace",
+            "portability",
             "import",
             &package_text,
             "--transfer-password-stdin",
@@ -246,7 +244,7 @@ fn phase_five_cli_round_trips_workspace_and_env_without_plaintext_output() {
         &[
             "--output",
             "json",
-            "workspace",
+            "portability",
             "import",
             &package_text,
             "--transfer-password-stdin",
@@ -464,7 +462,7 @@ fn profile_and_secret_delete_are_idempotent_no_ops() {
 }
 
 #[test]
-fn empty_secret_and_principal_lists_report_zero_explicitly() {
+fn empty_secret_list_reports_zero_explicitly() {
     let fixture = DaemonFixture::initialize_and_start();
     assert_success(&fixture.run(
         &["--output", "json", "admin", "unlock", "--password-stdin"],
@@ -475,11 +473,6 @@ fn empty_secret_and_principal_lists_report_zero_explicitly() {
     assert_success(&secrets);
     let secrets = String::from_utf8(secrets.stdout).expect("human secrets output");
     assert!(secrets.starts_with("secrets: 0 secrets found\n"));
-
-    let principals = fixture.run(&["--output", "human", "admin", "agent", "list"], None);
-    assert_success(&principals);
-    let principals = String::from_utf8(principals.stdout).expect("human principals output");
-    assert!(principals.starts_with("principals: 0 principals found\n"));
 }
 
 #[test]
@@ -682,241 +675,6 @@ fn session_setup_preserves_hooks_that_only_contain_session_context_text() {
     );
 }
 
-#[test]
-fn phase_four_cli_filters_discovery_and_rejects_private_http_targets() {
-    let fixture = DaemonFixture::initialize_and_start();
-    let setup = setup_phase_four(&fixture);
-    assert_phase_four_discovery(&fixture, &setup);
-    assert_phase_four_private_http_rejection(&fixture, &setup);
-    assert_tree_has_no_bytes(&fixture.data_home, b"phase4-e2e-credential");
-    assert_tree_has_no_bytes(&fixture.data_home, b"hidden-phase4-credential");
-    assert_tree_has_no_bytes(&fixture.data_home, setup.discovery_token.as_bytes());
-}
-
-struct PhaseFourSetup {
-    visible_id: String,
-    principal_id: String,
-    discovery_token: String,
-}
-
-fn setup_phase_four(fixture: &DaemonFixture) -> PhaseFourSetup {
-    assert_success(&fixture.run(
-        &["--output", "json", "admin", "unlock", "--password-stdin"],
-        Some(PASSWORD),
-    ));
-    let credential = b"phase4-e2e-credential";
-    let visible_output = fixture.run(
-        &[
-            "--output",
-            "json",
-            "secret",
-            "create",
-            "VISIBLE_TOKEN",
-            "--description",
-            "Visible metadata",
-            "--stdin",
-        ],
-        Some(credential),
-    );
-    assert_success(&visible_output);
-    assert_no_bytes(&visible_output.stdout, credential);
-    let visible: Value = serde_json::from_slice(&visible_output.stdout).expect("visible secret");
-    let visible_id = visible[0]["id"].as_str().expect("visible id").to_owned();
-    let scope_id = visible[0]["scope_id"]
-        .as_str()
-        .expect("scope id")
-        .to_owned();
-    let hidden = fixture.run(
-        &[
-            "--output",
-            "json",
-            "secret",
-            "create",
-            "HIDDEN_TOKEN",
-            "--stdin",
-        ],
-        Some(b"hidden-phase4-credential"),
-    );
-    assert_success(&hidden);
-    let hidden: Value = serde_json::from_slice(&hidden.stdout).expect("hidden secret");
-    let hidden_id = hidden[0]["id"].as_str().expect("hidden id").to_owned();
-    let principal = fixture.json(&[
-        "--output",
-        "json",
-        "admin",
-        "agent",
-        "create",
-        "agent:phase4-e2e",
-    ]);
-    let principal_id = principal[0]["id"]
-        .as_str()
-        .expect("principal id")
-        .to_owned();
-    assert_success(&fixture.run(
-        &[
-            "--output",
-            "json",
-            "admin",
-            "policy",
-            "create",
-            "--principal",
-            &principal_id,
-            "--effect",
-            "deny",
-            "--action",
-            "discover",
-            "--secret",
-            &hidden_id,
-        ],
-        None,
-    ));
-
-    let grant = fixture.run(
-        &[
-            "--output",
-            "json",
-            "admin",
-            "grant",
-            "create",
-            "--principal",
-            &principal_id,
-            "--action",
-            "discover",
-            "--scope",
-            &scope_id,
-            "--max-requests",
-            "3",
-        ],
-        None,
-    );
-    assert_success(&grant);
-    let grant: Value = serde_json::from_slice(&grant.stdout).expect("grant");
-    let discovery_token = grant["token"].as_str().expect("token").to_owned();
-    PhaseFourSetup {
-        visible_id,
-        principal_id,
-        discovery_token,
-    }
-}
-
-fn assert_phase_four_discovery(fixture: &DaemonFixture, setup: &PhaseFourSetup) {
-    let token = setup.discovery_token.as_bytes();
-    let context = fixture.run(
-        &["--output", "json", "context", "--token-stdin"],
-        Some(token),
-    );
-    assert_success(&context);
-    assert_no_bytes(&context.stdout, token);
-    let context: Value = serde_json::from_slice(&context.stdout).expect("context");
-    assert_eq!(context["session"]["remaining_requests"], 3);
-    let toon_context = fixture.run(
-        &["--output", "toon", "context", "--token-stdin"],
-        Some(token),
-    );
-    assert_success(&toon_context);
-    let toon_context = String::from_utf8(toon_context.stdout).expect("TOON context");
-    assert!(toon_context.contains("resource"));
-    assert!(toon_context.contains("http_constraint{present}: false"));
-
-    let discovery = fixture.run(
-        &[
-            "--output",
-            "toon",
-            "secret",
-            "list",
-            "--describe",
-            "--token-stdin",
-        ],
-        Some(token),
-    );
-    assert_success(&discovery);
-    assert!(
-        discovery
-            .stdout
-            .windows(b"VISIBLE_TOKEN".len())
-            .any(|window| window == b"VISIBLE_TOKEN")
-    );
-    assert_no_bytes(&discovery.stdout, b"HIDDEN_TOKEN");
-    assert_no_bytes(&discovery.stdout, token);
-    let session = fixture.run(
-        &[
-            "--output",
-            "json",
-            "agent",
-            "session",
-            "status",
-            "--token-stdin",
-        ],
-        Some(token),
-    );
-    assert_success(&session);
-    let session: Value = serde_json::from_slice(&session.stdout).expect("session");
-    assert_eq!(session["remaining_requests"], 2);
-}
-
-fn assert_phase_four_private_http_rejection(fixture: &DaemonFixture, setup: &PhaseFourSetup) {
-    let http_grant = fixture.run(
-        &[
-            "--output",
-            "json",
-            "admin",
-            "grant",
-            "create",
-            "--principal",
-            &setup.principal_id,
-            "--action",
-            "http",
-            "--secret",
-            &setup.visible_id,
-            "--host",
-            "localhost",
-            "--method",
-            "get",
-            "--path-prefix",
-            "/v1",
-        ],
-        None,
-    );
-    assert_success(&http_grant);
-    let http_grant: Value = serde_json::from_slice(&http_grant.stdout).expect("HTTP grant");
-    let http_token = http_grant["token"].as_str().expect("HTTP token");
-    let rejected = fixture.run(
-        &[
-            "--output",
-            "json",
-            "request",
-            "http",
-            "https://localhost/v1/status",
-            "--method",
-            "get",
-            "--secret",
-            &setup.visible_id,
-            "--token-stdin",
-        ],
-        Some(http_token.as_bytes()),
-    );
-    assert!(!rejected.status.success());
-    assert_no_bytes(&rejected.stderr, http_token.as_bytes());
-    assert_no_bytes(&rejected.stderr, b"phase4-e2e-credential");
-    let error: Value = serde_json::from_slice(&rejected.stderr).expect("structured error");
-    assert_eq!(error["code"], "request_rejected");
-    let session = fixture.run(
-        &[
-            "--output",
-            "json",
-            "agent",
-            "session",
-            "status",
-            "--token-stdin",
-        ],
-        Some(http_token.as_bytes()),
-    );
-    assert_success(&session);
-    let session: Value = serde_json::from_slice(&session.stdout).expect("HTTP session");
-    assert_eq!(session["remaining_requests"], 0);
-    assert_tree_has_no_bytes(&fixture.data_home, http_token.as_bytes());
-}
-
 fn assert_initial_runtime(fixture: &DaemonFixture) -> u32 {
     let status = fixture.json(&["--output", "json", "status"]);
     assert_eq!(status["daemon"], "running");
@@ -1115,7 +873,6 @@ fn malformed_local_clients_fail_closed_without_crashing_daemon() {
         version: PROTOCOL_VERSION + 1,
         request_id,
         body: AuthenticatedRequest {
-            capability_token: None,
             operation: Operation::Status,
         },
     };
@@ -1137,7 +894,6 @@ fn malformed_local_clients_fail_closed_without_crashing_daemon() {
         version: PROTOCOL_VERSION,
         request_id: Uuid::new_v4(),
         body: AuthenticatedRequest {
-            capability_token: None,
             operation: Operation::Status,
         },
     };
@@ -1145,7 +901,6 @@ fn malformed_local_clients_fail_closed_without_crashing_daemon() {
         version: PROTOCOL_VERSION,
         request_id: Uuid::new_v4(),
         body: AuthenticatedRequest {
-            capability_token: None,
             operation: Operation::Status,
         },
     };
@@ -1187,123 +942,212 @@ fn malformed_local_clients_fail_closed_without_crashing_daemon() {
 }
 
 #[test]
-fn agent_capabilities_are_narrow_hashed_revocable_and_never_admin() {
-    let fixture = DaemonFixture::initialize();
-    let database_path = fixture.data_home.join("envault/vault.db");
-    let password = envault_service::SensitiveInput::copy_from_slice(PASSWORD);
-    let mut vault =
-        envault_service::VaultSession::unlock(&database_path, &password).expect("unlock vault");
-    let principal = vault
-        .create_principal(PrincipalKind::Agent, "agent:e2e")
-        .expect("agent principal");
-    let vault_id = vault.vault_id();
-    drop(vault);
-    drop(password);
-    fixture.start();
+fn secret_http_access_rejects_private_and_loopback_hosts() {
+    let fixture = DaemonFixture::initialize_and_start();
     assert_success(&fixture.run(
         &["--output", "json", "admin", "unlock", "--password-stdin"],
         Some(PASSWORD),
     ));
-
-    let privileged = envault::client::request_at(
-        &fixture.socket_path(),
-        Operation::CreateAgentSession {
-            principal_id: principal.id,
-            action: Action::Reveal,
-            resource: ResourceSelector::Vault(vault_id),
-            http_constraint: None,
-            ttl_minutes: 15,
-            max_requests: 2,
-        },
-        None,
-    );
-    assert_remote_code(privileged, "invalid_grant");
-
-    let created = match envault::client::request_at(
-        &fixture.socket_path(),
-        Operation::CreateAgentSession {
-            principal_id: principal.id,
-            action: Action::Discover,
-            resource: ResourceSelector::Vault(vault_id),
-            http_constraint: None,
-            ttl_minutes: 15,
-            max_requests: 2,
-        },
-        None,
-    )
-    .expect("create session")
-    {
-        Reply::AgentSessionCreated(created) => created,
-        reply => panic!("unexpected create reply: {reply:?}"),
-    };
-    let token = created.token.into_vec();
-    assert_eq!(token.len(), 32);
-    assert_tree_has_no_bytes(fixture.directory.path(), &token);
-    let status = envault::client::request_at(
-        &fixture.socket_path(),
-        Operation::AgentSessionStatus,
-        Some(SensitiveBytes::new(token.clone())),
-    )
-    .expect("session status");
-    match status {
-        Reply::AgentSessionStatus(status) => {
-            assert_eq!(status.principal_id, principal.id);
-            assert_eq!(status.action, Action::Discover);
-            assert_eq!(status.remaining_requests, 2);
-        }
-        reply => panic!("unexpected status reply: {reply:?}"),
-    }
-
-    assert_agent_token_cannot_authorize_service_or_admin(&fixture, &token);
-    assert_success(&fixture.run(&["--output", "json", "admin", "lock"], None));
     assert_success(&fixture.run(
-        &["--output", "json", "admin", "unlock", "--password-stdin"],
-        Some(PASSWORD),
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "base.PRIVATE_HOST_TOKEN",
+            "--stdin",
+        ],
+        Some(b"phase4-e2e-credential"),
     ));
-    assert!(matches!(
-        envault::client::request_at(
-            &fixture.socket_path(),
-            Operation::RevokeAgentSession {
-                grant_id: created.grant_id,
-            },
+
+    // Configuring the allowlist rule succeeds - `--host` is just a name at
+    // this point, not yet resolved.
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "profile",
+            "load",
+            "base",
+            "--secret",
+            "PRIVATE_HOST_TOKEN",
+            "--host",
+            "localhost",
+            "--method",
+            "get",
+            "--path-prefix",
+            "/v1",
+        ],
+        None,
+    ));
+
+    // The broker itself refuses to actually connect to a loopback/private
+    // address at request time, independent of the allowlist rule matching.
+    assert_stderr_error_code(
+        &fixture.run(
+            &[
+                "--output",
+                "json",
+                "request",
+                "http",
+                "https://localhost/v1/status",
+                "--secret",
+                "base.PRIVATE_HOST_TOKEN",
+            ],
             None,
         ),
-        Ok(Reply::Acknowledged { .. })
-    ));
-    assert_remote_code(
-        envault::client::request_at(
-            &fixture.socket_path(),
-            Operation::AgentSessionStatus,
-            Some(SensitiveBytes::new(token)),
-        ),
-        "permission_denied",
+        "request_rejected",
     );
 }
 
-fn assert_agent_token_cannot_authorize_service_or_admin(fixture: &DaemonFixture, token: &[u8]) {
-    assert_remote_code(
-        envault::client::request_at(
-            &fixture.socket_path(),
-            Operation::AdminLock,
-            Some(SensitiveBytes::new(token.to_vec())),
+#[test]
+fn secret_http_access_gates_request_http_without_any_principal_or_token() {
+    let fixture = DaemonFixture::initialize_and_start();
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "base.HTTP_TOKEN",
+            "--stdin",
+        ],
+        Some(b"broker-token-e2e"),
+    ));
+
+    // No access rule configured yet: request http must fail closed.
+    assert_stderr_error_code(
+        &fixture.run(
+            &[
+                "--output",
+                "json",
+                "request",
+                "http",
+                "https://api.example.com/v1/status",
+                "--secret",
+                "base.HTTP_TOKEN",
+            ],
+            None,
         ),
         "permission_denied",
     );
-    assert_eq!(
-        fixture.json(&["--output", "json", "admin", "status"])["active"],
-        true
-    );
-    assert_remote_code(
-        envault::client::request_at(
-            &fixture.socket_path(),
-            Operation::Lock,
-            Some(SensitiveBytes::new(token.to_vec())),
+
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "profile",
+            "load",
+            "base",
+            "--secret",
+            "HTTP_TOKEN",
+            "--host",
+            "api.example.com",
+            "--method",
+            "get",
+        ],
+        None,
+    ));
+
+    // Same-uid caller, still no principal/token involved - just profile
+    // loaded + a matching secret_http_access rule that denies the wrong host.
+    assert_stderr_error_code(
+        &fixture.run(
+            &[
+                "--output",
+                "json",
+                "request",
+                "http",
+                "https://attacker.example.com/v1/status",
+                "--secret",
+                "base.HTTP_TOKEN",
+            ],
+            None,
         ),
-        "permission_denied",
+        "request_rejected",
     );
+}
+
+#[test]
+fn run_injects_resolved_secrets_into_child_env_never_into_its_own_stdout() {
+    let fixture = DaemonFixture::initialize_and_start();
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "base.RUN_TOKEN",
+            "--stdin",
+        ],
+        Some(b"run-command-e2e-secret"),
+    ));
+
+    let output = fixture.run(
+        &["run", "--profile", "base", "--", "printenv", "RUN_TOKEN"],
+        None,
+    );
+    assert_success(&output);
     assert_eq!(
-        fixture.json(&["--output", "json", "status"])["service"],
-        "unlocked"
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "run-command-e2e-secret"
+    );
+
+    // `run` itself never prints the resolved value - only the child process
+    // it spawns (which explicitly asked for it via printenv) does.
+    let bare_status = fixture.run(&["run", "--profile", "base", "--", "true"], None);
+    assert_success(&bare_status);
+    assert_no_bytes(&bare_status.stdout, b"run-command-e2e-secret");
+    assert_no_bytes(&bare_status.stderr, b"run-command-e2e-secret");
+}
+
+#[test]
+fn describe_secret_typo_suggests_the_closest_existing_name() {
+    let fixture = DaemonFixture::initialize_and_start();
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "base.DATABASE_URL",
+            "--stdin",
+        ],
+        Some(b"typo-suggestion-e2e-secret"),
+    ));
+
+    let output = fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "describe",
+            "base.DATABASE_URI",
+        ],
+        None,
+    );
+    assert_stderr_error_code(&output, "not_found");
+    let error: Value = serde_json::from_slice(&output.stderr).expect("structured CLI error");
+    assert!(
+        error["help"]
+            .as_array()
+            .expect("help array")
+            .iter()
+            .any(|item| item
+                .as_str()
+                .is_some_and(|item| item.contains("did you mean \"DATABASE_URL\"")))
     );
 }
 
@@ -1329,6 +1173,12 @@ fn assert_cli_error_code(output: &Output, expected: &str) {
                 .as_str()
                 .is_some_and(|item| item.contains("envault start")))
     );
+}
+
+fn assert_stderr_error_code(output: &Output, expected: &str) {
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).expect("structured CLI error");
+    assert_eq!(error["code"], expected);
 }
 
 fn spawn_start(fixture: &DaemonFixture) -> std::process::Child {
@@ -1364,13 +1214,6 @@ fn assert_error_code(response: Response<Reply>, expected: &str) {
     match response.body {
         ResponseBody::Error(error) => assert_eq!(error.code, expected),
         ResponseBody::Ok(reply) => panic!("expected error response, got {reply:?}"),
-    }
-}
-
-fn assert_remote_code(result: Result<Reply, envault::client::ClientError>, expected: &str) {
-    match result {
-        Err(envault::client::ClientError::Remote(error)) => assert_eq!(error.code, expected),
-        result => panic!("expected remote error {expected}, got {result:?}"),
     }
 }
 

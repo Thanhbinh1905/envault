@@ -17,7 +17,6 @@ envault-broker = { version = "=0.0.1", path = "../envault-broker" }
 envault-core = { version = "=0.0.1", path = "../envault-core" }
 envault-crypto = { version = "=0.0.1", path = "../envault-crypto" }
 envault-platform = { version = "=0.0.1", path = "../envault-platform" }
-envault-policy = { version = "=0.0.1", path = "../envault-policy" }
 envault-store = { version = "=0.0.1", path = "../envault-store" }
 serde.workspace = true
 thiserror.workspace = true

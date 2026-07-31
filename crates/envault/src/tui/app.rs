@@ -17,6 +17,11 @@ pub trait DaemonClient {
     fn list_profiles(&self) -> Result<Vec<ProfileView>, ClientError>;
     fn list_secrets(&self) -> Result<Vec<SecretView>, ClientError>;
     fn list_secret_versions(&self, name: &str) -> Result<Vec<SecretVersionView>, ClientError>;
+    fn reveal_secret_value(
+        &self,
+        name: &str,
+        version: Option<u64>,
+    ) -> Result<SensitiveBytes, ClientError>;
 
     fn admin_unlock(
         &self,
@@ -133,9 +138,25 @@ impl DaemonClient for RealClient {
 
     fn list_secret_versions(&self, name: &str) -> Result<Vec<SecretVersionView>, ClientError> {
         match client::request(Operation::ListSecretVersions {
+            profile: "base".to_string(),
             name: name.to_string(),
         })? {
             Reply::SecretVersions(versions) => Ok(versions),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    fn reveal_secret_value(
+        &self,
+        name: &str,
+        version: Option<u64>,
+    ) -> Result<SensitiveBytes, ClientError> {
+        match client::request(Operation::RevealSecretValue {
+            profile: "base".to_string(),
+            name: name.to_string(),
+            version,
+        })? {
+            Reply::SecretPlaintext(value) => Ok(value),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -147,7 +168,7 @@ impl DaemonClient for RealClient {
     ) -> Result<AdminLeaseStatus, ClientError> {
         match client::request(Operation::AdminUnlock {
             password,
-            ttl_minutes,
+            ttl_minutes: Some(ttl_minutes),
         })? {
             Reply::AdminStatus(status) => Ok(status),
             _ => Err(ClientError::UnexpectedResponse),
@@ -166,7 +187,11 @@ impl DaemonClient for RealClient {
         name: String,
         description: Option<String>,
     ) -> Result<ProfileView, ClientError> {
-        match client::request(Operation::CreateProfile { name, description })? {
+        match client::request(Operation::CreateProfile {
+            name,
+            description,
+            workspace: None,
+        })? {
             Reply::Profile(profile) => Ok(profile),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -191,7 +216,7 @@ impl DaemonClient for RealClient {
     }
 
     fn activate_profile(&self, name: String) -> Result<ProfileView, ClientError> {
-        match client::request(Operation::ActivateProfile { name })? {
+        match client::request(Operation::LoadProfile { name })? {
             Reply::Profile(profile) => Ok(profile),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -204,6 +229,7 @@ impl DaemonClient for RealClient {
         generator: GeneratorSpec,
     ) -> Result<SecretView, ClientError> {
         match client::request(Operation::CreateGeneratedSecret {
+            profile: "base".to_string(),
             name,
             description,
             generator,
@@ -218,21 +244,32 @@ impl DaemonClient for RealClient {
         name: String,
         description: Option<String>,
     ) -> Result<SecretView, ClientError> {
-        match client::request(Operation::UpdateSecret { name, description })? {
+        match client::request(Operation::UpdateSecret {
+            profile: "base".to_string(),
+            name,
+            description,
+        })? {
             Reply::Secret(secret) => Ok(secret),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
 
     fn rename_secret(&self, old_name: String, new_name: String) -> Result<SecretView, ClientError> {
-        match client::request(Operation::RenameSecret { old_name, new_name })? {
+        match client::request(Operation::RenameSecret {
+            profile: "base".to_string(),
+            old_name,
+            new_name,
+        })? {
             Reply::Secret(secret) => Ok(secret),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
 
     fn delete_secret(&self, name: String) -> Result<(), ClientError> {
-        match client::request(Operation::DeleteSecret { name })? {
+        match client::request(Operation::DeleteSecret {
+            profile: "base".to_string(),
+            name,
+        })? {
             Reply::Acknowledged { .. } => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -243,7 +280,11 @@ impl DaemonClient for RealClient {
         name: String,
         generator: GeneratorSpec,
     ) -> Result<SecretVersionView, ClientError> {
-        match client::request(Operation::GenerateSecretValue { name, generator })? {
+        match client::request(Operation::GenerateSecretValue {
+            profile: "base".to_string(),
+            name,
+            generator,
+        })? {
             Reply::SecretVersion(version) => Ok(version),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -642,6 +683,10 @@ pub enum Mode {
     PasswordInput(PasswordPurpose, Zeroizing<String>),
     TextInput(InputKind, String),
     Confirm(PendingAction),
+    /// A transient plaintext popup opened by `Reveal`. Any key closes it; the
+    /// value is never written anywhere but this in-memory buffer, which
+    /// zeroizes on drop.
+    Reveal(String, Zeroizing<String>),
 }
 
 impl std::fmt::Debug for Mode {
@@ -655,6 +700,13 @@ impl std::fmt::Debug for Mode {
             ),
             Mode::TextInput(kind, _) => write!(formatter, "TextInput({kind:?}, <input>)"),
             Mode::Confirm(action) => write!(formatter, "Confirm({action:?})"),
+            Mode::Reveal(label, buffer) => {
+                write!(
+                    formatter,
+                    "Reveal({label}, <redacted len={}>)",
+                    buffer.len()
+                )
+            }
         }
     }
 }
@@ -805,6 +857,16 @@ impl<C: DaemonClient> App<C> {
         }
     }
 
+    /// Opens the admin-unlock prompt immediately if no lease is active yet,
+    /// so the TUI - the only place a human can view plaintext - always asks
+    /// for a step-up credential before the Dashboard is usable.
+    pub fn require_admin_on_entry(&mut self) {
+        if !self.admin_lease_active() {
+            self.mode =
+                Mode::PasswordInput(PasswordPurpose::AdminUnlock, Zeroizing::new(String::new()));
+        }
+    }
+
     fn refresh_profiles(&mut self) {
         match self.client.list_profiles() {
             Ok(profiles) => {
@@ -883,6 +945,7 @@ impl<C: DaemonClient> App<C> {
             Mode::PasswordInput(purpose, buffer) => self.on_key_password(code, purpose, buffer),
             Mode::TextInput(kind, buffer) => self.on_key_text(code, kind, buffer),
             Mode::Confirm(action) => self.on_key_confirm(code, action),
+            Mode::Reveal(..) => self.mode = Mode::Normal,
         }
     }
 
@@ -1062,7 +1125,35 @@ impl<C: DaemonClient> App<C> {
                     });
                 }
             }
+            (Screen::Secrets, 'v') => {
+                if let Some(secret) = self.secrets.get(self.secret_selected).cloned() {
+                    self.reveal_secret(secret.name, None);
+                }
+            }
+            (Screen::Versions, 'v') => {
+                if let (Some(secret), Some(version)) = (
+                    self.secrets.get(self.secret_selected).cloned(),
+                    self.versions.get(self.version_selected),
+                ) {
+                    let version = version.version;
+                    self.reveal_secret(secret.name, Some(version));
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Decrypts and shows a secret's plaintext in a transient popup. Re-checks
+    /// the admin lease on the daemon at the exact moment of reveal rather than
+    /// trusting the cached `admin_lease_active` flag, since a lease can expire
+    /// between key presses.
+    fn reveal_secret(&mut self, name: String, version: Option<u64>) {
+        match self.client.reveal_secret_value(&name, version) {
+            Ok(value) => {
+                let text = String::from_utf8_lossy(value.as_slice()).into_owned();
+                self.mode = Mode::Reveal(name, Zeroizing::new(text));
+            }
+            Err(error) => self.status_message = Some(describe_error(&error)),
         }
     }
 
@@ -2060,5 +2151,103 @@ mod tests {
         // would panic instead of the status message below being set.
         app.execute_portability_commit();
         assert_eq!(app.status_message(), Some("no preview to commit"));
+    }
+
+    #[test]
+    fn reveal_is_gated_behind_an_active_admin_lease() {
+        let client = FakeClient::default();
+        client
+            .status
+            .borrow_mut()
+            .push_back(Ok(sample_status(false)));
+        client
+            .admin_status
+            .borrow_mut()
+            .push_back(Ok(sample_admin_status(false)));
+        client
+            .secrets
+            .borrow_mut()
+            .push_back(Ok(vec![sample_secret("db-password", None)]));
+        let mut app = app_with(client);
+        app.on_key(KeyCode::Char('s'));
+        assert_eq!(app.screen(), Screen::Secrets);
+
+        // No entry queued in `reveal`: if the lease check were skipped, the
+        // client call would panic instead of the assertion below firing.
+        app.on_key(KeyCode::Char('v'));
+        assert!(matches!(app.mode(), Mode::Normal));
+        assert_eq!(
+            app.status_message(),
+            Some("admin lease required; press 'u' to unlock")
+        );
+    }
+
+    #[test]
+    fn reveal_shows_plaintext_in_a_popup_that_any_key_closes() {
+        let client = FakeClient::default();
+        client
+            .status
+            .borrow_mut()
+            .push_back(Ok(sample_status(true)));
+        client
+            .admin_status
+            .borrow_mut()
+            .push_back(Ok(sample_admin_status(true)));
+        client
+            .secrets
+            .borrow_mut()
+            .push_back(Ok(vec![sample_secret("db-password", None)]));
+        client
+            .reveal
+            .borrow_mut()
+            .push_back(Ok(SensitiveBytes::new(b"s3cr3t-value".to_vec())));
+        let mut app = app_with(client);
+        app.on_key(KeyCode::Char('s'));
+
+        app.on_key(KeyCode::Char('v'));
+        match app.mode() {
+            Mode::Reveal(name, value) => {
+                assert_eq!(name, "db-password");
+                assert_eq!(value.as_str(), "s3cr3t-value");
+            }
+            other => panic!("expected Mode::Reveal, got {other:?}"),
+        }
+
+        app.on_key(KeyCode::Esc);
+        assert!(matches!(app.mode(), Mode::Normal));
+    }
+
+    #[test]
+    fn entering_the_tui_without_an_active_lease_opens_the_admin_unlock_prompt() {
+        let client = FakeClient::default();
+        client
+            .status
+            .borrow_mut()
+            .push_back(Ok(sample_status(false)));
+        client
+            .admin_status
+            .borrow_mut()
+            .push_back(Ok(sample_admin_status(false)));
+        let mut app = app_with(client);
+
+        app.require_admin_on_entry();
+        assert!(matches!(app.mode(), Mode::PasswordInput(..)));
+    }
+
+    #[test]
+    fn entering_the_tui_with_an_active_lease_does_not_prompt() {
+        let client = FakeClient::default();
+        client
+            .status
+            .borrow_mut()
+            .push_back(Ok(sample_status(true)));
+        client
+            .admin_status
+            .borrow_mut()
+            .push_back(Ok(sample_admin_status(true)));
+        let mut app = app_with(client);
+
+        app.require_admin_on_entry();
+        assert!(matches!(app.mode(), Mode::Normal));
     }
 }

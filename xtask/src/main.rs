@@ -45,7 +45,6 @@ fn verify_packages() -> Result<()> {
         "envault-core",
         "envault-windows-ffi",
         "envault-platform",
-        "envault-policy",
         "envault-broker",
         "envault-protocol",
         "envault-crypto",
@@ -151,9 +150,9 @@ fn verify_contract() -> Result<()> {
         for required in [
             "envault start",
             "envault session setup",
-            "context --token-stdin",
-            "secret list --fields description --token-stdin",
-            "request http URL",
+            "secret list --fields description",
+            "envault run --profile",
+            "no capability token",
             "Never reveal",
             "Never start the daemon",
             "Never authenticate",
@@ -177,10 +176,10 @@ fn verify_contract() -> Result<()> {
         for required in [
             "session context",
             "session setup",
-            "context --token-stdin",
-            "secret list --fields description --token-stdin",
-            "agent session status --token-stdin",
-            "request http URL --method METHOD --secret UUID --token-stdin",
+            "secret list --fields description",
+            "envault request http",
+            "envault run --profile",
+            "no capability token",
         ] {
             if !command_reference.contains(required) {
                 bail!("skill command reference is missing: {required}");

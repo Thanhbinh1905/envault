@@ -14,7 +14,7 @@ A single prompt injection, misconfigured tool, or leaked log line can turn one c
 
 EnVault keeps secrets in an encrypted local vault and never releases plaintext to an agent.
 A trusted local daemon, started only by an explicit human or automation action, brokers access on behalf of callers.
-Agent principals can receive narrow, short-lived capabilities scoped to exactly what they need, but they can never request admin actions, plaintext export, reveal, or arbitrary execution.
+Agents can read secret metadata and use a narrow, per-secret HTTP access allowlist, but they can never request admin actions, plaintext export, reveal, or arbitrary execution.
 Everything is local-first: no cloud dependency, no third party holding your secrets.
 
 Read [the threat model](docs/threat-model.md) for the full security.

@@ -7,19 +7,16 @@ use std::{
     process::ExitCode,
 };
 
-use base64::Engine as _;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use envault::client::{self, ClientError};
 use envault_core::{
     EnvImportPreview, GeneratorFormat, GeneratorLength, GeneratorSpec, ImportConflictStrategy,
     PackageKind, PlaintextExportSummary, PortabilityExportSummary, PortabilityImportSummary,
-    PortabilityPreview, PrincipalKind, ProfileView, SecretVersionView, SecretView,
+    PortabilityPreview, ProfileView, ScopeView, SecretVersionView, SecretView,
 };
-use envault_policy::{Action, Effect, ResourceSelector};
 use envault_protocol::{
-    AdminLeaseStatus, AgentContext, AgentSessionCreated, AgentSessionView, DaemonStatus, ErrorKind,
-    HttpConstraint, HttpContentType, HttpMethod, HttpRequest, HttpResponse, Operation, Reply,
-    SensitiveBytes, ServiceState, StructuredError,
+    AdminLeaseStatus, DaemonStatus, EnvVar, ErrorKind, HttpConstraint, HttpContentType, HttpMethod,
+    HttpRequest, HttpResponse, Operation, Reply, SensitiveBytes, ServiceState, StructuredError,
 };
 use envault_service::{SensitiveInput, ServiceError};
 use serde::Serialize;
@@ -54,7 +51,6 @@ enum Command {
     Start(PasswordArgs),
     Lock,
     Stop,
-    Context(TokenArgs),
     Admin {
         #[command(subcommand)]
         command: AdminCommand,
@@ -67,13 +63,13 @@ enum Command {
         #[command(subcommand)]
         command: SecretCommand,
     },
-    Agent {
-        #[command(subcommand)]
-        command: AgentCommand,
-    },
     Request {
         #[command(subcommand)]
         command: RequestCommand,
+    },
+    Portability {
+        #[command(subcommand)]
+        command: PortabilityCommand,
     },
     Workspace {
         #[command(subcommand)]
@@ -87,6 +83,37 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    Run(RunArgs),
+    Completions(CompletionsArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct CompletionsArgs {
+    shell: clap_complete::Shell,
+}
+
+#[derive(Debug, clap::Args)]
+struct RunArgs {
+    #[arg(
+        long,
+        conflicts_with = "workspace",
+        help = "Profile to resolve secrets from"
+    )]
+    profile: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "profile",
+        help = "Workspace whose member profiles to resolve secrets from"
+    )]
+    workspace: Option<String>,
+    #[arg(
+        required = true,
+        num_args = 1..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = "Command (and its arguments) to run with resolved secrets injected as env vars"
+    )]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -139,8 +166,17 @@ struct PasswordArgs {
 struct AdminUnlockArgs {
     #[command(flatten)]
     password: PasswordArgs,
-    #[arg(long, default_value_t = envault_core::DEFAULT_ADMIN_LEASE_MINUTES)]
+    #[arg(
+        long,
+        default_value_t = envault_core::DEFAULT_ADMIN_LEASE_MINUTES,
+        conflicts_with = "no_expiration"
+    )]
     minutes: u8,
+    #[arg(
+        long,
+        help = "Lease never expires until `admin lock`/daemon stop or restart"
+    )]
+    no_expiration: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -148,18 +184,6 @@ enum AdminCommand {
     Unlock(AdminUnlockArgs),
     Status,
     Lock,
-    Agent {
-        #[command(subcommand)]
-        command: AdminAgentCommand,
-    },
-    Grant {
-        #[command(subcommand)]
-        command: GrantCommand,
-    },
-    Policy {
-        #[command(subcommand)]
-        command: PolicyCommand,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -167,21 +191,16 @@ enum RequestCommand {
     Http(HttpRequestArgs),
 }
 
-#[derive(Clone, Copy, Debug, clap::Args)]
-struct TokenArgs {
-    #[arg(long, help = "Read the capability token from standard input")]
-    token_stdin: bool,
-}
-
 #[derive(Debug, Subcommand)]
 enum ProfileCommand {
-    Create(NameDescriptionArgs),
+    Create(ProfileCreateArgs),
     Show(NameArgs),
     List,
     Update(NameDescriptionArgs),
     Rename(RenameArgs),
     Delete(NameArgs),
-    Activate(NameArgs),
+    Load(ProfileLoadArgs),
+    Unload(NameArgs),
     Export(ProfileExportArgs),
     Import(ProfilePackageImportArgs),
     ImportEnv(EnvImportArgs),
@@ -189,9 +208,17 @@ enum ProfileCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum WorkspaceCommand {
+enum PortabilityCommand {
     Export(WorkspaceExportArgs),
     Import(WorkspacePackageImportArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCommand {
+    Create(NameArgs),
+    List,
+    Show(NameArgs),
+    Load(NameArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -215,39 +242,6 @@ enum SecretValueCommand {
     Generate(SecretValueGenerateArgs),
 }
 
-#[derive(Debug, Subcommand)]
-enum AgentCommand {
-    Session {
-        #[command(subcommand)]
-        command: AgentSessionCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum AgentSessionCommand {
-    Status(TokenArgs),
-}
-
-#[derive(Debug, Subcommand)]
-enum AdminAgentCommand {
-    Create(NameArgs),
-    List,
-    Enable(PrincipalArgs),
-    Disable(PrincipalArgs),
-}
-
-#[derive(Debug, Subcommand)]
-enum GrantCommand {
-    Create(GrantCreateArgs),
-    Revoke(GrantRevokeArgs),
-}
-
-#[derive(Debug, Subcommand)]
-enum PolicyCommand {
-    Create(PolicyCreateArgs),
-    List,
-}
-
 #[derive(Debug, clap::Args)]
 struct NameArgs {
     name: String,
@@ -261,9 +255,45 @@ struct NameDescriptionArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct ProfileCreateArgs {
+    name: String,
+    #[arg(long)]
+    description: Option<String>,
+    #[arg(long, help = "Group this profile under an existing workspace")]
+    workspace: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
 struct RenameArgs {
     old_name: String,
     new_name: String,
+}
+
+#[derive(Debug, clap::Args)]
+struct ProfileLoadArgs {
+    name: String,
+    #[arg(
+        long,
+        help = "Also configure HTTP access for one secret in this profile (bare name, no profile prefix)"
+    )]
+    secret: Option<String>,
+    #[arg(long, help = "Required with --secret: the exact allowed host")]
+    host: Option<String>,
+    #[arg(long, default_value_t = 443)]
+    port: u16,
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        help = "Required with --secret: allowed HTTP methods"
+    )]
+    method: Vec<HttpMethodArg>,
+    #[arg(long, default_value = "/")]
+    path_prefix: String,
+    #[arg(long, default_value_t = 64 * 1024)]
+    max_request_bytes: usize,
+    #[arg(long, default_value_t = 256 * 1024)]
+    max_response_bytes: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -281,8 +311,6 @@ struct SecretCreateArgs {
 
 #[derive(Clone, Debug, clap::Args)]
 struct SecretListArgs {
-    #[arg(long)]
-    token_stdin: bool,
     #[arg(long, help = "Deprecated: use `--fields description` instead")]
     describe: bool,
     #[arg(
@@ -291,6 +319,11 @@ struct SecretListArgs {
         help = "Additional columns beyond the default schema (supported: description)"
     )]
     fields: Vec<String>,
+    #[arg(
+        long,
+        help = "Show the effective secret set for this profile (own secrets overlaid on base)"
+    )]
+    profile: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -327,90 +360,15 @@ enum GeneratorFormatArg {
 }
 
 #[derive(Debug, clap::Args)]
-struct PrincipalArgs {
-    principal_id: Uuid,
-}
-
-#[derive(Debug, clap::Args)]
-struct GrantCreateArgs {
-    #[arg(long)]
-    principal: Uuid,
-    #[arg(long, value_enum)]
-    action: GrantActionArg,
-    #[command(flatten)]
-    resource: ResourceArgs,
-    #[arg(long, default_value_t = envault_core::DEFAULT_AGENT_GRANT_MINUTES)]
-    minutes: u8,
-    #[arg(long, default_value_t = 1)]
-    max_requests: u32,
-    #[arg(long)]
-    host: Option<String>,
-    #[arg(long, default_value_t = 443)]
-    port: u16,
-    #[arg(long, value_enum, value_delimiter = ',')]
-    method: Vec<HttpMethodArg>,
-    #[arg(long, default_value = "/")]
-    path_prefix: String,
-    #[arg(long, default_value_t = 64 * 1024)]
-    max_request_bytes: usize,
-    #[arg(long, default_value_t = 256 * 1024)]
-    max_response_bytes: usize,
-}
-
-#[derive(Debug, clap::Args)]
-struct GrantRevokeArgs {
-    grant_id: Uuid,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum GrantActionArg {
-    Discover,
-    Http,
-}
-
-#[derive(Debug, clap::Args)]
-struct PolicyCreateArgs {
-    #[arg(long)]
-    principal: Uuid,
-    #[arg(long, value_enum)]
-    effect: EffectArg,
-    #[arg(long, value_enum)]
-    action: PolicyActionArg,
-    #[command(flatten)]
-    resource: ResourceArgs,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum EffectArg {
-    Allow,
-    Deny,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum PolicyActionArg {
-    Discover,
-    Http,
-}
-
-#[derive(Debug, clap::Args)]
-struct ResourceArgs {
-    #[arg(long, conflicts_with_all = ["scope", "secret"])]
-    vault: Option<Uuid>,
-    #[arg(long, conflicts_with_all = ["vault", "secret"])]
-    scope: Option<Uuid>,
-    #[arg(long, conflicts_with_all = ["vault", "scope"])]
-    secret: Option<Uuid>,
-}
-
-#[derive(Debug, clap::Args)]
 struct HttpRequestArgs {
     url: String,
     #[arg(long, value_enum, default_value_t = HttpMethodArg::Get)]
     method: HttpMethodArg,
-    #[arg(long)]
-    secret: Uuid,
-    #[arg(long, required = true)]
-    token_stdin: bool,
+    #[arg(
+        long,
+        help = "Secret reference as <profile>.<name>, or bare <name> for base"
+    )]
+    secret: String,
     #[arg(long)]
     body_file: Option<PathBuf>,
     #[arg(long, value_enum)]
@@ -648,7 +606,6 @@ struct StatusView {
     profile: Option<String>,
     pid: Option<u32>,
     admin_lease_active: bool,
-    agent_session_count: u32,
     help: Vec<&'static str>,
 }
 
@@ -665,18 +622,26 @@ fn main() -> ExitCode {
         Command::Start(arguments) => start_daemon(cli.output, arguments),
         Command::Lock => lifecycle_request(cli.output, Operation::Lock, "locked"),
         Command::Stop => lifecycle_request(cli.output, Operation::Stop, "stopped"),
-        Command::Admin { command } => admin_command(cli.output, command),
-        Command::Context(arguments) => context_command(cli.output, arguments),
+        Command::Admin { command } => admin_command(cli.output, &command),
         Command::Profile { command } => profile_command(cli.output, command),
         Command::Secret { command } => secret_command(cli.output, command),
-        Command::Agent { command } => agent_command(cli.output, &command),
         Command::Request {
             command: RequestCommand::Http(arguments),
         } => http_request(cli.output, arguments),
+        Command::Portability { command } => portability_command(cli.output, command),
         Command::Workspace { command } => workspace_command(cli.output, command),
         Command::ConvenienceUnlock { command } => convenience_unlock_command(cli.output, command),
         Command::Session { command } => session_command(cli.output, command),
+        Command::Run(arguments) => run_command(cli.output, arguments),
+        Command::Completions(arguments) => completions(arguments.shell),
     }
+}
+
+fn completions(shell: clap_complete::Shell) -> ExitCode {
+    let mut command = Cli::command();
+    let name = command.get_name().to_string();
+    clap_complete::generate(shell, &mut command, name, &mut io::stdout());
+    ExitCode::SUCCESS
 }
 
 fn initialize_vault(output: Output, arguments: PasswordArgs) -> ExitCode {
@@ -825,7 +790,13 @@ fn print_session_context(output: Output) -> ExitCode {
                 ServiceState::Unlocked => "unlocked",
                 ServiceState::Locked => "locked",
             };
-            print_session_context_view(output, "running", service, status.active_profile.as_deref())
+            let profiles = status.loaded_profiles.join(", ");
+            let profiles = if profiles.is_empty() {
+                None
+            } else {
+                Some(profiles.as_str())
+            };
+            print_session_context_view(output, "running", service, profiles)
         }
         Ok(_) => print_error(output, &unexpected_response()),
         Err(ClientError::NotRunning) => {
@@ -1025,16 +996,21 @@ fn install_session_hook(settings_path: &Path, command: &str) -> Result<HookInsta
     Ok(outcome)
 }
 
-fn admin_command(output: Output, command: AdminCommand) -> ExitCode {
+fn admin_command(output: Output, command: &AdminCommand) -> ExitCode {
     match command {
         AdminCommand::Unlock(arguments) => {
             let password = match read_master_password(arguments.password.password_stdin, false) {
                 Ok(password) => password,
                 Err(error) => return print_error(output, &error),
             };
+            let ttl_minutes = if arguments.no_expiration {
+                None
+            } else {
+                Some(arguments.minutes)
+            };
             match client::request(Operation::AdminUnlock {
                 password,
-                ttl_minutes: arguments.minutes,
+                ttl_minutes,
             }) {
                 Ok(Reply::AdminStatus(status)) => print_admin_status(output, &status),
                 Ok(_) => print_error(output, &unexpected_response()),
@@ -1047,150 +1023,6 @@ fn admin_command(output: Output, command: AdminCommand) -> ExitCode {
             Err(error) => print_error(output, &client_error(error)),
         },
         AdminCommand::Lock => lifecycle_request(output, Operation::AdminLock, "admin_locked"),
-        AdminCommand::Agent { command } => admin_agent_command(output, command),
-        AdminCommand::Grant { command } => grant_command(output, command),
-        AdminCommand::Policy { command } => policy_command(output, command),
-    }
-}
-
-fn context_command(output: Output, arguments: TokenArgs) -> ExitCode {
-    let token = match read_capability_token(arguments.token_stdin) {
-        Ok(token) => token,
-        Err(error) => return print_error(output, &error),
-    };
-    match client::request_with_capability(Operation::Context, Some(token)) {
-        Ok(Reply::Context(context)) => print_context(output, &context),
-        Ok(_) => print_error(output, &unexpected_response()),
-        Err(error) => print_error(output, &client_error(error)),
-    }
-}
-
-fn agent_command(output: Output, command: &AgentCommand) -> ExitCode {
-    match command {
-        AgentCommand::Session {
-            command: AgentSessionCommand::Status(arguments),
-        } => {
-            let token = match read_capability_token(arguments.token_stdin) {
-                Ok(token) => token,
-                Err(error) => return print_error(output, &error),
-            };
-            match client::request_with_capability(Operation::AgentSessionStatus, Some(token)) {
-                Ok(Reply::AgentSessionStatus(session)) => print_agent_session(output, &session),
-                Ok(_) => print_error(output, &unexpected_response()),
-                Err(error) => print_error(output, &client_error(error)),
-            }
-        }
-    }
-}
-
-fn admin_agent_command(output: Output, command: AdminAgentCommand) -> ExitCode {
-    let operation = match command {
-        AdminAgentCommand::Create(arguments) => Operation::CreatePrincipal {
-            kind: PrincipalKind::Agent,
-            name: arguments.name,
-        },
-        AdminAgentCommand::List => Operation::ListPrincipals,
-        AdminAgentCommand::Enable(arguments) => Operation::SetPrincipalDisabled {
-            principal_id: envault_core::PrincipalId(arguments.principal_id),
-            disabled: false,
-        },
-        AdminAgentCommand::Disable(arguments) => Operation::SetPrincipalDisabled {
-            principal_id: envault_core::PrincipalId(arguments.principal_id),
-            disabled: true,
-        },
-    };
-    match client::request(operation) {
-        Ok(Reply::Principal(principal)) => print_principals(output, &[principal], &[]),
-        Ok(Reply::Principals(principals)) => {
-            let help: &[&str] = if principals.is_empty() {
-                &["Run `envault admin agent create \"<name>\"` to add an agent principal"]
-            } else {
-                &["Run `envault admin agent disable <principal-id>` to revoke an agent"]
-            };
-            print_principals(output, &principals, help)
-        }
-        Ok(_) => print_error(output, &unexpected_response()),
-        Err(error) => print_error(output, &client_error(error)),
-    }
-}
-
-fn grant_command(output: Output, command: GrantCommand) -> ExitCode {
-    match command {
-        GrantCommand::Create(arguments) => create_grant(output, &arguments),
-        GrantCommand::Revoke(arguments) => lifecycle_request(
-            output,
-            Operation::RevokeAgentSession {
-                grant_id: envault_core::GrantId(arguments.grant_id),
-            },
-            "grant_revoked",
-        ),
-    }
-}
-
-fn create_grant(output: Output, arguments: &GrantCreateArgs) -> ExitCode {
-    if io::stdout().is_terminal() {
-        return print_error(
-            output,
-            &input_error(
-                "token_output_requires_pipe",
-                "new capability tokens are emitted only to piped standard output",
-            ),
-        );
-    }
-    let resource = match resource_selector(&arguments.resource) {
-        Ok(resource) => resource,
-        Err(error) => return print_error(output, &error),
-    };
-    let action = match arguments.action {
-        GrantActionArg::Discover => Action::Discover,
-        GrantActionArg::Http => Action::HttpRequest,
-    };
-    let http_constraint = match grant_http_constraint(arguments, action, resource) {
-        Ok(constraint) => constraint,
-        Err(error) => return print_error(output, &error),
-    };
-    let operation = Operation::CreateAgentSession {
-        principal_id: envault_core::PrincipalId(arguments.principal),
-        action,
-        resource,
-        http_constraint,
-        ttl_minutes: arguments.minutes,
-        max_requests: arguments.max_requests,
-    };
-    match client::request(operation) {
-        Ok(Reply::AgentSessionCreated(created)) => print_created_grant(output, created),
-        Ok(_) => print_error(output, &unexpected_response()),
-        Err(error) => print_error(output, &client_error(error)),
-    }
-}
-
-fn policy_command(output: Output, command: PolicyCommand) -> ExitCode {
-    let operation = match command {
-        PolicyCommand::Create(arguments) => {
-            let resource = match resource_selector(&arguments.resource) {
-                Ok(resource) => resource,
-                Err(error) => return print_error(output, &error),
-            };
-            Operation::CreatePolicyRule {
-                principal_id: envault_core::PrincipalId(arguments.principal),
-                effect: match arguments.effect {
-                    EffectArg::Allow => Effect::Allow,
-                    EffectArg::Deny => Effect::Deny,
-                },
-                action: match arguments.action {
-                    PolicyActionArg::Discover => Action::Discover,
-                    PolicyActionArg::Http => Action::HttpRequest,
-                },
-                resource,
-            }
-        }
-        PolicyCommand::List => Operation::ListPolicyRules,
-    };
-    match client::request(operation) {
-        Ok(Reply::PolicyRule(rule)) => print_json_or_debug(output, &rule, "policy"),
-        Ok(Reply::PolicyRules(rules)) => print_json_or_debug(output, &rules, "policies"),
-        Ok(_) => print_error(output, &unexpected_response()),
-        Err(error) => print_error(output, &client_error(error)),
     }
 }
 
@@ -1209,18 +1041,20 @@ fn profile_command(output: Output, command: ProfileCommand) -> ExitCode {
         ProfileCommand::Import(arguments) => return import_profile_package(output, arguments),
         ProfileCommand::ImportEnv(arguments) => return import_env(output, arguments),
         ProfileCommand::ExportEnv(arguments) => return export_plaintext_env(output, arguments),
+        ProfileCommand::Load(arguments) => return profile_load(output, arguments),
         ProfileCommand::Create(_)
         | ProfileCommand::Show(_)
         | ProfileCommand::List
         | ProfileCommand::Update(_)
         | ProfileCommand::Rename(_)
         | ProfileCommand::Delete(_)
-        | ProfileCommand::Activate(_) => {}
+        | ProfileCommand::Unload(_) => {}
     }
     let operation = match command {
         ProfileCommand::Create(arguments) => Operation::CreateProfile {
             name: arguments.name,
             description: arguments.description,
+            workspace: arguments.workspace,
         },
         ProfileCommand::Show(arguments) => Operation::ShowProfile {
             name: arguments.name,
@@ -1237,15 +1071,20 @@ fn profile_command(output: Output, command: ProfileCommand) -> ExitCode {
         ProfileCommand::Delete(arguments) => Operation::DeleteProfile {
             name: arguments.name,
         },
-        ProfileCommand::Activate(arguments) => Operation::ActivateProfile {
+        ProfileCommand::Unload(arguments) => Operation::UnloadProfile {
             name: arguments.name,
         },
         ProfileCommand::Export(_)
         | ProfileCommand::Import(_)
         | ProfileCommand::ImportEnv(_)
-        | ProfileCommand::ExportEnv(_) => unreachable!("portability commands returned above"),
+        | ProfileCommand::ExportEnv(_)
+        | ProfileCommand::Load(_) => unreachable!("handled above"),
     };
     let is_list = matches!(&operation, Operation::ListProfiles);
+    let show_name = match &operation {
+        Operation::ShowProfile { name } => Some(name.clone()),
+        _ => None,
+    };
     match client::request(operation) {
         Ok(Reply::Profile(profile)) => print_profiles(output, &[profile], &[]),
         Ok(Reply::Profiles(profiles)) if is_list => {
@@ -1261,13 +1100,66 @@ fn profile_command(output: Output, command: ProfileCommand) -> ExitCode {
             print_acknowledgement(output, "profile_deleted", no_op)
         }
         Ok(_) => print_error(output, &unexpected_response()),
+        Err(ClientError::Remote(error)) if show_name.is_some() => print_error(
+            output,
+            &suggest_on_not_found(error, &show_name.unwrap(), &profile_names()),
+        ),
         Err(error) => print_error(output, &client_error(error)),
     }
 }
 
-fn workspace_command(output: Output, command: WorkspaceCommand) -> ExitCode {
+fn profile_load(output: Output, arguments: ProfileLoadArgs) -> ExitCode {
+    let Some(secret) = arguments.secret else {
+        return match client::request(Operation::LoadProfile {
+            name: arguments.name,
+        }) {
+            Ok(Reply::Profile(profile)) => print_profiles(output, &[profile], &[]),
+            Ok(_) => print_error(output, &unexpected_response()),
+            Err(error) => print_error(output, &client_error(error)),
+        };
+    };
+    let Some(host) = arguments.host else {
+        return print_error(
+            output,
+            &input_error(
+                "http_access_requires_host",
+                "`--secret` requires an exact `--host`",
+            ),
+        );
+    };
+    if arguments.method.is_empty() {
+        return print_error(
+            output,
+            &input_error(
+                "http_access_requires_method",
+                "`--secret` requires at least one `--method`",
+            ),
+        );
+    }
+    let constraint = HttpConstraint {
+        host,
+        port: arguments.port,
+        methods: arguments.method.iter().copied().map(http_method).collect(),
+        path_prefix: arguments.path_prefix,
+        max_request_bytes: arguments.max_request_bytes,
+        max_response_bytes: arguments.max_response_bytes,
+    };
+    match client::request(Operation::SetSecretHttpAccess {
+        profile: arguments.name,
+        name: secret,
+        constraint,
+    }) {
+        Ok(Reply::Acknowledged { no_op }) => {
+            print_acknowledgement(output, "http_access_set", no_op)
+        }
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn portability_command(output: Output, command: PortabilityCommand) -> ExitCode {
     match command {
-        WorkspaceCommand::Export(arguments) => export_package(
+        PortabilityCommand::Export(arguments) => export_package(
             output,
             PackageKind::Workspace,
             None,
@@ -1275,8 +1167,62 @@ fn workspace_command(output: Output, command: WorkspaceCommand) -> ExitCode {
             arguments.password,
             arguments.age_recipients,
         ),
-        WorkspaceCommand::Import(arguments) => import_workspace_package(output, arguments),
+        PortabilityCommand::Import(arguments) => import_workspace_package(output, arguments),
     }
+}
+
+fn workspace_command(output: Output, command: WorkspaceCommand) -> ExitCode {
+    match command {
+        WorkspaceCommand::Create(arguments) => {
+            match client::request(Operation::CreateWorkspace {
+                name: arguments.name,
+            }) {
+                Ok(Reply::Workspace(scope)) => print_workspace_scope(output, &scope),
+                Ok(_) => print_error(output, &unexpected_response()),
+                Err(error) => print_error(output, &client_error(error)),
+            }
+        }
+        WorkspaceCommand::List => match client::request(Operation::ListWorkspaces) {
+            Ok(Reply::Workspaces(scopes)) => {
+                for scope in &scopes {
+                    print_workspace_scope(output, scope);
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(_) => print_error(output, &unexpected_response()),
+            Err(error) => print_error(output, &client_error(error)),
+        },
+        WorkspaceCommand::Show(arguments) => {
+            match client::request(Operation::ShowWorkspace {
+                name: arguments.name,
+            }) {
+                Ok(Reply::WorkspaceProfiles(profiles)) => print_profiles(output, &profiles, &[]),
+                Ok(_) => print_error(output, &unexpected_response()),
+                Err(error) => print_error(output, &client_error(error)),
+            }
+        }
+        WorkspaceCommand::Load(arguments) => {
+            match client::request(Operation::LoadWorkspace {
+                name: arguments.name,
+            }) {
+                Ok(Reply::WorkspaceProfiles(profiles)) => print_profiles(output, &profiles, &[]),
+                Ok(_) => print_error(output, &unexpected_response()),
+                Err(error) => print_error(output, &client_error(error)),
+            }
+        }
+    }
+}
+
+fn print_workspace_scope(output: Output, scope: &ScopeView) -> ExitCode {
+    match output {
+        Output::Human => println!("workspace: {} · id: {}", scope.path, scope.id.0),
+        Output::Json => println!(
+            "{}",
+            serde_json::json!({ "path": scope.path, "id": scope.id.0.to_string() })
+        ),
+        Output::Toon => println!("workspace{{path,id}}: {},{}", scope.path, scope.id.0),
+    }
+    ExitCode::SUCCESS
 }
 
 fn export_package(
@@ -1456,36 +1402,57 @@ fn secret_command(output: Output, command: SecretCommand) -> ExitCode {
     match command {
         SecretCommand::Create(arguments) => create_secret(output, arguments),
         SecretCommand::List(arguments) => list_secrets(output, &arguments),
-        SecretCommand::Describe(arguments) => request_secret(
-            output,
-            Operation::DescribeSecret {
-                name: arguments.name,
-            },
-        ),
-        SecretCommand::Update(arguments) => request_secret(
-            output,
-            Operation::UpdateSecret {
-                name: arguments.name,
-                description: arguments.description,
-            },
-        ),
-        SecretCommand::Rename(arguments) => request_secret(
-            output,
-            Operation::RenameSecret {
-                old_name: arguments.old_name,
-                new_name: arguments.new_name,
-            },
-        ),
-        SecretCommand::Delete(arguments) => lifecycle_request(
-            output,
-            Operation::DeleteSecret {
-                name: arguments.name,
-            },
-            "secret_deleted",
-        ),
+        SecretCommand::Describe(arguments) => {
+            let (profile, name) = parse_secret_ref(&arguments.name);
+            match client::request(Operation::DescribeSecret {
+                profile: profile.clone(),
+                name: name.clone(),
+            }) {
+                Ok(Reply::Secret(secret)) => print_secrets(output, &[secret], &[]),
+                Ok(_) => print_error(output, &unexpected_response()),
+                Err(ClientError::Remote(error)) => print_error(
+                    output,
+                    &suggest_on_not_found(error, &name, &secret_names_in_profile(&profile)),
+                ),
+                Err(error) => print_error(output, &client_error(error)),
+            }
+        }
+        SecretCommand::Update(arguments) => {
+            let (profile, name) = parse_secret_ref(&arguments.name);
+            request_secret(
+                output,
+                Operation::UpdateSecret {
+                    profile,
+                    name,
+                    description: arguments.description,
+                },
+            )
+        }
+        SecretCommand::Rename(arguments) => {
+            let (profile, old_name) = parse_secret_ref(&arguments.old_name);
+            let (_, new_name) = parse_secret_ref(&arguments.new_name);
+            request_secret(
+                output,
+                Operation::RenameSecret {
+                    profile,
+                    old_name,
+                    new_name,
+                },
+            )
+        }
+        SecretCommand::Delete(arguments) => {
+            let (profile, name) = parse_secret_ref(&arguments.name);
+            lifecycle_request(
+                output,
+                Operation::DeleteSecret { profile, name },
+                "secret_deleted",
+            )
+        }
         SecretCommand::Versions(arguments) => {
+            let (profile, name) = parse_secret_ref(&arguments.name);
             match client::request(Operation::ListSecretVersions {
-                name: arguments.name,
+                profile: profile.clone(),
+                name: name.clone(),
             }) {
                 Ok(Reply::SecretVersions(versions)) => {
                     let help: &[&str] = if versions.is_empty() {
@@ -1496,6 +1463,10 @@ fn secret_command(output: Output, command: SecretCommand) -> ExitCode {
                     print_versions(output, &versions, help)
                 }
                 Ok(_) => print_error(output, &unexpected_response()),
+                Err(ClientError::Remote(error)) => print_error(
+                    output,
+                    &suggest_on_not_found(error, &name, &secret_names_in_profile(&profile)),
+                ),
                 Err(error) => print_error(output, &client_error(error)),
             }
         }
@@ -1504,37 +1475,32 @@ fn secret_command(output: Output, command: SecretCommand) -> ExitCode {
 }
 
 fn create_secret(output: Output, arguments: SecretCreateArgs) -> ExitCode {
-    let operation = match (arguments.stdin, arguments.generate) {
-        (true, None) => {
-            let value = match read_secret_value() {
-                Ok(value) => value,
-                Err(error) => return print_error(output, &error),
-            };
-            Operation::CreateSecret {
-                name: arguments.name,
-                description: arguments.description,
-                value,
-            }
+    let (profile, name) = parse_secret_ref(&arguments.name);
+    let operation = if let Some(format) = arguments.generate {
+        let generator = match generator_spec(format, arguments.length) {
+            Ok(generator) => generator,
+            Err(error) => return print_error(output, &error),
+        };
+        Operation::CreateGeneratedSecret {
+            profile,
+            name,
+            description: arguments.description,
+            generator,
         }
-        (false, Some(format)) => {
-            let generator = match generator_spec(format, arguments.length) {
-                Ok(generator) => generator,
-                Err(error) => return print_error(output, &error),
-            };
-            Operation::CreateGeneratedSecret {
-                name: arguments.name,
-                description: arguments.description,
-                generator,
-            }
-        }
-        _ => {
-            return print_error(
-                output,
-                &input_error(
-                    "secret_input_required",
-                    "choose exactly one of `--stdin` or `--generate`",
-                ),
-            );
+    } else {
+        // Neither `--stdin` nor `--generate`: `--stdin` only ever changes
+        // whether a non-interactive terminal is rejected, since
+        // `read_secret_value_interactive` already reads piped input the same
+        // way `--stdin` does.
+        let value = match read_secret_value_interactive() {
+            Ok(value) => value,
+            Err(error) => return print_error(output, &error),
+        };
+        Operation::CreateSecret {
+            profile,
+            name,
+            description: arguments.description,
+            value,
         }
     };
     request_secret(output, operation)
@@ -1561,15 +1527,30 @@ fn list_secrets(output: Output, arguments: &SecretListArgs) -> ExitCode {
     }
     let include_description =
         arguments.describe || arguments.fields.iter().any(|field| field == "description");
-    let result = if arguments.token_stdin {
-        let token = match read_capability_token(true) {
-            Ok(token) => token,
-            Err(error) => return print_error(output, &error),
+    if let Some(profile) = &arguments.profile {
+        return match client::request(Operation::ListResolvedSecrets {
+            profile: profile.clone(),
+        }) {
+            Ok(Reply::ResolvedSecrets(resolved)) => {
+                let mut secrets: Vec<SecretView> =
+                    resolved.into_iter().map(|entry| entry.secret).collect();
+                if !include_description {
+                    for secret in &mut secrets {
+                        secret.description = None;
+                    }
+                }
+                let help: &[&str] = if secrets.is_empty() {
+                    &["Run `envault secret create \"<profile>.<name>\" --stdin` to add a secret"]
+                } else {
+                    &["Run `envault secret describe \"<name>\"` to see full details"]
+                };
+                print_secrets(output, &secrets, help)
+            }
+            Ok(_) => print_error(output, &unexpected_response()),
+            Err(error) => print_error(output, &client_error(error)),
         };
-        client::request_with_capability(Operation::DiscoverSecrets, Some(token))
-    } else {
-        client::request(Operation::ListSecrets)
-    };
+    }
+    let result = client::request(Operation::ListSecrets);
     match result {
         Ok(Reply::Secrets(mut secrets)) => {
             if !include_description {
@@ -1602,8 +1583,10 @@ fn secret_value_command(output: Output, command: SecretValueCommand) -> ExitCode
                 Ok(value) => value,
                 Err(error) => return print_error(output, &error),
             };
+            let (profile, name) = parse_secret_ref(&arguments.name);
             Operation::SetSecretValue {
-                name: arguments.name,
+                profile,
+                name,
                 value,
             }
         }
@@ -1612,8 +1595,10 @@ fn secret_value_command(output: Output, command: SecretValueCommand) -> ExitCode
                 Ok(generator) => generator,
                 Err(error) => return print_error(output, &error),
             };
+            let (profile, name) = parse_secret_ref(&arguments.name);
             Operation::GenerateSecretValue {
-                name: arguments.name,
+                profile,
+                name,
                 generator,
             }
         }
@@ -1634,10 +1619,6 @@ fn request_secret(output: Output, operation: Operation) -> ExitCode {
 }
 
 fn http_request(output: Output, arguments: HttpRequestArgs) -> ExitCode {
-    let token = match read_capability_token(arguments.token_stdin) {
-        Ok(token) => token,
-        Err(error) => return print_error(output, &error),
-    };
     let body = match arguments.body_file {
         Some(path) => match read_bounded_file(&path, envault_protocol::MAX_FRAME_BYTES / 2) {
             Ok(body) => body,
@@ -1646,78 +1627,98 @@ fn http_request(output: Output, arguments: HttpRequestArgs) -> ExitCode {
         None => Vec::new(),
     };
     let full = arguments.full;
+    let (profile, name) = parse_secret_ref(&arguments.secret);
     let request = HttpRequest {
         url: arguments.url,
         method: http_method(arguments.method),
         body,
         content_type: arguments.content_type.map(http_content_type),
     };
-    match client::request_with_capability(
-        Operation::HttpRequest {
-            secret_id: envault_core::SecretId(arguments.secret),
-            request,
-        },
-        Some(token),
-    ) {
+    match client::request(Operation::HttpRequest {
+        profile,
+        name,
+        request,
+    }) {
         Ok(Reply::HttpResponse(response)) => print_http_response(output, &response, full),
         Ok(_) => print_error(output, &unexpected_response()),
         Err(error) => print_error(output, &client_error(error)),
     }
 }
 
-fn read_capability_token(from_stdin: bool) -> Result<SensitiveBytes, StructuredError> {
-    use zeroize::Zeroize;
+/// Resolves secrets for a profile or workspace and injects them as env vars
+/// into a spawned child process. Plaintext is never printed here - it only
+/// ever reaches the child process's own environment.
+fn run_command(output: Output, arguments: RunArgs) -> ExitCode {
+    let profiles = if let Some(profile) = arguments.profile {
+        vec![profile]
+    } else if let Some(workspace) = arguments.workspace {
+        match client::request(Operation::ShowWorkspace { name: workspace }) {
+            Ok(Reply::WorkspaceProfiles(profiles)) => {
+                profiles.into_iter().map(|profile| profile.name).collect()
+            }
+            Ok(_) => return print_error(output, &unexpected_response()),
+            Err(error) => return print_error(output, &client_error(error)),
+        }
+    } else {
+        return print_error(
+            output,
+            &input_error(
+                "run_target_required",
+                "pass either --profile or --workspace",
+            ),
+        );
+    };
+    let vars = match client::request(Operation::RunEnv { profiles }) {
+        Ok(Reply::RunEnv(vars)) => vars,
+        Ok(_) => return print_error(output, &unexpected_response()),
+        Err(error) => return print_error(output, &client_error(error)),
+    };
+    let mut env_vars = Vec::with_capacity(vars.len());
+    for EnvVar { name, value } in vars {
+        let text = match std::str::from_utf8(value.as_slice()) {
+            Ok(text) => text.to_string(),
+            Err(_) => {
+                return print_error(
+                    output,
+                    &input_error(
+                        "secret_not_utf8",
+                        "envault run only supports UTF-8 secret values",
+                    ),
+                );
+            }
+        };
+        env_vars.push((name.to_uppercase(), text));
+    }
+    let (program, args) = arguments
+        .command
+        .split_first()
+        .expect("clap requires at least one command token");
+    let status = std::process::Command::new(program)
+        .args(args)
+        .envs(env_vars)
+        .status();
+    match status {
+        Ok(status) => {
+            let code = u8::try_from(status.code().unwrap_or(1).clamp(0, 255)).unwrap_or(1);
+            ExitCode::from(code)
+        }
+        Err(error) => print_error(
+            output,
+            &input_error(
+                "run_spawn_failed",
+                &format!("failed to spawn {program}: {error}"),
+            ),
+        ),
+    }
+}
 
-    if !from_stdin {
-        return Err(input_error(
-            "token_stdin_required",
-            "capability tokens are accepted only through `--token-stdin`",
-        ));
+/// Splits a `<profile>.<secret>` reference into `(profile, secret)`. A bare
+/// name with no `.` addresses the permanent `base` profile.
+fn parse_secret_ref(input: &str) -> (String, String) {
+    match input.split_once('.') {
+        Some((profile, secret)) => (profile.to_string(), secret.to_string()),
+        None => ("base".to_string(), input.to_string()),
     }
-    if io::stdin().is_terminal() {
-        return Err(input_error(
-            "token_stdin_requires_pipe",
-            "`--token-stdin` requires piped standard input",
-        ));
-    }
-    let mut encoded = Vec::new();
-    io::stdin()
-        .take(257)
-        .read_to_end(&mut encoded)
-        .map_err(|_| input_error("io_error", "failed to read the capability token"))?;
-    if encoded.len() > 256 {
-        encoded.zeroize();
-        return Err(input_error(
-            "invalid_capability_token",
-            "capability token input is too large",
-        ));
-    }
-    while encoded.last().is_some_and(u8::is_ascii_whitespace) {
-        encoded.pop();
-    }
-    let first = encoded
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(encoded.len());
-    if first > 0 {
-        encoded.drain(..first);
-    }
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&encoded);
-    encoded.zeroize();
-    let decoded = decoded.map_err(|_| {
-        input_error(
-            "invalid_capability_token",
-            "capability token is not valid base64url",
-        )
-    })?;
-    let decoded = SensitiveBytes::new(decoded);
-    if decoded.len() != 32 {
-        return Err(input_error(
-            "invalid_capability_token",
-            "capability token must decode to exactly 32 bytes",
-        ));
-    }
-    Ok(decoded)
 }
 
 fn read_secret_value() -> Result<SensitiveBytes, StructuredError> {
@@ -1734,6 +1735,27 @@ fn read_secret_value() -> Result<SensitiveBytes, StructuredError> {
         .read_to_end(&mut value)
         .map_err(|_| input_error("io_error", "failed to read the secret value"))?;
     let value = SensitiveBytes::new(value);
+    validate_secret_value_length(value)
+}
+
+/// Prompts on a masked terminal when standard input is interactive,
+/// otherwise reads a piped value exactly like `read_secret_value`. Used only
+/// where the CLI offers a fallback to typing a value directly, not where
+/// `--stdin` was explicitly requested.
+fn read_secret_value_interactive() -> Result<SensitiveBytes, StructuredError> {
+    if !io::stdin().is_terminal() {
+        return read_secret_value();
+    }
+    let value = SensitiveBytes::new(
+        rpassword::prompt_password("Secret value: ")
+            .map_err(|_| input_error("io_error", "failed to read the secret value"))?
+            .into_bytes(),
+    );
+    validate_secret_value_length(value)
+}
+
+fn validate_secret_value_length(value: SensitiveBytes) -> Result<SensitiveBytes, StructuredError> {
+    let maximum = envault_protocol::MAX_FRAME_BYTES / 2;
     if value.is_empty() || value.len() > maximum {
         return Err(input_error(
             "invalid_secret_value",
@@ -1795,58 +1817,6 @@ fn generator_spec(
             "generator arguments violate the contract",
         )
     })
-}
-
-fn resource_selector(arguments: &ResourceArgs) -> Result<ResourceSelector, StructuredError> {
-    match (arguments.vault, arguments.scope, arguments.secret) {
-        (Some(id), None, None) => Ok(ResourceSelector::Vault(envault_core::VaultId(id))),
-        (None, Some(id), None) => Ok(ResourceSelector::ScopeTree(envault_core::ScopeId(id))),
-        (None, None, Some(id)) => Ok(ResourceSelector::Secret(envault_core::SecretId(id))),
-        _ => Err(input_error(
-            "resource_required",
-            "choose exactly one of `--vault`, `--scope`, or `--secret`",
-        )),
-    }
-}
-
-fn grant_http_constraint(
-    arguments: &GrantCreateArgs,
-    action: Action,
-    resource: ResourceSelector,
-) -> Result<Option<HttpConstraint>, StructuredError> {
-    if action != Action::HttpRequest {
-        if arguments.host.is_some() || !arguments.method.is_empty() {
-            return Err(input_error(
-                "invalid_grant",
-                "HTTP constraints are valid only for HTTP grants",
-            ));
-        }
-        return Ok(None);
-    }
-    if !matches!(resource, ResourceSelector::Secret(_)) {
-        return Err(input_error(
-            "invalid_grant",
-            "HTTP grants require one exact `--secret` resource",
-        ));
-    }
-    let host = arguments
-        .host
-        .clone()
-        .ok_or_else(|| input_error("invalid_grant", "HTTP grants require an exact `--host`"))?;
-    if arguments.method.is_empty() {
-        return Err(input_error(
-            "invalid_grant",
-            "HTTP grants require at least one `--method`",
-        ));
-    }
-    Ok(Some(HttpConstraint {
-        host,
-        port: arguments.port,
-        methods: arguments.method.iter().copied().map(http_method).collect(),
-        path_prefix: arguments.path_prefix.clone(),
-        max_request_bytes: arguments.max_request_bytes,
-        max_response_bytes: arguments.max_response_bytes,
-    }))
 }
 
 const fn http_method(method: HttpMethodArg) -> HttpMethod {
@@ -2208,158 +2178,6 @@ fn print_plaintext_export(output: Output, summary: &PlaintextExportSummary) -> E
     ExitCode::SUCCESS
 }
 
-fn print_context(output: Output, context: &AgentContext) -> ExitCode {
-    match output {
-        Output::Human => println!(
-            "vault: {} · profile: {} · principal: {} · action: {:?} · resource: {} · constraint: {} · remaining: {}",
-            context.vault_id.0,
-            context.active_profile.name,
-            context.session.principal_id.0,
-            context.session.action,
-            resource_label(context.session.resource),
-            human_http_constraint(context.session.http_constraint.as_ref()),
-            context.session.remaining_requests
-        ),
-        Output::Json => print_json(context),
-        Output::Toon => {
-            println!(
-                "context{{vault_id,profile,profile_id,scope_id,principal_id,grant_id,action,resource,expires_at,remaining_requests}}: {},{},{},{},{},{},{:?},{},{},{}",
-                context.vault_id.0,
-                toon_string(&context.active_profile.name),
-                context.active_profile.id.0,
-                context.active_profile.scope_id.0,
-                context.session.principal_id.0,
-                context.session.grant_id.0,
-                context.session.action,
-                toon_string(&resource_label(context.session.resource)),
-                context.session.expires_at,
-                context.session.remaining_requests
-            );
-            print_http_constraint_toon(context.session.http_constraint.as_ref());
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-fn print_agent_session(output: Output, session: &AgentSessionView) -> ExitCode {
-    match output {
-        Output::Human => println!(
-            "grant: {} · principal: {} · action: {:?} · resource: {} · constraint: {} · expires_at: {} · remaining: {}",
-            session.grant_id.0,
-            session.principal_id.0,
-            session.action,
-            resource_label(session.resource),
-            human_http_constraint(session.http_constraint.as_ref()),
-            session.expires_at,
-            session.remaining_requests
-        ),
-        Output::Json => print_json(session),
-        Output::Toon => {
-            println!(
-                "session{{grant_id,principal_id,action,resource,expires_at,remaining_requests,revoked}}: {},{},{:?},{},{},{},{}",
-                session.grant_id.0,
-                session.principal_id.0,
-                session.action,
-                toon_string(&resource_label(session.resource)),
-                session.expires_at,
-                session.remaining_requests,
-                session.revoked
-            );
-            print_http_constraint_toon(session.http_constraint.as_ref());
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-fn resource_label(resource: ResourceSelector) -> String {
-    match resource {
-        ResourceSelector::Vault(id) => format!("vault:{}", id.0),
-        ResourceSelector::ScopeTree(id) => format!("scope_tree:{}", id.0),
-        ResourceSelector::Secret(id) => format!("secret:{}", id.0),
-    }
-}
-
-fn human_http_constraint(constraint: Option<&HttpConstraint>) -> String {
-    let Some(constraint) = constraint else {
-        return "none".to_owned();
-    };
-    let methods = constraint
-        .methods
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("|");
-    format!(
-        "https://{}:{}{} [{}; request<={}B; response<={}B]",
-        constraint.host,
-        constraint.port,
-        constraint.path_prefix,
-        methods,
-        constraint.max_request_bytes,
-        constraint.max_response_bytes
-    )
-}
-
-fn print_http_constraint_toon(constraint: Option<&HttpConstraint>) {
-    let Some(constraint) = constraint else {
-        println!("http_constraint{{present}}: false");
-        return;
-    };
-    let methods = constraint
-        .methods
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("|");
-    println!(
-        "http_constraint{{host,port,methods,path_prefix,max_request_bytes,max_response_bytes}}: {},{},{},{},{},{}",
-        toon_string(&constraint.host),
-        constraint.port,
-        toon_string(&methods),
-        toon_string(&constraint.path_prefix),
-        constraint.max_request_bytes,
-        constraint.max_response_bytes
-    );
-}
-
-fn print_created_grant(output: Output, created: AgentSessionCreated) -> ExitCode {
-    use zeroize::Zeroize;
-
-    let mut raw = created.token.into_vec();
-    let mut token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw);
-    raw.zeroize();
-    match output {
-        Output::Human => println!(
-            "token: {}\ngrant: {}\napproval: {}\nexpires_at: {}\nmax_requests: {}",
-            token,
-            created.grant_id.0,
-            created.approval_id.0,
-            created.expires_at,
-            created.max_requests
-        ),
-        Output::Json => println!(
-            "{}",
-            serde_json::json!({
-                "token": token,
-                "grant_id": created.grant_id,
-                "approval_id": created.approval_id,
-                "expires_at": created.expires_at,
-                "max_requests": created.max_requests,
-            })
-        ),
-        Output::Toon => println!(
-            "grant{{token,grant_id,approval_id,expires_at,max_requests}}: {},{},{},{},{}",
-            toon_string(&token),
-            created.grant_id.0,
-            created.approval_id.0,
-            created.expires_at,
-            created.max_requests
-        ),
-    }
-    token.zeroize();
-    ExitCode::SUCCESS
-}
-
 /// Prints the next-step suggestions a list or mutation view carries, per
 /// AXI guideline §9. Called after the primary data so the hints read as
 /// supplementary rather than part of the record itself.
@@ -2380,6 +2198,22 @@ fn print_toon_help(help: &[&str]) {
                 .join(",")
         );
     }
+}
+
+/// The first 8 characters of a UUID's canonical hex representation, used as
+/// a human-scannable table column; the full UUID remains available via
+/// `--output json`.
+fn short_id(id: Uuid) -> String {
+    id.simple().to_string()[..8].to_string()
+}
+
+fn human_table(header: Vec<&str>) -> comfy_table::Table {
+    let mut table = comfy_table::Table::new();
+    table
+        .load_preset(comfy_table::presets::UTF8_FULL_CONDENSED)
+        .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
+        .set_header(header);
+    table
 }
 
 fn print_profiles(output: Output, profiles: &[ProfileView], help: &[&str]) -> ExitCode {
@@ -2409,16 +2243,17 @@ fn print_profiles(output: Output, profiles: &[ProfileView], help: &[&str]) -> Ex
             if profiles.is_empty() {
                 println!("profiles: 0 profiles found");
             } else {
+                let mut table = human_table(vec!["name", "id", "scope", "loaded", "description"]);
                 for profile in profiles {
-                    println!(
-                        "{} · id: {} · scope: {} · startup: {} · description: {}",
-                        profile.name,
-                        profile.id.0,
-                        profile.scope_id.0,
-                        profile.activate_on_start,
-                        profile.description.as_deref().unwrap_or("none")
-                    );
+                    table.add_row(vec![
+                        profile.name.clone(),
+                        short_id(profile.id.0),
+                        short_id(profile.scope_id.0),
+                        profile.activate_on_start.to_string(),
+                        profile.description.clone().unwrap_or_default(),
+                    ]);
                 }
+                println!("{table}");
             }
             print_human_help(help);
         }
@@ -2453,17 +2288,25 @@ fn print_secrets(output: Output, secrets: &[SecretView], help: &[&str]) -> ExitC
             if secrets.is_empty() {
                 println!("secrets: 0 secrets found");
             } else {
+                let mut table = human_table(vec![
+                    "name",
+                    "id",
+                    "scope",
+                    "version",
+                    "status",
+                    "description",
+                ]);
                 for secret in secrets {
-                    println!(
-                        "{} · id: {} · scope: {} · version: {} · status: {:?} · description: {}",
-                        secret.name,
-                        secret.id.0,
-                        secret.scope_id.0,
-                        secret.current_version,
-                        secret.status,
-                        secret.description.as_deref().unwrap_or("none")
-                    );
+                    table.add_row(vec![
+                        secret.name.clone(),
+                        short_id(secret.id.0),
+                        short_id(secret.scope_id.0),
+                        secret.current_version.to_string(),
+                        format!("{:?}", secret.status),
+                        secret.description.clone().unwrap_or_default(),
+                    ]);
                 }
+                println!("{table}");
             }
             print_human_help(help);
         }
@@ -2498,59 +2341,18 @@ fn print_versions(output: Output, versions: &[SecretVersionView], help: &[&str])
             if versions.is_empty() {
                 println!("versions: 0 versions found");
             } else {
+                let mut table =
+                    human_table(vec!["version", "id", "generator", "length", "entropy_bits"]);
                 for version in versions {
-                    println!(
-                        "version: {} · id: {} · generator: {:?} · length: {} · entropy_bits: {}",
-                        version.version,
-                        version.id.0,
-                        version.generator,
+                    table.add_row(vec![
+                        version.version.to_string(),
+                        short_id(version.id.0),
+                        format!("{:?}", version.generator),
                         optional_number(version.generated_length),
-                        optional_number(version.entropy_bits)
-                    );
+                        optional_number(version.entropy_bits),
+                    ]);
                 }
-            }
-            print_human_help(help);
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-fn print_principals(
-    output: Output,
-    principals: &[envault_core::PrincipalView],
-    help: &[&str],
-) -> ExitCode {
-    match output {
-        Output::Json => {
-            print_json(principals);
-        }
-        Output::Toon => {
-            println!(
-                "principals[{}]{{id,kind,name,disabled,generation}}:",
-                principals.len()
-            );
-            for principal in principals {
-                println!(
-                    "  {},{:?},{},{},{}",
-                    principal.id.0,
-                    principal.kind,
-                    toon_string(&principal.name),
-                    principal.disabled,
-                    principal.generation
-                );
-            }
-            print_toon_help(help);
-        }
-        Output::Human => {
-            if principals.is_empty() {
-                println!("principals: 0 principals found");
-            } else {
-                for principal in principals {
-                    println!(
-                        "{} · id: {} · kind: {:?} · disabled: {}",
-                        principal.name, principal.id.0, principal.kind, principal.disabled
-                    );
-                }
+                println!("{table}");
             }
             print_human_help(help);
         }
@@ -2631,23 +2433,6 @@ fn print_http_response(output: Output, response: &HttpResponse, full: bool) -> E
                 );
             }
         }
-    }
-    ExitCode::SUCCESS
-}
-
-fn print_json_or_debug<T: Serialize + core::fmt::Debug>(
-    output: Output,
-    value: &T,
-    label: &str,
-) -> ExitCode {
-    match output {
-        Output::Human => println!("{label}: {value:#?}"),
-        Output::Json => print_json(value),
-        Output::Toon => println!(
-            "{}{{json}}: {}",
-            label,
-            toon_string(&serde_json::to_string(value).expect("value serializes"))
-        ),
     }
     ExitCode::SUCCESS
 }
@@ -2741,10 +2526,10 @@ fn print_running_status(output: Output, status: &DaemonStatus) -> ExitCode {
         &StatusView {
             daemon: "running",
             service,
-            profile: status.active_profile.clone(),
+            profile: (!status.loaded_profiles.is_empty())
+                .then(|| status.loaded_profiles.join(", ")),
             pid: Some(status.pid),
             admin_lease_active: status.admin_lease_active,
-            agent_session_count: status.agent_session_count,
             help,
         },
     )
@@ -2757,7 +2542,6 @@ fn stopped_status() -> StatusView {
         profile: None,
         pid: None,
         admin_lease_active: false,
-        agent_session_count: 0,
         help: vec!["Run `envault start`"],
     }
 }
@@ -2766,7 +2550,7 @@ fn print_status_view(output: Output, status: &StatusView) -> ExitCode {
     match output {
         Output::Human => {
             println!(
-                "daemon: {} · service: {} · profile: {} · admin: {} · agents: {}",
+                "daemon: {} · service: {} · profile: {} · admin: {}",
                 status.daemon,
                 status.service,
                 status.profile.as_deref().unwrap_or("none"),
@@ -2774,8 +2558,7 @@ fn print_status_view(output: Output, status: &StatusView) -> ExitCode {
                     "unlocked"
                 } else {
                     "locked"
-                },
-                status.agent_session_count
+                }
             );
             for help in &status.help {
                 println!("help: {help}");
@@ -2787,7 +2570,7 @@ fn print_status_view(output: Output, status: &StatusView) -> ExitCode {
         ),
         Output::Toon => {
             println!(
-                "status{{daemon,service,profile,pid,admin_lease_active,agent_session_count}}: {},{},{},{},{},{}",
+                "status{{daemon,service,profile,pid,admin_lease_active}}: {},{},{},{},{}",
                 status.daemon,
                 status.service,
                 status
@@ -2797,8 +2580,7 @@ fn print_status_view(output: Output, status: &StatusView) -> ExitCode {
                 status
                     .pid
                     .map_or_else(|| "null".to_owned(), |pid| pid.to_string()),
-                status.admin_lease_active,
-                status.agent_session_count
+                status.admin_lease_active
             );
             if !status.help.is_empty() {
                 println!(
@@ -2876,6 +2658,70 @@ fn service_error(error: &ServiceError) -> StructuredError {
         request_id: Uuid::new_v4(),
         retryable,
         kind: ErrorKind::Runtime,
+    }
+}
+
+/// Appends a "did you mean" hint to a `not_found` error when some candidate
+/// name is close enough (Levenshtein distance <= 2) to what was requested.
+/// A best-effort UX aid, not authoritative: the daemon has already decided
+/// the lookup failed, this only helps a human correct a typo.
+fn suggest_on_not_found(
+    mut error: StructuredError,
+    identifier: &str,
+    candidates: &[String],
+) -> StructuredError {
+    if error.code == "not_found"
+        && let Some(suggestion) = closest_match(identifier, candidates)
+    {
+        error.help.push(format!("did you mean \"{suggestion}\"?"));
+    }
+    error
+}
+
+fn closest_match(target: &str, candidates: &[String]) -> Option<String> {
+    candidates
+        .iter()
+        .map(|candidate| (candidate, levenshtein_distance(target, candidate)))
+        .filter(|(_, distance)| (1..=2).contains(distance))
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(candidate, _)| candidate.clone())
+}
+
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    for (i, &character_a) in a.iter().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, &character_b) in b.iter().enumerate() {
+            let cost = usize::from(character_a != character_b);
+            current.push(
+                (previous[j + 1] + 1)
+                    .min(current[j] + 1)
+                    .min(previous[j] + cost),
+            );
+        }
+        previous = current;
+    }
+    previous[b.len()]
+}
+
+fn secret_names_in_profile(profile: &str) -> Vec<String> {
+    match client::request(Operation::ListResolvedSecrets {
+        profile: profile.to_string(),
+    }) {
+        Ok(Reply::ResolvedSecrets(resolved)) => resolved
+            .into_iter()
+            .map(|entry| entry.secret.name)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn profile_names() -> Vec<String> {
+    match client::request(Operation::ListProfiles) {
+        Ok(Reply::Profiles(profiles)) => profiles.into_iter().map(|profile| profile.name).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -3011,8 +2857,6 @@ mod tests {
 
     #[test]
     fn bootstrap_command_surface_is_stable() {
-        use clap::CommandFactory;
-
         let command = Cli::command();
         let names = command
             .get_subcommands()
@@ -3026,15 +2870,16 @@ mod tests {
                 "start",
                 "lock",
                 "stop",
-                "context",
                 "admin",
                 "profile",
                 "secret",
-                "agent",
                 "request",
+                "portability",
                 "workspace",
                 "convenience-unlock",
-                "session"
+                "session",
+                "run",
+                "completions"
             ]
         );
     }
@@ -3225,8 +3070,6 @@ mod tests {
 
     #[test]
     fn implemented_cli_leaf_paths_match_the_canonical_contract() {
-        use clap::CommandFactory;
-
         let mut actual = BTreeSet::new();
         collect_leaf_paths(&Cli::command(), "", &mut actual);
         let contract: Contract =
@@ -3253,5 +3096,31 @@ mod tests {
                 paths.insert(path);
             }
         }
+    }
+
+    #[test]
+    fn levenshtein_distance_matches_known_values() {
+        assert_eq!(levenshtein_distance("", ""), 0);
+        assert_eq!(levenshtein_distance("abc", "abc"), 0);
+        assert_eq!(levenshtein_distance("abc", "abd"), 1);
+        assert_eq!(levenshtein_distance("kitten", "sitting"), 3);
+        assert_eq!(levenshtein_distance("DATABASE_URI", "DATABASE_URL"), 1);
+    }
+
+    #[test]
+    fn closest_match_ignores_exact_and_distant_names() {
+        let candidates = vec![
+            "DATABASE_URL".to_string(),
+            "API_KEY".to_string(),
+            "STRIPE_SECRET".to_string(),
+        ];
+        assert_eq!(
+            closest_match("DATABASE_URI", &candidates),
+            Some("DATABASE_URL".to_string())
+        );
+        // An exact match is not a typo suggestion.
+        assert_eq!(closest_match("API_KEY", &candidates), None);
+        // Nothing within distance 2 of a wildly different name.
+        assert_eq!(closest_match("COMPLETELY_UNRELATED", &candidates), None);
     }
 }

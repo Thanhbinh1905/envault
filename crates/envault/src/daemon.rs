@@ -9,18 +9,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use envault_core::{ApprovalId, GrantId, PrincipalId, PrincipalKind, validate_admin_lease};
-use envault_policy::{Action, Grant, MAX_GRANT_LIFETIME_SECONDS, MAX_GRANT_USES, ResourceSelector};
+use envault_core::validate_admin_lease;
 use envault_protocol::{
-    AdminLeaseStatus, AgentContext, AgentSessionCreated, AgentSessionView, AuthenticatedRequest,
-    BootstrapRequest, DaemonStatus, ErrorKind, HttpConstraint, Operation, PROTOCOL_VERSION, Reply,
-    Request, Response, ResponseBody, SensitiveBytes, ServiceState, StructuredError,
-    validate_version,
+    AdminLeaseStatus, AuthenticatedRequest, BootstrapRequest, DaemonStatus, ErrorKind,
+    HttpConstraint, Operation, PROTOCOL_VERSION, Reply, Request, Response, ResponseBody,
+    SensitiveBytes, ServiceState, StructuredError, validate_version,
 };
 use envault_service::{
-    BrokerFailure, CapabilityTokenKey, PackageImportOptions, SensitiveInput, ServiceError,
-    VaultSession, classify_broker_failure, execute_agent_http_request,
-    normalize_agent_http_constraint,
+    BrokerFailure, PackageImportOptions, SensitiveInput, ServiceError, VaultSession,
+    classify_broker_failure, execute_agent_http_request,
 };
 use thiserror::Error;
 #[cfg(unix)]
@@ -36,7 +33,6 @@ use uuid::Uuid;
 use crate::ipc::{read_async_frame, read_sync_frame, write_async_frame, write_sync_frame};
 
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
-const MAX_AGENT_SESSIONS: usize = 1024;
 const MAX_RATE_WINDOWS: usize = 256;
 const REQUESTS_PER_MINUTE: u32 = 600;
 const GLOBAL_REQUESTS_PER_MINUTE: u32 = 1_200;
@@ -102,75 +98,48 @@ struct PeerIdentity {
 #[derive(Debug)]
 struct AdminLease {
     uid: u32,
-    session_id: u32,
-    deadline: Instant,
-    expires_at: i64,
-}
-
-#[derive(Debug)]
-struct CapabilitySession {
-    grant: Grant,
-    http_constraint: Option<HttpConstraint>,
-    deadline: Instant,
-}
-
-#[derive(Debug)]
-struct AgentSessionSpec {
-    principal_id: PrincipalId,
-    action: Action,
-    resource: ResourceSelector,
-    http_constraint: Option<HttpConstraint>,
-    ttl_minutes: u8,
-    max_requests: u32,
+    /// `None` means no expiration (`--no-expiration`); the lease then only
+    /// ends via `lock`/`stop` or an explicit `admin lock`.
+    deadline: Option<Instant>,
+    expires_at: Option<i64>,
 }
 
 struct RuntimeState {
     vault: Option<VaultSession>,
     database_path: PathBuf,
-    token_hash_key: Option<CapabilityTokenKey>,
     admin_lease: Option<AdminLease>,
-    capabilities: BTreeMap<[u8; 32], CapabilitySession>,
     rate_limits: BTreeMap<(u32, u32), RateWindow>,
     global_rate_limit: RateWindow,
 }
 
 impl RuntimeState {
-    fn new(vault: VaultSession, database_path: PathBuf) -> Result<Self, RuntimeFailure> {
-        Ok(Self {
+    fn new(vault: VaultSession, database_path: PathBuf) -> Self {
+        Self {
             vault: Some(vault),
             database_path,
-            token_hash_key: Some(
-                CapabilityTokenKey::generate().map_err(|_| RuntimeFailure::Internal)?,
-            ),
             admin_lease: None,
-            capabilities: BTreeMap::new(),
             rate_limits: BTreeMap::new(),
             global_rate_limit: RateWindow::new(),
-        })
+        }
     }
 
     fn status(&mut self, peer: PeerIdentity) -> Result<DaemonStatus, RuntimeFailure> {
-        self.remove_expired_capabilities();
-        let active_profile = self
+        let loaded_profiles = self
             .vault
             .as_ref()
             .map(|vault| {
-                vault
-                    .profiles()
-                    .map_err(|_| RuntimeFailure::Internal)?
-                    .into_iter()
-                    .find(|profile| profile.activate_on_start)
-                    .map(|profile| profile.name)
-                    .ok_or(RuntimeFailure::Internal)
+                Ok::<_, RuntimeFailure>(
+                    vault
+                        .profiles()
+                        .map_err(|_| RuntimeFailure::Internal)?
+                        .into_iter()
+                        .filter(|profile| profile.activate_on_start)
+                        .map(|profile| profile.name)
+                        .collect::<Vec<_>>(),
+                )
             })
-            .transpose()?;
-        let agent_session_count = self
-            .capabilities
-            .values()
-            .filter(|session| !session.grant.revoked)
-            .count()
-            .try_into()
-            .map_err(|_| RuntimeFailure::Internal)?;
+            .transpose()?
+            .unwrap_or_default();
         Ok(DaemonStatus {
             service: if self.vault.is_some() {
                 ServiceState::Unlocked
@@ -178,24 +147,21 @@ impl RuntimeState {
                 ServiceState::Locked
             },
             pid: std::process::id(),
-            active_profile,
+            loaded_profiles,
             admin_lease_active: self.admin_lease_active(peer),
-            agent_session_count,
         })
     }
 
     fn lock(&mut self) {
         self.vault = None;
-        self.token_hash_key = None;
         self.admin_lease = None;
-        self.capabilities.clear();
     }
 
     fn admin_status(&mut self, peer: PeerIdentity) -> AdminLeaseStatus {
         if self.admin_lease_active(peer) {
             AdminLeaseStatus {
                 active: true,
-                expires_at: self.admin_lease.as_ref().map(|lease| lease.expires_at),
+                expires_at: self.admin_lease.as_ref().and_then(|lease| lease.expires_at),
             }
         } else {
             AdminLeaseStatus {
@@ -208,28 +174,33 @@ impl RuntimeState {
     fn issue_admin_lease(
         &mut self,
         peer: PeerIdentity,
-        ttl_minutes: u8,
+        ttl_minutes: Option<u8>,
     ) -> Result<AdminLeaseStatus, RuntimeFailure> {
-        validate_admin_lease(ttl_minutes).map_err(|_| RuntimeFailure::InvalidTtl)?;
         if self.vault.is_none() {
             return Err(RuntimeFailure::Locked);
         }
-        let duration = Duration::from_secs(u64::from(ttl_minutes) * 60);
-        let deadline = Instant::now()
-            .checked_add(duration)
-            .ok_or(RuntimeFailure::Internal)?;
-        let expires_at = unix_seconds()?
-            .checked_add(i64::from(ttl_minutes) * 60)
-            .ok_or(RuntimeFailure::Internal)?;
+        let (deadline, expires_at) = match ttl_minutes {
+            Some(ttl_minutes) => {
+                validate_admin_lease(ttl_minutes).map_err(|_| RuntimeFailure::InvalidTtl)?;
+                let duration = Duration::from_secs(u64::from(ttl_minutes) * 60);
+                let deadline = Instant::now()
+                    .checked_add(duration)
+                    .ok_or(RuntimeFailure::Internal)?;
+                let expires_at = unix_seconds()?
+                    .checked_add(i64::from(ttl_minutes) * 60)
+                    .ok_or(RuntimeFailure::Internal)?;
+                (Some(deadline), Some(expires_at))
+            }
+            None => (None, None),
+        };
         self.admin_lease = Some(AdminLease {
             uid: peer.uid,
-            session_id: peer.session_id,
             deadline,
             expires_at,
         });
         Ok(AdminLeaseStatus {
             active: true,
-            expires_at: Some(expires_at),
+            expires_at,
         })
     }
 
@@ -239,284 +210,73 @@ impl RuntimeState {
         Ok(())
     }
 
-    fn create_agent_session(
+    /// Admin-gated: loads `profile` and configures the HTTP allowlist rule
+    /// for one secret in it (`envault profile load ... --action http`).
+    fn set_secret_http_access(
         &mut self,
         peer: PeerIdentity,
-        spec: AgentSessionSpec,
-    ) -> Result<AgentSessionCreated, RuntimeFailure> {
-        let AgentSessionSpec {
-            principal_id,
-            action,
-            resource,
-            http_constraint,
-            ttl_minutes,
-            max_requests,
-        } = spec;
+        profile: &str,
+        name: &str,
+        constraint: HttpConstraint,
+    ) -> Result<(), RuntimeFailure> {
         self.require_admin(peer)?;
-        self.remove_expired_capabilities();
-        if self.capabilities.len() >= MAX_AGENT_SESSIONS {
-            return Err(RuntimeFailure::Busy);
-        }
-        let http_constraint = match (action, resource, http_constraint) {
-            (Action::HttpRequest, ResourceSelector::Secret(_), Some(constraint)) => Some(
-                normalize_agent_http_constraint(constraint)
-                    .map_err(|_| RuntimeFailure::InvalidGrant)?,
-            ),
-            (Action::HttpRequest, _, _) | (_, _, Some(_)) => {
-                return Err(RuntimeFailure::InvalidGrant);
-            }
-            _ => None,
-        };
-        let vault = self.vault.as_ref().ok_or(RuntimeFailure::Locked)?;
-        let principal = vault
-            .principals()
-            .map_err(|_| RuntimeFailure::Internal)?
-            .into_iter()
-            .find(|principal| principal.id == principal_id)
-            .ok_or(RuntimeFailure::NotFound)?;
-        if principal.kind != PrincipalKind::Agent || principal.disabled {
-            return Err(RuntimeFailure::PermissionDenied);
-        }
+        let vault = self.vault.as_mut().ok_or(RuntimeFailure::Locked)?;
         vault
-            .validate_policy_resource(resource)
+            .load_profile(profile)
             .map_err(|error| map_service_failure(&error))?;
-        let lifetime_seconds = i64::from(ttl_minutes) * 60;
-        if !(1..=MAX_GRANT_LIFETIME_SECONDS).contains(&lifetime_seconds)
-            || !(1..=MAX_GRANT_USES).contains(&max_requests)
-        {
-            return Err(RuntimeFailure::InvalidGrant);
-        }
-        let issued_at = unix_seconds()?;
-        let expires_at = issued_at
-            .checked_add(i64::from(ttl_minutes) * 60)
-            .ok_or(RuntimeFailure::Internal)?;
-        let deadline = Instant::now()
-            .checked_add(Duration::from_secs(u64::from(ttl_minutes) * 60))
-            .ok_or(RuntimeFailure::Internal)?;
-        let grant_id = GrantId(Uuid::new_v4());
-        let approval_id = ApprovalId(Uuid::new_v4());
-        let grant = Grant {
-            id: grant_id,
-            principal_id,
-            action,
-            resource,
-            issued_at,
-            expires_at,
-            max_uses: max_requests,
-            uses: 0,
-            revoked: false,
-            nonce: [0; 32],
-            approval_id,
-        };
-        let key = self.token_hash_key.as_ref().ok_or(RuntimeFailure::Locked)?;
-        for _ in 0..4 {
-            let issued = key.issue().map_err(|_| RuntimeFailure::Internal)?;
-            let hash = issued.digest();
-            if let std::collections::btree_map::Entry::Vacant(entry) = self.capabilities.entry(hash)
-            {
-                let mut grant = grant.clone();
-                grant.nonce = issued.nonce();
-                grant.validate().map_err(|_| RuntimeFailure::InvalidGrant)?;
-                entry.insert(CapabilitySession {
-                    grant,
-                    http_constraint: http_constraint.clone(),
-                    deadline,
-                });
-                return Ok(AgentSessionCreated {
-                    token: SensitiveBytes::new(issued.into_token()),
-                    grant_id,
-                    approval_id,
-                    expires_at,
-                    max_requests,
-                });
-            }
-        }
-        Err(RuntimeFailure::Internal)
+        vault
+            .set_secret_http_access(profile, name, constraint)
+            .map_err(|error| map_service_failure(&error))
     }
 
-    fn agent_session_status(
+    fn remove_secret_http_access(
         &mut self,
-        token: Option<&SensitiveBytes>,
-    ) -> Result<AgentSessionView, RuntimeFailure> {
-        self.remove_expired_capabilities();
-        let token = token.ok_or(RuntimeFailure::PermissionDenied)?;
-        let hash = self.token_hash(token.as_slice())?;
-        let view = {
-            let session = self
-                .capabilities
-                .get(&hash)
-                .ok_or(RuntimeFailure::PermissionDenied)?;
-            if session.grant.revoked {
-                return Err(RuntimeFailure::PermissionDenied);
-            }
-            capability_view(session)
-        };
-        self.require_enabled_agent(view.principal_id)?;
-        Ok(view)
+        peer: PeerIdentity,
+        profile: &str,
+        name: &str,
+    ) -> Result<(), RuntimeFailure> {
+        self.require_admin(peer)?;
+        self.vault
+            .as_mut()
+            .ok_or(RuntimeFailure::Locked)?
+            .remove_secret_http_access(profile, name)
+            .map_err(|error| map_service_failure(&error))
     }
 
-    fn agent_context(
+    /// Not admin-gated: succeeds only if `profile` is loaded and a matching
+    /// `secret_http_access` rule exists for this secret - no principal/token.
+    fn prepare_http_request(
         &mut self,
-        token: Option<&SensitiveBytes>,
-    ) -> Result<AgentContext, RuntimeFailure> {
-        self.remove_expired_capabilities();
-        let token = token.ok_or(RuntimeFailure::PermissionDenied)?;
-        let hash = self.token_hash(token.as_slice())?;
-        let session = {
-            let session = self
-                .capabilities
-                .get(&hash)
-                .ok_or(RuntimeFailure::PermissionDenied)?;
-            if session.grant.revoked {
-                return Err(RuntimeFailure::PermissionDenied);
-            }
-            capability_view(session)
-        };
-        self.require_enabled_agent(session.principal_id)?;
-        let vault = self.vault.as_ref().ok_or(RuntimeFailure::Locked)?;
-        let mut active_profile = vault
-            .active_profile()
-            .map_err(|error| map_service_failure(&error))?;
-        active_profile.description = None;
-        Ok(AgentContext {
-            vault_id: vault.vault_id(),
-            active_profile,
-            session,
-        })
+        profile: &str,
+        name: &str,
+        request: envault_protocol::HttpRequest,
+    ) -> Result<envault_service::AgentHttpRequest, RuntimeFailure> {
+        self.vault
+            .as_mut()
+            .ok_or(RuntimeFailure::Locked)?
+            .prepare_http_request(profile, name, request)
+            .map_err(|error| map_service_failure(&error))
     }
 
-    fn require_enabled_agent(&self, principal_id: PrincipalId) -> Result<(), RuntimeFailure> {
-        let principal = self
+    /// Not admin-gated and not loaded-set-gated: naming a profile here is
+    /// itself the explicit action `envault run` requires.
+    fn resolve_run_env(
+        &mut self,
+        profiles: &[String],
+    ) -> Result<Vec<envault_protocol::EnvVar>, RuntimeFailure> {
+        let values = self
             .vault
             .as_ref()
             .ok_or(RuntimeFailure::Locked)?
-            .principals()
-            .map_err(|_| RuntimeFailure::Internal)?
+            .resolve_run_env(profiles)
+            .map_err(|error| map_service_failure(&error))?;
+        Ok(values
             .into_iter()
-            .find(|principal| principal.id == principal_id)
-            .ok_or(RuntimeFailure::PermissionDenied)?;
-        if principal.kind != PrincipalKind::Agent || principal.disabled {
-            return Err(RuntimeFailure::PermissionDenied);
-        }
-        Ok(())
-    }
-
-    fn discover_secrets(
-        &mut self,
-        token: Option<&SensitiveBytes>,
-        request_id: Uuid,
-    ) -> Result<Vec<envault_core::SecretView>, RuntimeFailure> {
-        self.remove_expired_capabilities();
-        let token = token.ok_or(RuntimeFailure::PermissionDenied)?;
-        let hash = self.token_hash(token.as_slice())?;
-        let now = unix_seconds()?;
-        let Self {
-            vault,
-            capabilities,
-            ..
-        } = self;
-        let session = capabilities
-            .get_mut(&hash)
-            .ok_or(RuntimeFailure::PermissionDenied)?;
-        if session.grant.revoked {
-            return Err(RuntimeFailure::PermissionDenied);
-        }
-        vault
-            .as_mut()
-            .ok_or(RuntimeFailure::Locked)?
-            .discover_secrets(&mut session.grant, now, request_id)
-            .map_err(|error| map_service_failure(&error))
-    }
-
-    fn prepare_http_request(
-        &mut self,
-        token: Option<&SensitiveBytes>,
-        secret_id: envault_core::SecretId,
-        request: envault_protocol::HttpRequest,
-        request_id: Uuid,
-    ) -> Result<envault_service::AgentHttpRequest, RuntimeFailure> {
-        self.remove_expired_capabilities();
-        let token = token.ok_or(RuntimeFailure::PermissionDenied)?;
-        let hash = self.token_hash(token.as_slice())?;
-        let now = unix_seconds()?;
-        let Self {
-            vault,
-            capabilities,
-            ..
-        } = self;
-        let session = capabilities
-            .get_mut(&hash)
-            .ok_or(RuntimeFailure::PermissionDenied)?;
-        if session.grant.revoked {
-            return Err(RuntimeFailure::PermissionDenied);
-        }
-        let constraint = session
-            .http_constraint
-            .clone()
-            .ok_or(RuntimeFailure::PermissionDenied)?;
-        vault
-            .as_mut()
-            .ok_or(RuntimeFailure::Locked)?
-            .prepare_agent_http_request(
-                &mut session.grant,
-                constraint,
-                secret_id,
-                request,
-                now,
-                request_id,
-            )
-            .map_err(|error| map_service_failure(&error))
-    }
-
-    fn revoke_agent_session(
-        &mut self,
-        peer: PeerIdentity,
-        grant_id: GrantId,
-    ) -> Result<(), RuntimeFailure> {
-        self.require_admin(peer)?;
-        let hash = self
-            .capabilities
-            .iter()
-            .find_map(|(hash, session)| (session.grant.id == grant_id).then_some(*hash))
-            .ok_or(RuntimeFailure::NotFound)?;
-        self.capabilities.remove(&hash);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn consume_capability(
-        &mut self,
-        token: &[u8],
-        action: Action,
-        resource: ResourceSelector,
-    ) -> Result<PrincipalId, RuntimeFailure> {
-        self.remove_expired_capabilities();
-        let hash = self.token_hash(token)?;
-        let session = self
-            .capabilities
-            .get_mut(&hash)
-            .ok_or(RuntimeFailure::PermissionDenied)?;
-        if session.grant.revoked
-            || session.grant.action != action
-            || session.grant.resource != resource
-            || session.grant.uses >= session.grant.max_uses
-        {
-            return Err(RuntimeFailure::PermissionDenied);
-        }
-        session.grant.uses = session
-            .grant
-            .uses
-            .checked_add(1)
-            .ok_or(RuntimeFailure::Internal)?;
-        Ok(session.grant.principal_id)
-    }
-
-    fn token_hash(&self, token: &[u8]) -> Result<[u8; 32], RuntimeFailure> {
-        if token.len() != 32 {
-            return Err(RuntimeFailure::PermissionDenied);
-        }
-        let key = self.token_hash_key.as_ref().ok_or(RuntimeFailure::Locked)?;
-        Ok(key.digest(token))
+            .map(|(name, value)| envault_protocol::EnvVar {
+                name,
+                value: SensitiveBytes::new(value.into_vec()),
+            })
+            .collect())
     }
 
     fn require_admin(&mut self, peer: PeerIdentity) -> Result<(), RuntimeFailure> {
@@ -530,23 +290,21 @@ impl RuntimeState {
         }
     }
 
+    /// Scoped by `uid` alone (not `session_id`): unlocking admin from any
+    /// terminal covers every session of that same OS user, so a human can
+    /// step up from a second terminal without interrupting an agent running
+    /// in the first one.
     fn admin_lease_active(&mut self, peer: PeerIdentity) -> bool {
-        if self
-            .admin_lease
-            .as_ref()
-            .is_some_and(|lease| Instant::now() >= lease.deadline)
-        {
+        if self.admin_lease.as_ref().is_some_and(|lease| {
+            lease
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        }) {
             self.admin_lease = None;
         }
         self.admin_lease
             .as_ref()
-            .is_some_and(|lease| lease.uid == peer.uid && lease.session_id == peer.session_id)
-    }
-
-    fn remove_expired_capabilities(&mut self) {
-        let now = Instant::now();
-        self.capabilities
-            .retain(|_, session| now < session.deadline);
+            .is_some_and(|lease| lease.uid == peer.uid)
     }
 
     fn rate_window(&mut self, peer: PeerIdentity) -> Result<&mut RateWindow, RuntimeFailure> {
@@ -635,7 +393,6 @@ enum RuntimeFailure {
     AdminRequired,
     PermissionDenied,
     InvalidTtl,
-    InvalidGrant,
     InvalidInput,
     Io,
     PackageError,
@@ -644,6 +401,7 @@ enum RuntimeFailure {
     PlaintextAcknowledgementRequired,
     Conflict,
     NotFound,
+    ProfileNotLoaded,
     RequestRejected,
     ResponseRejected,
     ProviderRejected(u16),
@@ -711,8 +469,7 @@ impl Server {
         envault_platform::set_private_socket_permissions(&config.socket_path)?;
         let socket_guard = SocketGuard::new(config.socket_path.clone())?;
         let owner_uid = std::fs::metadata(&config.runtime_directory)?.uid();
-        let state = RuntimeState::new(vault, config.database_path.clone())
-            .map_err(|_| DaemonError::BootstrapProtocol)?;
+        let state = RuntimeState::new(vault, config.database_path.clone());
         Ok(Self {
             listener,
             state: Arc::new(Mutex::new(state)),
@@ -798,8 +555,7 @@ impl Server {
         drop(sensitive);
         let pipe_name = crate::client::windows_pipe_name(&config.socket_path);
         let listener = envault_windows_ffi::create_named_pipe_server(&pipe_name, true)?;
-        let state = RuntimeState::new(vault, config.database_path.clone())
-            .map_err(|_| DaemonError::BootstrapProtocol)?;
+        let state = RuntimeState::new(vault, config.database_path.clone());
         Ok(Self {
             listener,
             pipe_name,
@@ -1036,12 +792,11 @@ async fn process_decoded_request(
     let request_id = request.request_id;
     validate_version(request.version)
         .map_err(|_| (request_id, RuntimeFailure::ProtocolMismatch))?;
-    if request.body.capability_token.is_some() && !request.body.operation.accepts_agent_capability()
-    {
-        return Err((request_id, RuntimeFailure::PermissionDenied));
-    }
     if let Operation::AdminUnlock { ttl_minutes, .. } = &request.body.operation {
-        validate_admin_lease(*ttl_minutes).map_err(|_| (request_id, RuntimeFailure::InvalidTtl))?;
+        if let Some(ttl_minutes) = ttl_minutes {
+            validate_admin_lease(*ttl_minutes)
+                .map_err(|_| (request_id, RuntimeFailure::InvalidTtl))?;
+        }
         state
             .try_lock()
             .map_err(|_| (request_id, RuntimeFailure::Busy))?
@@ -1049,7 +804,6 @@ async fn process_decoded_request(
             .map_err(|failure| (request_id, failure))?;
     }
     let operation = request.body.operation;
-    let capability_token = request.body.capability_token;
     let result = match operation {
         Operation::AdminUnlock {
             password,
@@ -1063,11 +817,15 @@ async fn process_decoded_request(
         )
         .await
         .map(|status| (Reply::AdminStatus(status), false)),
-        Operation::HttpRequest { secret_id, request } => {
+        Operation::HttpRequest {
+            profile,
+            name,
+            request,
+        } => {
             let prepared = state
                 .try_lock()
                 .map_err(|_| (request_id, RuntimeFailure::Busy))?
-                .prepare_http_request(capability_token.as_ref(), secret_id, request, request_id)
+                .prepare_http_request(&profile, &name, request)
                 .map_err(|failure| (request_id, failure))?;
             execute_agent_http_request(prepared)
                 .await
@@ -1080,7 +838,7 @@ async fn process_decoded_request(
                 state
                     .try_lock()
                     .map_err(|_| RuntimeFailure::Busy)?
-                    .handle(peer, operation, None, request_id)
+                    .handle(peer, operation)
             })
             .await
             .map_err(|_| (request_id, RuntimeFailure::Internal))?
@@ -1088,7 +846,7 @@ async fn process_decoded_request(
         operation => state
             .try_lock()
             .map_err(|_| (request_id, RuntimeFailure::Busy))?
-            .handle(peer, operation, capability_token.as_ref(), request_id),
+            .handle(peer, operation),
     };
     let (reply, stop) = result.map_err(|failure| (request_id, failure))?;
     Ok((
@@ -1106,12 +864,9 @@ impl RuntimeState {
         &mut self,
         peer: PeerIdentity,
         operation: Operation,
-        token: Option<&SensitiveBytes>,
-        request_id: Uuid,
     ) -> Result<(Reply, bool), RuntimeFailure> {
         match operation {
             Operation::Status => Ok((Reply::Status(self.status(peer)?), false)),
-            Operation::Context => Ok((Reply::Context(self.agent_context(token)?), false)),
             Operation::Lock => {
                 if self.vault.is_none() {
                     return Ok((Reply::Acknowledged { no_op: true }, false));
@@ -1133,50 +888,55 @@ impl RuntimeState {
                 self.clear_admin_lease(peer)?;
                 Ok((Reply::Acknowledged { no_op: false }, false))
             }
-            Operation::CreateAgentSession {
-                principal_id,
-                action,
-                resource,
-                http_constraint,
-                ttl_minutes,
-                max_requests,
-            } => Ok((
-                Reply::AgentSessionCreated(self.create_agent_session(
-                    peer,
-                    AgentSessionSpec {
-                        principal_id,
-                        action,
-                        resource,
-                        http_constraint,
-                        ttl_minutes,
-                        max_requests,
-                    },
-                )?),
-                false,
-            )),
-            Operation::AgentSessionStatus => Ok((
-                Reply::AgentSessionStatus(self.agent_session_status(token)?),
-                false,
-            )),
-            Operation::RevokeAgentSession { grant_id } => {
-                self.revoke_agent_session(peer, grant_id)?;
+            Operation::SetSecretHttpAccess {
+                profile,
+                name,
+                constraint,
+            } => {
+                self.set_secret_http_access(peer, &profile, &name, constraint)?;
                 Ok((Reply::Acknowledged { no_op: false }, false))
             }
-            operation @ (Operation::CreatePrincipal { .. }
-            | Operation::ListPrincipals
-            | Operation::SetPrincipalDisabled { .. }
-            | Operation::CreatePolicyRule { .. }
-            | Operation::ListPolicyRules) => self.handle_security_configuration(peer, operation),
+            Operation::RemoveSecretHttpAccess { profile, name } => {
+                self.remove_secret_http_access(peer, &profile, &name)?;
+                Ok((Reply::Acknowledged { no_op: false }, false))
+            }
+            Operation::RunEnv { profiles } => {
+                let vars = self.resolve_run_env(&profiles)?;
+                Ok((Reply::RunEnv(vars), false))
+            }
+            Operation::RevealSecretValue {
+                profile,
+                name,
+                version,
+            } => {
+                self.require_admin(peer)?;
+                let value = self
+                    .vault
+                    .as_ref()
+                    .ok_or(RuntimeFailure::Locked)?
+                    .reveal_secret_value(&profile, &name, version)
+                    .map_err(|error| map_service_failure(&error))?;
+                Ok((
+                    Reply::SecretPlaintext(SensitiveBytes::new(value.into_vec())),
+                    false,
+                ))
+            }
             operation @ (Operation::CreateProfile { .. }
             | Operation::ShowProfile { .. }
             | Operation::ListProfiles
             | Operation::UpdateProfile { .. }
             | Operation::RenameProfile { .. }
             | Operation::DeleteProfile { .. }
-            | Operation::ActivateProfile { .. }) => self.handle_profile(peer, operation),
+            | Operation::LoadProfile { .. }
+            | Operation::UnloadProfile { .. }) => self.handle_profile(peer, operation),
+            operation @ (Operation::CreateWorkspace { .. }
+            | Operation::ListWorkspaces
+            | Operation::ShowWorkspace { .. }
+            | Operation::LoadWorkspace { .. }) => self.handle_workspace(peer, operation),
             operation @ (Operation::CreateSecret { .. }
             | Operation::CreateGeneratedSecret { .. }
             | Operation::ListSecrets
+            | Operation::ListResolvedSecrets { .. }
             | Operation::DescribeSecret { .. }
             | Operation::UpdateSecret { .. }
             | Operation::RenameSecret { .. }
@@ -1190,60 +950,10 @@ impl RuntimeState {
             | Operation::PreviewEnvImport { .. }
             | Operation::CommitEnvImport { .. }
             | Operation::ExportPlaintextEnv { .. }) => self.handle_portability(peer, operation),
-            Operation::DiscoverSecrets => Ok((
-                Reply::Secrets(self.discover_secrets(token, request_id)?),
-                false,
-            )),
             Operation::HttpRequest { .. } | Operation::AdminUnlock { .. } => {
                 Err(RuntimeFailure::Internal)
             }
         }
-    }
-
-    fn handle_security_configuration(
-        &mut self,
-        peer: PeerIdentity,
-        operation: Operation,
-    ) -> Result<(Reply, bool), RuntimeFailure> {
-        self.require_admin(peer)?;
-        let vault = self.vault.as_mut().ok_or(RuntimeFailure::Locked)?;
-        let reply = match operation {
-            Operation::CreatePrincipal { kind, name } => Reply::Principal(
-                vault
-                    .create_principal(kind, &name)
-                    .map_err(|error| map_service_failure(&error))?,
-            ),
-            Operation::ListPrincipals => Reply::Principals(
-                vault
-                    .principals()
-                    .map_err(|error| map_service_failure(&error))?,
-            ),
-            Operation::SetPrincipalDisabled {
-                principal_id,
-                disabled,
-            } => Reply::Principal(
-                vault
-                    .set_principal_disabled(principal_id, disabled)
-                    .map_err(|error| map_service_failure(&error))?,
-            ),
-            Operation::CreatePolicyRule {
-                principal_id,
-                effect,
-                action,
-                resource,
-            } => Reply::PolicyRule(
-                vault
-                    .create_policy_rule(principal_id, effect, action, resource)
-                    .map_err(|error| map_service_failure(&error))?,
-            ),
-            Operation::ListPolicyRules => Reply::PolicyRules(
-                vault
-                    .policy_rules()
-                    .map_err(|error| map_service_failure(&error))?,
-            ),
-            _ => return Err(RuntimeFailure::Internal),
-        };
-        Ok((reply, false))
     }
 
     fn handle_profile(
@@ -1274,10 +984,18 @@ impl RuntimeState {
         self.require_admin(peer)?;
         let vault = self.vault.as_mut().ok_or(RuntimeFailure::Locked)?;
         let reply = match operation {
-            Operation::CreateProfile { name, description } => Reply::Profile(
-                vault
-                    .create_profile(&name, description.as_deref())
-                    .map_err(|error| map_service_failure(&error))?,
+            Operation::CreateProfile {
+                name,
+                description,
+                workspace,
+            } => Reply::Profile(
+                match &workspace {
+                    Some(workspace) => {
+                        vault.create_profile_in_workspace(workspace, &name, description.as_deref())
+                    }
+                    None => vault.create_profile(&name, description.as_deref()),
+                }
+                .map_err(|error| map_service_failure(&error))?,
             ),
             Operation::UpdateProfile { name, description } => Reply::Profile(
                 vault
@@ -1294,9 +1012,57 @@ impl RuntimeState {
                 Err(ServiceError::NotFound) => Reply::Acknowledged { no_op: true },
                 Err(error) => return Err(map_service_failure(&error)),
             },
-            Operation::ActivateProfile { name } => Reply::Profile(
+            Operation::LoadProfile { name } => Reply::Profile(
                 vault
-                    .activate_profile(&name)
+                    .load_profile(&name)
+                    .map_err(|error| map_service_failure(&error))?,
+            ),
+            Operation::UnloadProfile { name } => Reply::Profile(
+                vault
+                    .unload_profile(&name)
+                    .map_err(|error| map_service_failure(&error))?,
+            ),
+            _ => return Err(RuntimeFailure::Internal),
+        };
+        Ok((reply, false))
+    }
+
+    fn handle_workspace(
+        &mut self,
+        peer: PeerIdentity,
+        operation: Operation,
+    ) -> Result<(Reply, bool), RuntimeFailure> {
+        if matches!(
+            operation,
+            Operation::ListWorkspaces | Operation::ShowWorkspace { .. }
+        ) {
+            let vault = self.vault.as_ref().ok_or(RuntimeFailure::Locked)?;
+            let reply = match operation {
+                Operation::ListWorkspaces => Reply::Workspaces(
+                    vault
+                        .workspaces()
+                        .map_err(|error| map_service_failure(&error))?,
+                ),
+                Operation::ShowWorkspace { name } => Reply::WorkspaceProfiles(
+                    vault
+                        .profiles_in_workspace(&name)
+                        .map_err(|error| map_service_failure(&error))?,
+                ),
+                _ => return Err(RuntimeFailure::Internal),
+            };
+            return Ok((reply, false));
+        }
+        self.require_admin(peer)?;
+        let vault = self.vault.as_mut().ok_or(RuntimeFailure::Locked)?;
+        let reply = match operation {
+            Operation::CreateWorkspace { name } => Reply::Workspace(
+                vault
+                    .create_workspace(&name)
+                    .map_err(|error| map_service_failure(&error))?,
+            ),
+            Operation::LoadWorkspace { name } => Reply::WorkspaceProfiles(
+                vault
+                    .load_workspace(&name)
                     .map_err(|error| map_service_failure(&error))?,
             ),
             _ => return Err(RuntimeFailure::Internal),
@@ -1312,6 +1078,7 @@ impl RuntimeState {
         if matches!(
             operation,
             Operation::ListSecrets
+                | Operation::ListResolvedSecrets { .. }
                 | Operation::DescribeSecret { .. }
                 | Operation::ListSecretVersions { .. }
         ) {
@@ -1329,14 +1096,19 @@ impl RuntimeState {
                     .secrets()
                     .map_err(|error| map_service_failure(&error))?,
             ),
-            Operation::DescribeSecret { name } => Reply::Secret(
+            Operation::ListResolvedSecrets { profile } => Reply::ResolvedSecrets(
                 vault
-                    .secret(&name)
+                    .secrets_in_profile(&profile)
                     .map_err(|error| map_service_failure(&error))?,
             ),
-            Operation::ListSecretVersions { name } => Reply::SecretVersions(
+            Operation::DescribeSecret { profile, name } => Reply::Secret(
                 vault
-                    .secret_versions(&name)
+                    .secret(&profile, &name)
+                    .map_err(|error| map_service_failure(&error))?,
+            ),
+            Operation::ListSecretVersions { profile, name } => Reply::SecretVersions(
+                vault
+                    .secret_versions(&profile, &name)
                     .map_err(|error| map_service_failure(&error))?,
             ),
             _ => return Err(RuntimeFailure::Internal),
@@ -1351,12 +1123,14 @@ impl RuntimeState {
         let vault = self.vault.as_mut().ok_or(RuntimeFailure::Locked)?;
         let reply = match operation {
             Operation::CreateSecret {
+                profile,
                 name,
                 description,
                 value,
             } => Reply::Secret(
                 vault
                     .create_secret(
+                        &profile,
                         &name,
                         description.as_deref(),
                         SensitiveInput::new(value.into_vec()),
@@ -1364,37 +1138,56 @@ impl RuntimeState {
                     .map_err(|error| map_service_failure(&error))?,
             ),
             Operation::CreateGeneratedSecret {
+                profile,
                 name,
                 description,
                 generator,
             } => Reply::Secret(
                 vault
-                    .create_generated_secret(&name, description.as_deref(), generator)
+                    .create_generated_secret(&profile, &name, description.as_deref(), generator)
                     .map_err(|error| map_service_failure(&error))?,
             ),
-            Operation::UpdateSecret { name, description } => Reply::Secret(
+            Operation::UpdateSecret {
+                profile,
+                name,
+                description,
+            } => Reply::Secret(
                 vault
-                    .update_secret(&name, description.as_deref())
+                    .update_secret(&profile, &name, description.as_deref())
                     .map_err(|error| map_service_failure(&error))?,
             ),
-            Operation::RenameSecret { old_name, new_name } => Reply::Secret(
+            Operation::RenameSecret {
+                profile,
+                old_name,
+                new_name,
+            } => Reply::Secret(
                 vault
-                    .rename_secret(&old_name, &new_name)
+                    .rename_secret(&profile, &old_name, &new_name)
                     .map_err(|error| map_service_failure(&error))?,
             ),
-            Operation::DeleteSecret { name } => match vault.delete_secret(&name) {
-                Ok(()) => Reply::Acknowledged { no_op: false },
-                Err(ServiceError::NotFound) => Reply::Acknowledged { no_op: true },
-                Err(error) => return Err(map_service_failure(&error)),
-            },
-            Operation::SetSecretValue { name, value } => Reply::SecretVersion(
+            Operation::DeleteSecret { profile, name } => {
+                match vault.delete_secret(&profile, &name) {
+                    Ok(()) => Reply::Acknowledged { no_op: false },
+                    Err(ServiceError::NotFound) => Reply::Acknowledged { no_op: true },
+                    Err(error) => return Err(map_service_failure(&error)),
+                }
+            }
+            Operation::SetSecretValue {
+                profile,
+                name,
+                value,
+            } => Reply::SecretVersion(
                 vault
-                    .set_secret_value(&name, SensitiveInput::new(value.into_vec()))
+                    .set_secret_value(&profile, &name, SensitiveInput::new(value.into_vec()))
                     .map_err(|error| map_service_failure(&error))?,
             ),
-            Operation::GenerateSecretValue { name, generator } => Reply::SecretVersion(
+            Operation::GenerateSecretValue {
+                profile,
+                name,
+                generator,
+            } => Reply::SecretVersion(
                 vault
-                    .generate_secret_value(&name, generator)
+                    .generate_secret_value(&profile, &name, generator)
                     .map_err(|error| map_service_failure(&error))?,
             ),
             _ => return Err(RuntimeFailure::Internal),
@@ -1408,7 +1201,6 @@ impl RuntimeState {
         operation: Operation,
     ) -> Result<(Reply, bool), RuntimeFailure> {
         self.require_admin(peer)?;
-        let revoke_capabilities = revokes_capabilities_after_success(&operation);
         let vault = self.vault.as_mut().ok_or(RuntimeFailure::Locked)?;
         let reply = match operation {
             Operation::ExportPackage { .. }
@@ -1423,9 +1215,6 @@ impl RuntimeState {
             }
             _ => return Err(RuntimeFailure::Internal),
         };
-        if revoke_capabilities {
-            self.capabilities.clear();
-        }
         Ok((reply, false))
     }
 
@@ -1552,18 +1341,16 @@ impl RuntimeState {
     }
 }
 
-const fn revokes_capabilities_after_success(operation: &Operation) -> bool {
-    matches!(operation, Operation::CommitPackageImport { .. })
-}
-
 async fn authenticate_admin(
     state: &Arc<Mutex<RuntimeState>>,
     peer: PeerIdentity,
     password: SensitiveBytes,
-    ttl_minutes: u8,
+    ttl_minutes: Option<u8>,
     authentication: Arc<Semaphore>,
 ) -> Result<AdminLeaseStatus, RuntimeFailure> {
-    validate_admin_lease(ttl_minutes).map_err(|_| RuntimeFailure::InvalidTtl)?;
+    if let Some(ttl_minutes) = ttl_minutes {
+        validate_admin_lease(ttl_minutes).map_err(|_| RuntimeFailure::InvalidTtl)?;
+    }
     let database_path = {
         let state = state.try_lock().map_err(|_| RuntimeFailure::Busy)?;
         if state.vault.is_none() {
@@ -1592,25 +1379,13 @@ async fn authenticate_admin(
         .issue_admin_lease(peer, ttl_minutes)
 }
 
-fn capability_view(session: &CapabilitySession) -> AgentSessionView {
-    AgentSessionView {
-        grant_id: session.grant.id,
-        principal_id: session.grant.principal_id,
-        action: session.grant.action,
-        resource: session.grant.resource,
-        http_constraint: session.http_constraint.clone(),
-        expires_at: session.grant.expires_at,
-        remaining_requests: session.grant.max_uses.saturating_sub(session.grant.uses),
-        revoked: session.grant.revoked,
-    }
-}
-
 fn map_service_failure(error: &ServiceError) -> RuntimeFailure {
     match error {
         ServiceError::AuthenticationFailed => RuntimeFailure::AuthenticationFailed,
         ServiceError::PermissionDenied => RuntimeFailure::PermissionDenied,
         ServiceError::Conflict | ServiceError::StartupProfileRequired => RuntimeFailure::Conflict,
         ServiceError::NotFound => RuntimeFailure::NotFound,
+        ServiceError::ProfileNotLoaded => RuntimeFailure::ProfileNotLoaded,
         ServiceError::Corrupt | ServiceError::Store(_) => RuntimeFailure::Corrupt,
         ServiceError::Invariant(_) | ServiceError::InvalidPasswordLength => {
             RuntimeFailure::InvalidInput
@@ -1695,12 +1470,6 @@ fn failure_details(failure: RuntimeFailure) -> FailureDetails {
             "Choose a supported lease duration",
             false,
         ),
-        RuntimeFailure::InvalidGrant => (
-            "invalid_grant",
-            "capability grant violates security bounds",
-            "Use an agent-safe action and bounded lifetime",
-            false,
-        ),
         RuntimeFailure::InvalidInput => (
             "invalid_input",
             "the request violates the EnVault contract",
@@ -1728,6 +1497,12 @@ fn failure_details(failure: RuntimeFailure) -> FailureDetails {
             "not_found",
             "the requested resource was not found",
             "Refresh the current EnVault context",
+            false,
+        ),
+        RuntimeFailure::ProfileNotLoaded => (
+            "profile_not_loaded",
+            "the profile is not loaded in this session",
+            "Run `envault profile load \"<profile>\"` first",
             false,
         ),
         failure @ (RuntimeFailure::RequestRejected
@@ -2008,31 +1783,34 @@ mod tests {
         let password = SensitiveInput::copy_from_slice(b"daemon test password");
         envault_service::initialize_with_recommended_kdf(&path, &password).expect("initialize");
         let vault = VaultSession::unlock(&path, &password).expect("unlock");
-        (
-            directory,
-            RuntimeState::new(vault, path).expect("state"),
-            password,
-        )
+        (directory, RuntimeState::new(vault, path), password)
     }
 
     #[test]
-    fn lock_clears_vault_leases_tokens_and_hash_key() {
+    fn lock_clears_vault_and_admin_lease() {
         let (_directory, mut state, _password) = state();
-        state.issue_admin_lease(peer(), 5).expect("lease");
-        let mut unrelated = peer();
-        unrelated.session_id += 1;
-        assert!(!state.admin_lease_active(unrelated));
+        state.issue_admin_lease(peer(), Some(5)).expect("lease");
+        // Scoped by uid alone: a different terminal (different session_id,
+        // same uid) still sees the lease as active - the whole point of the
+        // uid-scoped step-up (Phase 5).
+        let mut other_session = peer();
+        other_session.session_id += 1;
+        assert!(state.admin_lease_active(other_session));
+        // A different uid entirely must never see it.
+        let mut other_uid = peer();
+        other_uid.uid += 1;
+        assert!(!state.admin_lease_active(other_uid));
         assert!(state.admin_lease.is_some());
         assert!(state.require_admin(peer()).is_ok());
-        state.admin_lease.as_mut().expect("lease").deadline = Instant::now();
+        state.admin_lease.as_mut().expect("lease").deadline = Some(Instant::now());
         assert!(!state.admin_lease_active(peer()));
         assert!(state.admin_lease.is_none());
-        state.issue_admin_lease(peer(), 5).expect("renew lease");
+        state
+            .issue_admin_lease(peer(), Some(5))
+            .expect("renew lease");
         state.lock();
         assert!(state.vault.is_none());
         assert!(state.admin_lease.is_none());
-        assert!(state.capabilities.is_empty());
-        assert!(state.token_hash_key.is_none());
     }
 
     #[cfg(unix)]
@@ -2143,10 +1921,9 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 request_id,
                 body: AuthenticatedRequest {
-                    capability_token: None,
                     operation: Operation::AdminUnlock {
                         password: SensitiveBytes::new(b"daemon test password".to_vec()),
-                        ttl_minutes: 5,
+                        ttl_minutes: Some(5),
                     },
                 },
             },
@@ -2181,156 +1958,5 @@ mod tests {
         assert_eq!(error.code, "request_timeout");
         assert!(!error.retryable);
         assert!(error.help[0].contains("Preview current state"));
-    }
-
-    #[test]
-    fn package_commit_is_an_agent_capability_revocation_boundary() {
-        assert!(revokes_capabilities_after_success(
-            &Operation::CommitPackageImport {
-                expected_kind: PackageKind::Workspace,
-                input_path: "/tmp/workspace.envault-workspace".into(),
-                transfer_password: None,
-                age_identity_path: None,
-                strategy: ImportConflictStrategy::Replace,
-                rename_to: None,
-                expected_plan_hash: "plan".into(),
-            }
-        ));
-        assert!(!revokes_capabilities_after_success(
-            &Operation::PreviewPackageImport {
-                expected_kind: PackageKind::Workspace,
-                input_path: "/tmp/workspace.envault-workspace".into(),
-                transfer_password: None,
-                age_identity_path: None,
-                strategy: ImportConflictStrategy::Replace,
-                rename_to: None,
-            }
-        ));
-    }
-
-    #[test]
-    fn capability_is_hashed_bounded_revocable_and_privilege_safe() {
-        let (_directory, mut state, _password) = state();
-        let principal = state
-            .vault
-            .as_mut()
-            .expect("vault")
-            .create_principal(PrincipalKind::Agent, "agent:test")
-            .expect("principal");
-        let vault_id = state.vault.as_ref().expect("vault").vault_id();
-        state.issue_admin_lease(peer(), 5).expect("lease");
-        assert!(matches!(
-            state.create_agent_session(
-                peer(),
-                AgentSessionSpec {
-                    principal_id: principal.id,
-                    action: Action::Reveal,
-                    resource: ResourceSelector::Vault(vault_id),
-                    http_constraint: None,
-                    ttl_minutes: 15,
-                    max_requests: 1,
-                },
-            ),
-            Err(RuntimeFailure::InvalidGrant)
-        ));
-        let created = state
-            .create_agent_session(
-                peer(),
-                AgentSessionSpec {
-                    principal_id: principal.id,
-                    action: Action::Discover,
-                    resource: ResourceSelector::Vault(vault_id),
-                    http_constraint: None,
-                    ttl_minutes: envault_core::DEFAULT_AGENT_GRANT_MINUTES,
-                    max_requests: 1,
-                },
-            )
-            .expect("capability");
-        let token = created.token.into_vec();
-        assert_eq!(token.len(), 32);
-        let raw_token: [u8; 32] = token.as_slice().try_into().expect("token array");
-        assert!(!state.capabilities.contains_key(&raw_token));
-        assert_eq!(
-            state
-                .consume_capability(&token, Action::Discover, ResourceSelector::Vault(vault_id))
-                .expect("consume"),
-            principal.id
-        );
-        assert!(matches!(
-            state.consume_capability(&token, Action::Discover, ResourceSelector::Vault(vault_id)),
-            Err(RuntimeFailure::PermissionDenied)
-        ));
-        state
-            .revoke_agent_session(peer(), created.grant_id)
-            .expect("revoke");
-        assert!(state.capabilities.is_empty());
-        assert!(matches!(
-            state.agent_session_status(Some(&SensitiveBytes::new(token.clone()))),
-            Err(RuntimeFailure::PermissionDenied)
-        ));
-        let expiring = state
-            .create_agent_session(
-                peer(),
-                AgentSessionSpec {
-                    principal_id: principal.id,
-                    action: Action::Discover,
-                    resource: ResourceSelector::Vault(vault_id),
-                    http_constraint: None,
-                    ttl_minutes: envault_core::DEFAULT_AGENT_GRANT_MINUTES,
-                    max_requests: 1,
-                },
-            )
-            .expect("expiring capability");
-        let expiring_token = expiring.token.into_vec();
-        state
-            .capabilities
-            .values_mut()
-            .next()
-            .expect("session")
-            .deadline = Instant::now();
-        assert!(matches!(
-            state.agent_session_status(Some(&SensitiveBytes::new(expiring_token))),
-            Err(RuntimeFailure::PermissionDenied)
-        ));
-        assert!(state.capabilities.is_empty());
-    }
-
-    #[test]
-    fn disabled_principal_cannot_inspect_an_existing_capability() {
-        let (_directory, mut state, _password) = state();
-        let vault = state.vault.as_mut().expect("vault");
-        let principal = vault
-            .create_principal(PrincipalKind::Agent, "agent:disabled")
-            .expect("principal");
-        let vault_id = vault.vault_id();
-        state.issue_admin_lease(peer(), 5).expect("lease");
-        let created = state
-            .create_agent_session(
-                peer(),
-                AgentSessionSpec {
-                    principal_id: principal.id,
-                    action: Action::Discover,
-                    resource: ResourceSelector::Vault(vault_id),
-                    http_constraint: None,
-                    ttl_minutes: envault_core::DEFAULT_AGENT_GRANT_MINUTES,
-                    max_requests: 1,
-                },
-            )
-            .expect("capability");
-        let token = SensitiveBytes::new(created.token.into_vec());
-        state
-            .vault
-            .as_mut()
-            .expect("vault")
-            .set_principal_disabled(principal.id, true)
-            .expect("disable principal");
-        assert_eq!(
-            state.agent_session_status(Some(&token)),
-            Err(RuntimeFailure::PermissionDenied)
-        );
-        assert_eq!(
-            state.agent_context(Some(&token)),
-            Err(RuntimeFailure::PermissionDenied)
-        );
     }
 }

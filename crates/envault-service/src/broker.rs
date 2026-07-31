@@ -1,12 +1,12 @@
-use envault_broker::{
-    BrokerError, HttpConstraint, HttpRequest, HttpResponse, PreparedHttpRequest,
-    normalize_constraint, prepare_bearer_request, validate_http_request,
-};
-use envault_core::{ProfileView, SecretStatus, SecretView};
-use envault_policy::{Action, Decision, Grant, Request, ResourceSelector, authorize};
-use uuid::Uuid;
+use std::str::FromStr;
 
-use super::{ServiceError, VaultSession};
+use envault_broker::{
+    BrokerError, HttpConstraint, HttpMethod, HttpRequest, HttpResponse, PreparedHttpRequest,
+    normalize_constraint, prepare_bearer_request,
+};
+use envault_store::SecretHttpAccessRecord;
+
+use super::{EntityKind, ServiceError, VaultSession};
 
 pub struct AgentHttpRequest(PreparedHttpRequest);
 
@@ -66,114 +66,101 @@ pub fn classify_broker_failure(error: &BrokerError) -> BrokerFailure {
 }
 
 impl VaultSession {
-    pub fn active_profile(&self) -> Result<ProfileView, ServiceError> {
-        self.profiles()?
-            .into_iter()
-            .find(|profile| profile.activate_on_start)
-            .ok_or(ServiceError::Corrupt)
-    }
-
-    pub fn discover_secrets(
+    /// Configures (or replaces) the HTTP allowlist rule for one secret -
+    /// the only thing standing between an agent-driven request and the
+    /// broker actually calling out. Requires the secret's profile to be
+    /// loaded (mirrors `profile load ... --action http`).
+    pub fn set_secret_http_access(
         &mut self,
-        grant: &mut Grant,
-        now: i64,
-        request_id: Uuid,
-    ) -> Result<Vec<SecretView>, ServiceError> {
-        if grant.action != Action::Discover {
-            return Err(ServiceError::PermissionDenied);
-        }
-        let principal_id = grant.principal_id;
-        let resource = grant.resource;
-        let explanation = self.explain_policy(
-            principal_id,
-            Action::Discover,
-            resource,
-            Some(grant),
-            now,
-            request_id,
-        )?;
-        if explanation.decision != Decision::Allow {
-            return Err(ServiceError::PermissionDenied);
-        }
-
-        let candidates = match resource {
-            ResourceSelector::Vault(vault_id) if vault_id == self.vault_id => self
-                .resolved_secrets(self.active_profile()?.scope_id)?
-                .into_iter()
-                .map(|resolved| resolved.secret)
-                .collect::<Vec<_>>(),
-            ResourceSelector::ScopeTree(scope_id) => self
-                .resolved_secrets(scope_id)?
-                .into_iter()
-                .map(|resolved| resolved.secret)
-                .collect::<Vec<_>>(),
-            ResourceSelector::Secret(secret_id) => {
-                let record = self
-                    .store
-                    .secret_by_id(secret_id)?
-                    .ok_or(ServiceError::NotFound)?;
-                vec![self.secret_view(&record)?]
-            }
-            ResourceSelector::Vault(_) => return Err(ServiceError::NotFound),
-        };
-
-        let rules = self.policy_rules()?;
-        let mut filtered = Vec::new();
-        for secret in candidates
-            .into_iter()
-            .filter(|secret| secret.status == SecretStatus::Active)
-        {
-            let (scope_chain, secret_id) =
-                self.resource_context(ResourceSelector::Secret(secret.id))?;
-            let explanation = authorize(
-                &rules,
-                Request {
-                    principal_id,
-                    action: Action::Discover,
-                    vault_id: self.vault_id,
-                    scope_chain: &scope_chain,
-                    secret_id,
-                },
-                None,
-                now,
-            )?;
-            if explanation.decision != Decision::DenyExplicit {
-                filtered.push(secret);
-            }
-        }
-        Ok(filtered)
-    }
-
-    pub fn prepare_agent_http_request(
-        &mut self,
-        grant: &mut Grant,
+        profile: &str,
+        name: &str,
         constraint: HttpConstraint,
-        secret_id: envault_core::SecretId,
+    ) -> Result<(), ServiceError> {
+        let constraint = normalize_agent_http_constraint(constraint)?;
+        let secret = self.secret_by_ref(profile, name, true)?;
+        let record = SecretHttpAccessRecord {
+            secret_id: secret.id,
+            encrypted_host: self.encrypt_entity_text(
+                EntityKind::Secret,
+                secret.id.0,
+                "http_host",
+                &constraint.host,
+            )?,
+            port: constraint.port,
+            methods: constraint
+                .methods
+                .iter()
+                .map(HttpMethod::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            encrypted_path_prefix: self.encrypt_entity_text(
+                EntityKind::Secret,
+                secret.id.0,
+                "http_path_prefix",
+                &constraint.path_prefix,
+            )?,
+            max_request_bytes: u64::try_from(constraint.max_request_bytes)
+                .map_err(|_| ServiceError::Corrupt)?,
+            max_response_bytes: u64::try_from(constraint.max_response_bytes)
+                .map_err(|_| ServiceError::Corrupt)?,
+        };
+        self.store.set_secret_http_access(&record)?;
+        Ok(())
+    }
+
+    pub fn remove_secret_http_access(
+        &mut self,
+        profile: &str,
+        name: &str,
+    ) -> Result<(), ServiceError> {
+        let secret = self.secret_by_ref(profile, name, false)?;
+        self.store.remove_secret_http_access(secret.id)?;
+        Ok(())
+    }
+
+    /// Prepares an agent-driven HTTP call: the secret must be loaded and
+    /// have an allowlist rule matching this request's host/port/method/path;
+    /// the plaintext credential goes straight into the broker, never back
+    /// to the caller.
+    pub fn prepare_http_request(
+        &mut self,
+        profile: &str,
+        name: &str,
         request: HttpRequest,
-        now: i64,
-        request_id: Uuid,
     ) -> Result<AgentHttpRequest, ServiceError> {
-        validate_http_request(&request, &constraint)?;
-        if grant.action != Action::HttpRequest
-            || grant.resource != ResourceSelector::Secret(secret_id)
-        {
-            return Err(ServiceError::PermissionDenied);
-        }
-        let explanation = self.explain_policy(
-            grant.principal_id,
-            Action::HttpRequest,
-            ResourceSelector::Secret(secret_id),
-            Some(grant),
-            now,
-            request_id,
-        )?;
-        if explanation.decision != Decision::Allow {
-            return Err(ServiceError::PermissionDenied);
-        }
-        let secret = self
+        let secret = self.secret_by_ref(profile, name, true)?;
+        let access = self
             .store
-            .secret_by_id(secret_id)?
-            .ok_or(ServiceError::NotFound)?;
+            .secret_http_access(secret.id)?
+            .ok_or(ServiceError::PermissionDenied)?;
+        let host = self.decrypt_entity_text(
+            EntityKind::Secret,
+            secret.id.0,
+            "http_host",
+            &access.encrypted_host,
+        )?;
+        let path_prefix = self.decrypt_entity_text(
+            EntityKind::Secret,
+            secret.id.0,
+            "http_path_prefix",
+            &access.encrypted_path_prefix,
+        )?;
+        let methods = access
+            .methods
+            .split(',')
+            .map(HttpMethod::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ServiceError::Corrupt)?;
+        let constraint = HttpConstraint {
+            host,
+            port: access.port,
+            methods,
+            path_prefix,
+            max_request_bytes: usize::try_from(access.max_request_bytes)
+                .map_err(|_| ServiceError::Corrupt)?,
+            max_response_bytes: usize::try_from(access.max_response_bytes)
+                .map_err(|_| ServiceError::Corrupt)?,
+        };
         if secret.status != 0 || secret.current_version == 0 {
             return Err(ServiceError::NotFound);
         }

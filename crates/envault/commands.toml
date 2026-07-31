@@ -41,14 +41,6 @@ outputs = ["human", "json", "toon"]
 errors = ["envault_not_running"]
 
 [[command]]
-path = "context"
-auth = "agent"
-daemon = "required"
-agent = true
-outputs = ["human", "json", "toon"]
-errors = ["envault_not_running", "envault_locked", "permission_denied"]
-
-[[command]]
 path = "admin unlock"
 auth = "human"
 daemon = "required"
@@ -71,70 +63,6 @@ daemon = "required"
 agent = false
 outputs = ["human", "json", "toon"]
 errors = ["envault_not_running", "envault_locked", "admin_auth_required"]
-
-[[command]]
-path = "admin agent create"
-auth = "admin"
-daemon = "required"
-agent = false
-outputs = ["human", "json", "toon"]
-errors = ["admin_auth_required", "conflict", "invalid_input"]
-
-[[command]]
-path = "admin agent list"
-auth = "admin"
-daemon = "required"
-agent = false
-outputs = ["human", "json", "toon"]
-errors = ["admin_auth_required"]
-
-[[command]]
-path = "admin agent enable"
-auth = "admin"
-daemon = "required"
-agent = false
-outputs = ["human", "json", "toon"]
-errors = ["admin_auth_required", "not_found"]
-
-[[command]]
-path = "admin agent disable"
-auth = "admin"
-daemon = "required"
-agent = false
-outputs = ["human", "json", "toon"]
-errors = ["admin_auth_required", "not_found"]
-
-[[command]]
-path = "admin grant create"
-auth = "admin"
-daemon = "required"
-agent = false
-outputs = ["human", "json", "toon"]
-errors = ["admin_auth_required", "invalid_grant", "token_output_requires_pipe"]
-
-[[command]]
-path = "admin grant revoke"
-auth = "admin"
-daemon = "required"
-agent = false
-outputs = ["human", "json", "toon"]
-errors = ["admin_auth_required", "not_found"]
-
-[[command]]
-path = "admin policy create"
-auth = "admin"
-daemon = "required"
-agent = false
-outputs = ["human", "json", "toon"]
-errors = ["admin_auth_required", "invalid_input", "not_found"]
-
-[[command]]
-path = "admin policy list"
-auth = "admin"
-daemon = "required"
-agent = false
-outputs = ["human", "json", "toon"]
-errors = ["admin_auth_required"]
 
 [[command]]
 path = "profile create"
@@ -185,12 +113,20 @@ outputs = ["human", "json", "toon"]
 errors = ["admin_auth_required", "not_found", "conflict"]
 
 [[command]]
-path = "profile activate"
+path = "profile load"
 auth = "admin"
 daemon = "required"
 agent = false
 outputs = ["human", "json", "toon"]
 errors = ["admin_auth_required", "not_found"]
+
+[[command]]
+path = "profile unload"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found", "conflict"]
 
 [[command]]
 path = "secret create"
@@ -265,20 +201,12 @@ outputs = ["human", "json", "toon"]
 errors = ["admin_auth_required", "not_found", "invalid_input"]
 
 [[command]]
-path = "agent session status"
-auth = "agent"
-daemon = "required"
-agent = true
-outputs = ["human", "json", "toon"]
-errors = ["envault_locked", "permission_denied"]
-
-[[command]]
 path = "request http"
-auth = "agent"
+auth = "service"
 daemon = "required"
 agent = true
 outputs = ["human", "json", "toon"]
-errors = ["envault_locked", "permission_denied", "request_rejected", "response_rejected", "provider_error", "network_error"]
+errors = ["envault_locked", "profile_not_loaded", "permission_denied", "request_rejected", "response_rejected", "provider_error", "network_error"]
 
 [[command]]
 path = "profile export"
@@ -313,7 +241,7 @@ outputs = ["human", "json", "toon"]
 errors = ["admin_auth_required", "plaintext_acknowledgement_required", "invalid_input", "conflict", "io_error"]
 
 [[command]]
-path = "workspace export"
+path = "portability export"
 auth = "admin"
 daemon = "required"
 agent = false
@@ -321,12 +249,44 @@ outputs = ["human", "json", "toon"]
 errors = ["admin_auth_required", "package_error", "package_authentication_failed", "conflict", "io_error"]
 
 [[command]]
-path = "workspace import"
+path = "portability import"
 auth = "admin"
 daemon = "required"
 agent = false
 outputs = ["human", "json", "toon"]
 errors = ["admin_auth_required", "package_error", "package_authentication_failed", "stale_import_plan", "conflict", "io_error"]
+
+[[command]]
+path = "workspace create"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "conflict", "invalid_input"]
+
+[[command]]
+path = "workspace list"
+auth = "service"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["envault_locked"]
+
+[[command]]
+path = "workspace show"
+auth = "service"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["envault_locked", "not_found"]
+
+[[command]]
+path = "workspace load"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found"]
 
 [[command]]
 path = "convenience-unlock enable"
@@ -363,6 +323,22 @@ errors = ["io_error"]
 [[command]]
 path = "session setup"
 auth = "human"
+daemon = "forbidden"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["io_error"]
+
+[[command]]
+path = "run"
+auth = "service"
+daemon = "required"
+agent = true
+outputs = ["human", "json", "toon"]
+errors = ["envault_locked", "run_target_required", "secret_not_utf8", "run_spawn_failed", "protocol_error"]
+
+[[command]]
+path = "completions"
+auth = "bootstrap"
 daemon = "forbidden"
 agent = false
 outputs = ["human", "json", "toon"]

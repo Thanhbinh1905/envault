@@ -37,28 +37,12 @@ pub struct SecretId(pub Uuid);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SecretVersionId(pub Uuid);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct PrincipalId(pub Uuid);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct PolicyRuleId(pub Uuid);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct GrantId(pub Uuid);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct ApprovalId(pub Uuid);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct AuditEventId(pub Uuid);
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum EntityKind {
     Profile,
     Scope,
     Secret,
     SecretVersion,
-    Principal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -100,13 +84,6 @@ pub enum ImportAction {
     Rename,
     Skip,
     Reject,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum PrincipalKind {
-    Human,
-    Agent,
-    Process,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -177,15 +154,6 @@ pub struct ProfileSession {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PrincipalView {
-    pub id: PrincipalId,
-    pub kind: PrincipalKind,
-    pub name: String,
-    pub disabled: bool,
-    pub generation: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedSecretView {
     pub secret: SecretView,
     pub source_scope_id: ScopeId,
@@ -215,8 +183,6 @@ pub struct PortabilityCounts {
     pub profiles: u64,
     pub secrets: u64,
     pub versions: u64,
-    pub principals: u64,
-    pub policy_rules: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -293,13 +259,15 @@ pub struct ProfileSummary {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum InvariantError {
-    #[error("exactly one profile must activate on start, found {0}")]
+    #[error("at least one profile must be loaded (auto-load) at start, found {0}")]
     StartupProfileCount(usize),
     #[error("admin lease must be between 1 and 30 minutes")]
     InvalidAdminLease,
     #[error("description exceeds 240 UTF-8 characters")]
     DescriptionTooLong,
-    #[error("name must contain between 1 and 128 UTF-8 bytes without control characters")]
+    #[error(
+        "name must contain between 1 and 128 UTF-8 bytes without control characters or '.' (reserved for <profile>.<secret> addressing)"
+    )]
     InvalidName,
     #[error("generator size must be between 1 and 4096")]
     InvalidGeneratorSize,
@@ -313,12 +281,15 @@ pub enum InvariantError {
     AmbiguousScopeEntry,
 }
 
+/// "Loaded set" = profiles with `activate_on_start`. Base is always in it
+/// (enforced elsewhere by refusing to unload/delete it); any additional
+/// profile may join or leave the set independently via `load`/`unload`.
 pub fn validate_startup_profile(profiles: &[ProfileSummary]) -> Result<(), InvariantError> {
     let active_count = profiles
         .iter()
         .filter(|profile| profile.activate_on_start)
         .count();
-    if active_count == 1 {
+    if active_count >= 1 {
         Ok(())
     } else {
         Err(InvariantError::StartupProfileCount(active_count))
@@ -346,6 +317,7 @@ pub fn normalize_name(name: &str) -> Result<String, InvariantError> {
     if normalized.is_empty()
         || normalized.len() > MAX_NAME_BYTES
         || normalized.chars().any(char::is_control)
+        || normalized.contains('.')
     {
         Err(InvariantError::InvalidName)
     } else {
@@ -465,10 +437,14 @@ mod tests {
     }
 
     #[test]
-    fn exactly_one_startup_profile_is_valid() {
+    fn at_least_one_loaded_profile_is_required() {
         assert_eq!(validate_startup_profile(&[profile(true)]), Ok(()));
         assert!(validate_startup_profile(&[profile(false)]).is_err());
-        assert!(validate_startup_profile(&[profile(true), profile(true)]).is_err());
+        assert_eq!(
+            validate_startup_profile(&[profile(true), profile(true)]),
+            Ok(())
+        );
+        assert!(validate_startup_profile(&[]).is_err());
     }
 
     #[test]
