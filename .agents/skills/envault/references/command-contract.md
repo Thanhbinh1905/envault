@@ -13,6 +13,7 @@ Use these agent-safe commands:
 
 - `envault --output toon session context` (daemon status and active profile only, safe to run anytime)
 - `envault --output toon secret list --fields description` (optionally `--profile <name>`; `--describe` still works as a deprecated alias for `--fields description`)
+- `envault request http ...`, gated by a `secret_http_access` record on the target secret; the broker performs the HTTP call and never returns the secret's plaintext to you
 - `envault run --profile <name> -- <command> [args...]` (or `--workspace <name>`), run by the human, not by you: it injects plaintext directly into the spawned child's environment and never prints it
 
 `session context` and `session setup` touch no secret and are safe at any time.

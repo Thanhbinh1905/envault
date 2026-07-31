@@ -204,7 +204,7 @@ errors = ["admin_auth_required", "not_found", "invalid_input"]
 path = "request http"
 auth = "service"
 daemon = "required"
-agent = false
+agent = true
 outputs = ["human", "json", "toon"]
 errors = ["envault_locked", "profile_not_loaded", "permission_denied", "request_rejected", "response_rejected", "provider_error", "network_error"]
 
