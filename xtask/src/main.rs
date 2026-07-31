@@ -150,8 +150,9 @@ fn verify_contract() -> Result<()> {
         let skill = fs::read_to_string(".agents/skills/envault/SKILL.md").context("read skill")?;
         for required in [
             "envault start",
+            "envault session setup",
             "context --token-stdin",
-            "secret list --describe --token-stdin",
+            "secret list --fields description --token-stdin",
             "request http URL",
             "Never reveal",
             "Never start the daemon",
@@ -174,8 +175,10 @@ fn verify_contract() -> Result<()> {
             fs::read_to_string(".agents/skills/envault/references/command-contract.md")
                 .context("read skill command reference")?;
         for required in [
+            "session context",
+            "session setup",
             "context --token-stdin",
-            "secret list --describe --token-stdin",
+            "secret list --fields description --token-stdin",
             "agent session status --token-stdin",
             "request http URL --method METHOD --secret UUID --token-stdin",
         ] {

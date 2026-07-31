@@ -351,3 +351,19 @@ daemon = "forbidden"
 agent = false
 outputs = ["human", "json", "toon"]
 errors = ["io_error"]
+
+[[command]]
+path = "session context"
+auth = "bootstrap"
+daemon = "optional"
+agent = true
+outputs = ["human", "json", "toon"]
+errors = ["io_error"]
+
+[[command]]
+path = "session setup"
+auth = "human"
+daemon = "forbidden"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["io_error"]

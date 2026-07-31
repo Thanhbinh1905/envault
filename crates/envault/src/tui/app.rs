@@ -156,7 +156,7 @@ impl DaemonClient for RealClient {
 
     fn admin_lock(&self) -> Result<(), ClientError> {
         match client::request(Operation::AdminLock)? {
-            Reply::Acknowledged => Ok(()),
+            Reply::Acknowledged { .. } => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -185,7 +185,7 @@ impl DaemonClient for RealClient {
 
     fn delete_profile(&self, name: String) -> Result<(), ClientError> {
         match client::request(Operation::DeleteProfile { name })? {
-            Reply::Acknowledged => Ok(()),
+            Reply::Acknowledged { .. } => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -233,7 +233,7 @@ impl DaemonClient for RealClient {
 
     fn delete_secret(&self, name: String) -> Result<(), ClientError> {
         match client::request(Operation::DeleteSecret { name })? {
-            Reply::Acknowledged => Ok(()),
+            Reply::Acknowledged { .. } => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

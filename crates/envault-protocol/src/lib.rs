@@ -337,7 +337,19 @@ pub enum Reply {
     PortabilityImport(PortabilityImportSummary),
     EnvImportPreview(EnvImportPreview),
     PlaintextExport(PlaintextExportSummary),
-    Acknowledged,
+    Acknowledged { no_op: bool },
+}
+
+/// Distinguishes an error an agent can resolve by correcting its own input
+/// (never reaching a dependency call) from one where a dependency was
+/// invoked and failed. Drives the CLI's exit code: `Usage` maps to 2,
+/// `Runtime` to 1, so an agent can tell "fix your command" from "the
+/// operation genuinely failed" without parsing the message body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    Usage,
+    Runtime,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -347,6 +359,7 @@ pub struct StructuredError {
     pub help: Vec<String>,
     pub request_id: Uuid,
     pub retryable: bool,
+    pub kind: ErrorKind,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]

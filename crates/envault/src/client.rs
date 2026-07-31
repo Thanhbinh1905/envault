@@ -75,7 +75,7 @@ pub fn start(password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
         Ok(Reply::Status(status)) if status.service == ServiceState::Unlocked => return Ok(status),
         Ok(Reply::Status(_)) => {
             match request(Operation::Stop) {
-                Ok(Reply::Acknowledged) | Err(ClientError::NotRunning) => {}
+                Ok(Reply::Acknowledged { .. }) | Err(ClientError::NotRunning) => {}
                 Ok(_) => return Err(ClientError::UnexpectedResponse),
                 Err(error) => return Err(error),
             }
