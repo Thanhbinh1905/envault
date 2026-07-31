@@ -622,7 +622,7 @@ fn main() -> ExitCode {
         Command::Start(arguments) => start_daemon(cli.output, arguments),
         Command::Lock => lifecycle_request(cli.output, Operation::Lock, "locked"),
         Command::Stop => lifecycle_request(cli.output, Operation::Stop, "stopped"),
-        Command::Admin { command } => admin_command(cli.output, command),
+        Command::Admin { command } => admin_command(cli.output, &command),
         Command::Profile { command } => profile_command(cli.output, command),
         Command::Secret { command } => secret_command(cli.output, command),
         Command::Request {
@@ -996,7 +996,7 @@ fn install_session_hook(settings_path: &Path, command: &str) -> Result<HookInsta
     Ok(outcome)
 }
 
-fn admin_command(output: Output, command: AdminCommand) -> ExitCode {
+fn admin_command(output: Output, command: &AdminCommand) -> ExitCode {
     match command {
         AdminCommand::Unlock(arguments) => {
             let password = match read_master_password(arguments.password.password_stdin, false) {

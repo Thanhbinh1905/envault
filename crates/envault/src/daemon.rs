@@ -113,14 +113,14 @@ struct RuntimeState {
 }
 
 impl RuntimeState {
-    fn new(vault: VaultSession, database_path: PathBuf) -> Result<Self, RuntimeFailure> {
-        Ok(Self {
+    fn new(vault: VaultSession, database_path: PathBuf) -> Self {
+        Self {
             vault: Some(vault),
             database_path,
             admin_lease: None,
             rate_limits: BTreeMap::new(),
             global_rate_limit: RateWindow::new(),
-        })
+        }
     }
 
     fn status(&mut self, peer: PeerIdentity) -> Result<DaemonStatus, RuntimeFailure> {
@@ -469,8 +469,7 @@ impl Server {
         envault_platform::set_private_socket_permissions(&config.socket_path)?;
         let socket_guard = SocketGuard::new(config.socket_path.clone())?;
         let owner_uid = std::fs::metadata(&config.runtime_directory)?.uid();
-        let state = RuntimeState::new(vault, config.database_path.clone())
-            .map_err(|_| DaemonError::BootstrapProtocol)?;
+        let state = RuntimeState::new(vault, config.database_path.clone());
         Ok(Self {
             listener,
             state: Arc::new(Mutex::new(state)),
@@ -556,8 +555,7 @@ impl Server {
         drop(sensitive);
         let pipe_name = crate::client::windows_pipe_name(&config.socket_path);
         let listener = envault_windows_ffi::create_named_pipe_server(&pipe_name, true)?;
-        let state = RuntimeState::new(vault, config.database_path.clone())
-            .map_err(|_| DaemonError::BootstrapProtocol)?;
+        let state = RuntimeState::new(vault, config.database_path.clone());
         Ok(Self {
             listener,
             pipe_name,
@@ -1785,11 +1783,7 @@ mod tests {
         let password = SensitiveInput::copy_from_slice(b"daemon test password");
         envault_service::initialize_with_recommended_kdf(&path, &password).expect("initialize");
         let vault = VaultSession::unlock(&path, &password).expect("unlock");
-        (
-            directory,
-            RuntimeState::new(vault, path).expect("state"),
-            password,
-        )
+        (directory, RuntimeState::new(vault, path), password)
     }
 
     #[test]
