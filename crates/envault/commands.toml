@@ -341,5 +341,5 @@ path = "completions"
 auth = "bootstrap"
 daemon = "forbidden"
 agent = false
-outputs = ["human"]
-errors = []
+outputs = ["human", "json", "toon"]
+errors = ["io_error"]
