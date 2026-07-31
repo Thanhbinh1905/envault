@@ -62,7 +62,7 @@ A random Data Encryption Key dedicated to one immutable secret version.
 
 ## Scope
 
-A stable node in a tree used for inheritance, override, tombstone, and policy resolution.
+A stable node in a tree used for inheritance, override, and tombstone resolution.
 
 ## Profile
 

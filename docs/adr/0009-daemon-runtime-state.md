@@ -43,3 +43,8 @@ Connection and authentication limits apply both per operating-system session and
 Stopping or locking the daemon invalidates every admin and agent authorization immediately.
 The daemon can later expose policy-filtered discovery and broker operations without adding a plaintext secret-reading protocol.
 Protocol and bootstrap decoders remain hostile-input boundaries and require fuzzing and malformed-client tests.
+
+## Addendum (2026-07-31): admin lease rescoped to uid, agent capabilities removed
+
+The admin lease is now scoped to the authenticated peer `uid` alone, not `(uid, session_id)`: unlocking admin from any terminal or process running as that user covers every other process of that same user, reducing friction when an agent runs in the same terminal session as the human. `lock` and `stop` still drop the lease immediately.
+Agent capability tokens, `CapabilitySession`, and the `Principal` concept described above were removed entirely; there is no token-hash key, capability digest, nonce, or approval identity in daemon memory. Agent metadata discovery is now gated by the loaded set (`activate_on_start`) and agent-initiated HTTP actions by the `secret_http_access` record on the target secret, both checked by same-uid trust alone. See ADR 0004's and ADR 0010's addenda for the corresponding protocol and broker changes.

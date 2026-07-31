@@ -5,7 +5,7 @@ For the security model and threat model, see [docs/threat-model.md](threat-model
 
 ## Workspace
 
-The Rust workspace separates domain, crypto, storage, policy, protocol, platform, broker, and executable concerns.
+The Rust workspace separates domain, crypto, storage, protocol, platform, broker, and executable concerns.
 CLI and TUI code must access secrets through application services and IPC, never through crypto or storage directly.
 
 The pinned toolchain is Rust 1.97.1 with Rust Edition 2024.
@@ -53,7 +53,7 @@ target/debug/envault start
 Automation may use `start --password-stdin` with the same safe input constraints as initialization.
 Use `envault status`, `envault lock`, and `envault stop` for explicit lifecycle control.
 Use `envault admin unlock --minutes 5`, `envault admin status`, and `envault admin lock` for the bounded admin lease.
-Profile, versioned secret, policy-filtered agent discovery, capability inspection, and constrained HTTP broker workflows run only through daemon IPC.
+Profile, versioned secret, loaded-set agent discovery, and constrained HTTP broker workflows run only through daemon IPC.
 
 ## Encrypted portability
 
