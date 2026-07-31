@@ -12,7 +12,15 @@
 .lavish/
 
 # Internal dev-only artifacts, not needed by external contributors
-/.agents/
+/.agents/*
+!/.agents/skills/
+/.agents/skills/axi/
+!/.agents/skills/envault/
+!/.agents/skills/envault/**
 /docs/plans/
 /docs/reviews/
 
+# Local agent-tooling state (per-machine, not part of the shipped project)
+/.claude/
+/.codegraph/
+/skills-lock.json

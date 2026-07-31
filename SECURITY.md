@@ -2,8 +2,10 @@
 
 ## Supported versions
 
-EnVault has not published a supported release yet.
-Security properties in the architecture and threat model are design targets until their exit gates are verified.
+The release target is `v0.0.1`; no supported release has been published yet.
+It becomes the supported release only when this branch merges into `main` and the `v0.0.1` tag completes the release workflow.
+Until that tag is published, treat repository revisions as pre-release builds.
+Security properties in the architecture and threat model remain release gates and are not weakened by the pre-release status.
 
 ## Reporting a vulnerability
 

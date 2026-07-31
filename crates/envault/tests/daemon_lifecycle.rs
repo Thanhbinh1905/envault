@@ -334,6 +334,355 @@ fn phase_five_cli_round_trips_workspace_and_env_without_plaintext_output() {
 }
 
 #[test]
+fn secret_list_fields_flag_gates_description_and_rejects_unknown_fields() {
+    let fixture = DaemonFixture::initialize_and_start();
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "FIELDS_TEST",
+            "--description",
+            "fields-flag-sentinel",
+            "--stdin",
+        ],
+        Some(b"fields-flag-secret-value"),
+    ));
+
+    let default_list = fixture.json(&["--output", "json", "secret", "list"]);
+    assert_eq!(default_list[0]["description"], Value::Null);
+
+    let with_fields = fixture.json(&[
+        "--output",
+        "json",
+        "secret",
+        "list",
+        "--fields",
+        "description",
+    ]);
+    assert_eq!(with_fields[0]["description"], "fields-flag-sentinel");
+
+    let with_legacy_describe = fixture.json(&["--output", "json", "secret", "list", "--describe"]);
+    assert_eq!(
+        with_legacy_describe[0]["description"],
+        "fields-flag-sentinel"
+    );
+
+    let rejected = fixture.run(
+        &["--output", "json", "secret", "list", "--fields", "bogus"],
+        None,
+    );
+    assert!(!rejected.status.success());
+    let error: Value = serde_json::from_slice(&rejected.stderr).expect("structured CLI error");
+    assert_eq!(error["code"], "unknown_field");
+    assert_eq!(error["kind"], "usage");
+}
+
+#[test]
+fn exit_codes_distinguish_usage_from_runtime_errors() {
+    let fixture = DaemonFixture::initialize_and_start();
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+
+    let usage_error = fixture.run(
+        &["--output", "json", "secret", "list", "--fields", "bogus"],
+        None,
+    );
+    assert_eq!(usage_error.status.code(), Some(2));
+    let usage_body: Value = serde_json::from_slice(&usage_error.stderr).expect("usage error");
+    assert_eq!(usage_body["kind"], "usage");
+
+    let runtime_error = fixture.run(
+        &["--output", "json", "profile", "show", "no-such-profile"],
+        None,
+    );
+    assert_eq!(runtime_error.status.code(), Some(1));
+    let runtime_body: Value = serde_json::from_slice(&runtime_error.stderr).expect("runtime error");
+    assert_eq!(runtime_body["kind"], "runtime");
+    assert_eq!(runtime_body["code"], "not_found");
+}
+
+#[test]
+fn profile_and_secret_delete_are_idempotent_no_ops() {
+    let fixture = DaemonFixture::initialize_and_start();
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "profile",
+            "create",
+            "IDEMPOTENT_PROFILE",
+        ],
+        None,
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "IDEMPOTENT_SECRET",
+            "--stdin",
+        ],
+        Some(b"idempotent-delete-sentinel"),
+    ));
+
+    let first_profile_delete = fixture.json(&[
+        "--output",
+        "json",
+        "profile",
+        "delete",
+        "IDEMPOTENT_PROFILE",
+    ]);
+    assert_eq!(first_profile_delete["no_op"], false);
+    let second_profile_delete = fixture.json(&[
+        "--output",
+        "json",
+        "profile",
+        "delete",
+        "IDEMPOTENT_PROFILE",
+    ]);
+    assert_eq!(second_profile_delete["no_op"], true);
+
+    let first_secret_delete =
+        fixture.json(&["--output", "json", "secret", "delete", "IDEMPOTENT_SECRET"]);
+    assert_eq!(first_secret_delete["no_op"], false);
+    let second_secret_delete =
+        fixture.json(&["--output", "json", "secret", "delete", "IDEMPOTENT_SECRET"]);
+    assert_eq!(second_secret_delete["no_op"], true);
+}
+
+#[test]
+fn empty_secret_and_principal_lists_report_zero_explicitly() {
+    let fixture = DaemonFixture::initialize_and_start();
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+
+    let secrets = fixture.run(&["--output", "human", "secret", "list"], None);
+    assert_success(&secrets);
+    let secrets = String::from_utf8(secrets.stdout).expect("human secrets output");
+    assert!(secrets.starts_with("secrets: 0 secrets found\n"));
+
+    let principals = fixture.run(&["--output", "human", "admin", "agent", "list"], None);
+    assert_success(&principals);
+    let principals = String::from_utf8(principals.stdout).expect("human principals output");
+    assert!(principals.starts_with("principals: 0 principals found\n"));
+}
+
+#[test]
+fn session_context_reports_daemon_state_without_secret_material() {
+    let fixture = DaemonFixture::initialize();
+    let stopped = fixture.json(&["--output", "json", "session", "context"]);
+    assert_eq!(stopped["daemon"], "stopped");
+    assert_eq!(stopped["service"], "inactive");
+    assert_eq!(stopped["profile"], Value::Null);
+
+    fixture.start();
+    let sentinel = b"session-context-secret-sentinel";
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "SESSION_SECRET",
+            "--stdin",
+        ],
+        Some(sentinel),
+    ));
+
+    let running = fixture.run(&["--output", "toon", "session", "context"], None);
+    assert_success(&running);
+    assert_no_bytes(&running.stdout, sentinel);
+    let running = String::from_utf8(running.stdout).expect("TOON session context");
+    assert!(running.contains("session{daemon,service,profile}: running,unlocked,\"base\""));
+}
+
+#[test]
+fn session_setup_is_idempotent_and_repairs_a_stale_command() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let settings_path = directory.path().join(".claude/settings.json");
+    let settings_arg = settings_path.to_string_lossy().into_owned();
+
+    let installed = Command::new(env!("CARGO_BIN_EXE_envault"))
+        .args([
+            "--output",
+            "json",
+            "session",
+            "setup",
+            "--settings-file",
+            &settings_arg,
+        ])
+        .output()
+        .expect("spawn envault session setup");
+    assert_success(&installed);
+    let installed_body: Value =
+        serde_json::from_slice(&installed.stdout).expect("structured setup result");
+    assert_eq!(installed_body["status"], "installed");
+
+    let settings_text = fs::read_to_string(&settings_path).expect("settings file");
+    let settings: Value = serde_json::from_str(&settings_text).expect("settings JSON");
+    let command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("hook command")
+        .to_owned();
+    assert!(command.contains("session context"));
+    assert!(command.contains("--output toon"));
+
+    let unchanged = Command::new(env!("CARGO_BIN_EXE_envault"))
+        .args([
+            "--output",
+            "json",
+            "session",
+            "setup",
+            "--settings-file",
+            &settings_arg,
+        ])
+        .output()
+        .expect("spawn envault session setup again");
+    assert_success(&unchanged);
+    let unchanged_body: Value =
+        serde_json::from_slice(&unchanged.stdout).expect("structured setup result");
+    assert_eq!(unchanged_body["status"], "unchanged");
+
+    let stale = settings_text.replace(
+        &command,
+        "/stale/relocated/envault session context --output toon --envault-session-hook",
+    );
+    fs::write(&settings_path, stale).expect("write stale settings");
+    let repaired = Command::new(env!("CARGO_BIN_EXE_envault"))
+        .args([
+            "--output",
+            "json",
+            "session",
+            "setup",
+            "--settings-file",
+            &settings_arg,
+        ])
+        .output()
+        .expect("spawn envault session setup after relocation");
+    assert_success(&repaired);
+    let repaired_body: Value =
+        serde_json::from_slice(&repaired.stdout).expect("structured setup result");
+    assert_eq!(repaired_body["status"], "repaired");
+
+    let repaired_settings: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).expect("settings file"))
+            .expect("settings JSON");
+    let repaired_command = repaired_settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("hook command");
+    assert_eq!(repaired_command, command);
+}
+
+#[test]
+fn session_setup_preserves_unrelated_settings_and_hooks() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let settings_path = directory.path().join(".claude/settings.json");
+    fs::create_dir_all(settings_path.parent().expect("parent")).expect("settings dir");
+    fs::write(
+        &settings_path,
+        r#"{"theme":"dark","hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"echo other-hook"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo audit"}]}]}}"#,
+    )
+    .expect("write existing settings");
+    let settings_arg = settings_path.to_string_lossy().into_owned();
+
+    let installed = Command::new(env!("CARGO_BIN_EXE_envault"))
+        .args([
+            "--output",
+            "json",
+            "session",
+            "setup",
+            "--settings-file",
+            &settings_arg,
+        ])
+        .output()
+        .expect("spawn envault session setup");
+    assert_success(&installed);
+
+    let settings: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).expect("settings file"))
+            .expect("settings JSON");
+    assert_eq!(settings["theme"], "dark");
+    assert_eq!(
+        settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "echo audit"
+    );
+    let session_start = settings["hooks"]["SessionStart"]
+        .as_array()
+        .expect("SessionStart array");
+    assert_eq!(session_start.len(), 2);
+    assert_eq!(session_start[0]["hooks"][0]["command"], "echo other-hook");
+    assert!(
+        session_start[1]["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("session context")
+    );
+}
+
+#[test]
+fn session_setup_preserves_hooks_that_only_contain_session_context_text() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let settings_path = directory.path().join(".claude/settings.json");
+    fs::create_dir_all(settings_path.parent().expect("parent")).expect("settings dir");
+    fs::write(
+        &settings_path,
+        r#"{"hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"echo 'session context from another tool'"}]}]}}"#,
+    )
+    .expect("write existing settings");
+    let settings_arg = settings_path.to_string_lossy().into_owned();
+
+    let installed = Command::new(env!("CARGO_BIN_EXE_envault"))
+        .args([
+            "--output",
+            "json",
+            "session",
+            "setup",
+            "--settings-file",
+            &settings_arg,
+        ])
+        .output()
+        .expect("spawn envault session setup");
+    assert_success(&installed);
+
+    let settings: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).expect("settings file"))
+            .expect("settings JSON");
+    let session_start = settings["hooks"]["SessionStart"]
+        .as_array()
+        .expect("SessionStart array");
+    assert_eq!(session_start.len(), 2);
+    assert_eq!(
+        session_start[0]["hooks"][0]["command"],
+        "echo 'session context from another tool'"
+    );
+    assert!(
+        session_start[1]["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("--envault-session-hook")
+    );
+}
+
+#[test]
 fn phase_four_cli_filters_discovery_and_rejects_private_http_targets() {
     let fixture = DaemonFixture::initialize_and_start();
     let setup = setup_phase_four(&fixture);
@@ -633,9 +982,13 @@ fn exercise_admin_and_lock(fixture: &DaemonFixture) {
         fixture.json(&["--output", "json", "status"])["service"],
         "locked"
     );
-    assert_cli_error_code(
-        &fixture.run(&["--output", "json", "lock"], None),
-        "envault_locked",
+    let repeat_lock = fixture.run(&["--output", "json", "lock"], None);
+    assert_success(&repeat_lock);
+    let repeat_lock_body: Value =
+        serde_json::from_slice(&repeat_lock.stdout).expect("structured lock acknowledgement");
+    assert_eq!(
+        repeat_lock_body["no_op"], true,
+        "locking an already-locked daemon is an idempotent no-op, not an error"
     );
     assert_cli_error_code(
         &fixture.run(&["--output", "json", "admin", "status"], None),
@@ -915,7 +1268,7 @@ fn agent_capabilities_are_narrow_hashed_revocable_and_never_admin() {
             },
             None,
         ),
-        Ok(Reply::Acknowledged)
+        Ok(Reply::Acknowledged { .. })
     ));
     assert_remote_code(
         envault::client::request_at(

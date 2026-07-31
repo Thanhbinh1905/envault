@@ -13,8 +13,9 @@ use envault_core::{ApprovalId, GrantId, PrincipalId, PrincipalKind, validate_adm
 use envault_policy::{Action, Grant, MAX_GRANT_LIFETIME_SECONDS, MAX_GRANT_USES, ResourceSelector};
 use envault_protocol::{
     AdminLeaseStatus, AgentContext, AgentSessionCreated, AgentSessionView, AuthenticatedRequest,
-    BootstrapRequest, DaemonStatus, HttpConstraint, Operation, PROTOCOL_VERSION, Reply, Request,
-    Response, ResponseBody, SensitiveBytes, ServiceState, StructuredError, validate_version,
+    BootstrapRequest, DaemonStatus, ErrorKind, HttpConstraint, Operation, PROTOCOL_VERSION, Reply,
+    Request, Response, ResponseBody, SensitiveBytes, ServiceState, StructuredError,
+    validate_version,
 };
 use envault_service::{
     BrokerFailure, CapabilityTokenKey, PackageImportOptions, SensitiveInput, ServiceError,
@@ -1113,14 +1114,14 @@ impl RuntimeState {
             Operation::Context => Ok((Reply::Context(self.agent_context(token)?), false)),
             Operation::Lock => {
                 if self.vault.is_none() {
-                    return Err(RuntimeFailure::Locked);
+                    return Ok((Reply::Acknowledged { no_op: true }, false));
                 }
                 self.lock();
-                Ok((Reply::Acknowledged, false))
+                Ok((Reply::Acknowledged { no_op: false }, false))
             }
             Operation::Stop => {
                 self.lock();
-                Ok((Reply::Acknowledged, true))
+                Ok((Reply::Acknowledged { no_op: false }, true))
             }
             Operation::AdminStatus => {
                 if self.vault.is_none() {
@@ -1130,7 +1131,7 @@ impl RuntimeState {
             }
             Operation::AdminLock => {
                 self.clear_admin_lease(peer)?;
-                Ok((Reply::Acknowledged, false))
+                Ok((Reply::Acknowledged { no_op: false }, false))
             }
             Operation::CreateAgentSession {
                 principal_id,
@@ -1159,7 +1160,7 @@ impl RuntimeState {
             )),
             Operation::RevokeAgentSession { grant_id } => {
                 self.revoke_agent_session(peer, grant_id)?;
-                Ok((Reply::Acknowledged, false))
+                Ok((Reply::Acknowledged { no_op: false }, false))
             }
             operation @ (Operation::CreatePrincipal { .. }
             | Operation::ListPrincipals
@@ -1288,12 +1289,11 @@ impl RuntimeState {
                     .rename_profile(&old_name, &new_name)
                     .map_err(|error| map_service_failure(&error))?,
             ),
-            Operation::DeleteProfile { name } => {
-                vault
-                    .delete_profile(&name)
-                    .map_err(|error| map_service_failure(&error))?;
-                Reply::Acknowledged
-            }
+            Operation::DeleteProfile { name } => match vault.delete_profile(&name) {
+                Ok(()) => Reply::Acknowledged { no_op: false },
+                Err(ServiceError::NotFound) => Reply::Acknowledged { no_op: true },
+                Err(error) => return Err(map_service_failure(&error)),
+            },
             Operation::ActivateProfile { name } => Reply::Profile(
                 vault
                     .activate_profile(&name)
@@ -1382,12 +1382,11 @@ impl RuntimeState {
                     .rename_secret(&old_name, &new_name)
                     .map_err(|error| map_service_failure(&error))?,
             ),
-            Operation::DeleteSecret { name } => {
-                vault
-                    .delete_secret(&name)
-                    .map_err(|error| map_service_failure(&error))?;
-                Reply::Acknowledged
-            }
+            Operation::DeleteSecret { name } => match vault.delete_secret(&name) {
+                Ok(()) => Reply::Acknowledged { no_op: false },
+                Err(ServiceError::NotFound) => Reply::Acknowledged { no_op: true },
+                Err(error) => return Err(map_service_failure(&error)),
+            },
             Operation::SetSecretValue { name, value } => Reply::SecretVersion(
                 vault
                     .set_secret_value(&name, SensitiveInput::new(value.into_vec()))
@@ -1658,6 +1657,7 @@ fn structured_error(request_id: Uuid, failure: RuntimeFailure) -> StructuredErro
         help: vec![help.into()],
         request_id,
         retryable,
+        kind: ErrorKind::Runtime,
     }
 }
 

@@ -17,7 +17,7 @@ use envault_core::{
 };
 use envault_policy::{Action, Effect, ResourceSelector};
 use envault_protocol::{
-    AdminLeaseStatus, AgentContext, AgentSessionCreated, AgentSessionView, DaemonStatus,
+    AdminLeaseStatus, AgentContext, AgentSessionCreated, AgentSessionView, DaemonStatus, ErrorKind,
     HttpConstraint, HttpContentType, HttpMethod, HttpRequest, HttpResponse, Operation, Reply,
     SensitiveBytes, ServiceState, StructuredError,
 };
@@ -83,6 +83,31 @@ enum Command {
         #[command(subcommand)]
         command: ConvenienceUnlockCommand,
     },
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    Context(SessionContextArgs),
+    #[command(
+        long_about = "Installs a SessionStart hook into a Claude Code settings.json so `session context` runs automatically at session start.\nFor Codex, add an equivalent SessionStart hook running `envault session context --output toon` to `.codex/hooks.json` (with `[features].hooks = true` in config.toml) by hand; for OpenCode, wire the same command into a managed plugin under `~/.config/opencode/plugins/`. Neither is automated by this command."
+    )]
+    Setup(SessionSetupArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct SessionContextArgs {
+    #[arg(long, hide = true)]
+    envault_session_hook: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct SessionSetupArgs {
+    #[arg(long, default_value = ".claude/settings.json")]
+    settings_file: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -254,12 +279,18 @@ struct SecretCreateArgs {
     length: GeneratorLengthArgs,
 }
 
-#[derive(Clone, Copy, Debug, clap::Args)]
+#[derive(Clone, Debug, clap::Args)]
 struct SecretListArgs {
     #[arg(long)]
     token_stdin: bool,
-    #[arg(long)]
+    #[arg(long, help = "Deprecated: use `--fields description` instead")]
     describe: bool,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Additional columns beyond the default schema (supported: description)"
+    )]
+    fields: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -384,6 +415,8 @@ struct HttpRequestArgs {
     body_file: Option<PathBuf>,
     #[arg(long, value_enum)]
     content_type: Option<HttpContentTypeArg>,
+    #[arg(long, help = "Print the complete response body without truncation")]
+    full: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::Args)]
@@ -621,7 +654,11 @@ struct StatusView {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let no_args = cli.command.is_none();
     let command = cli.command.unwrap_or(Command::Status);
+    if no_args {
+        print_home_header(cli.output);
+    }
     match command {
         Command::Status => print_status(cli.output),
         Command::Init(arguments) => initialize_vault(cli.output, arguments),
@@ -638,6 +675,7 @@ fn main() -> ExitCode {
         } => http_request(cli.output, arguments),
         Command::Workspace { command } => workspace_command(cli.output, command),
         Command::ConvenienceUnlock { command } => convenience_unlock_command(cli.output, command),
+        Command::Session { command } => session_command(cli.output, command),
     }
 }
 
@@ -769,6 +807,224 @@ fn convenience_unlock_command(output: Output, command: ConvenienceUnlockCommand)
     }
 }
 
+/// Directory-scoped, token-budget-aware dashboard suitable for a
+/// `SessionStart` hook (AXI guideline §7): only what an agent needs to
+/// orient before taking any action, never the full status view's agent
+/// session count or admin lease detail, and never secret material.
+fn session_command(output: Output, command: SessionCommand) -> ExitCode {
+    match command {
+        SessionCommand::Context(_) => print_session_context(output),
+        SessionCommand::Setup(arguments) => session_setup(output, &arguments),
+    }
+}
+
+fn print_session_context(output: Output) -> ExitCode {
+    match client::request(Operation::Status) {
+        Ok(Reply::Status(status)) => {
+            let service = match status.service {
+                ServiceState::Unlocked => "unlocked",
+                ServiceState::Locked => "locked",
+            };
+            print_session_context_view(output, "running", service, status.active_profile.as_deref())
+        }
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(ClientError::NotRunning) => {
+            print_session_context_view(output, "stopped", "inactive", None)
+        }
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn print_session_context_view(
+    output: Output,
+    daemon: &str,
+    service: &str,
+    profile: Option<&str>,
+) -> ExitCode {
+    match output {
+        Output::Human => println!(
+            "envault: daemon {daemon} · service {service} · profile {}",
+            profile.unwrap_or("none")
+        ),
+        Output::Json => println!(
+            "{}",
+            serde_json::json!({ "daemon": daemon, "service": service, "profile": profile })
+        ),
+        Output::Toon => println!(
+            "session{{daemon,service,profile}}: {},{},{}",
+            daemon,
+            service,
+            optional_toon(profile)
+        ),
+    }
+    ExitCode::SUCCESS
+}
+
+const SESSION_HOOK_MARKER: &str = "--envault-session-hook";
+
+fn session_setup(output: Output, arguments: &SessionSetupArgs) -> ExitCode {
+    let Ok(executable) = std::env::current_exe() else {
+        return print_error(
+            output,
+            &input_error(
+                "io_error",
+                "unable to resolve the current executable's path",
+            ),
+        );
+    };
+    let command = session_hook_command(&executable);
+    match install_session_hook(&arguments.settings_file, &command) {
+        Ok(HookInstallOutcome::Installed) => print_session_setup_result(output, "installed"),
+        Ok(HookInstallOutcome::Repaired) => print_session_setup_result(output, "repaired"),
+        Ok(HookInstallOutcome::Unchanged) => print_session_setup_result(output, "unchanged"),
+        Err(message) => print_error(output, &input_error("io_error", &message)),
+    }
+}
+
+fn print_session_setup_result(output: Output, state: &str) -> ExitCode {
+    match output {
+        Output::Human => println!("session hook: {state}"),
+        Output::Json => println!("{{\"status\":{}}}", toon_string(state)),
+        Output::Toon => println!("session_hook{{status}}: {}", toon_string(state)),
+    }
+    ExitCode::SUCCESS
+}
+
+/// A PATH-verified binary name is portable across machines and survives a
+/// relocated install; the absolute path is the fallback only when the
+/// current executable isn't the one `PATH` would actually resolve, so a
+/// stale `PATH` entry can never shadow this hook with a different binary.
+fn session_hook_command(executable: &Path) -> String {
+    let binary_name = executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("envault");
+    let resolves_to_current = which_on_path(binary_name)
+        .is_some_and(|resolved| paths_reference_the_same_file(&resolved, executable));
+    let program = if resolves_to_current {
+        binary_name.to_owned()
+    } else {
+        shell_quote(&executable.display().to_string())
+    };
+    format!("{program} session context --output toon {SESSION_HOOK_MARKER}")
+}
+
+#[cfg(windows)]
+fn shell_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+#[cfg(not(windows))]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn which_on_path(binary_name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|directory| directory.join(binary_name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn paths_reference_the_same_file(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+enum HookInstallOutcome {
+    Installed,
+    Repaired,
+    Unchanged,
+}
+
+/// Installs (or repairs) a `SessionStart` hook entry whose command contains
+/// [`SESSION_HOOK_MARKER`], matching the "explicit opt-in setup command,
+/// idempotent on repeat, path repair on relocation" contract AXI guideline
+/// §7 sets for ambient session integrations.
+fn install_session_hook(settings_path: &Path, command: &str) -> Result<HookInstallOutcome, String> {
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let text = fs::read_to_string(settings_path)
+            .map_err(|error| format!("failed to read {}: {error}", settings_path.display()))?;
+        if text.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&text).map_err(|error| {
+                format!(
+                    "{} contains invalid JSON and was left untouched: {error}",
+                    settings_path.display()
+                )
+            })?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    let hooks = settings
+        .as_object_mut()
+        .ok_or_else(|| format!("{} is not a JSON object", settings_path.display()))?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let session_start = hooks
+        .as_object_mut()
+        .ok_or_else(|| format!("{} `hooks` is not a JSON object", settings_path.display()))?
+        .entry("SessionStart")
+        .or_insert_with(|| serde_json::json!([]));
+    let session_start_entries = session_start.as_array_mut().ok_or_else(|| {
+        format!(
+            "{} `hooks.SessionStart` is not an array",
+            settings_path.display()
+        )
+    })?;
+
+    let existing_hook = session_start_entries.iter_mut().find_map(|entry| {
+        entry
+            .get_mut("hooks")?
+            .as_array_mut()?
+            .iter_mut()
+            .find(|hook| {
+                hook.get("command")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|existing| existing.contains(SESSION_HOOK_MARKER))
+            })
+    });
+
+    let outcome = if let Some(hook) = existing_hook {
+        let current = hook.get("command").and_then(|value| value.as_str());
+        if current == Some(command) {
+            HookInstallOutcome::Unchanged
+        } else {
+            hook["command"] = serde_json::Value::String(command.to_owned());
+            HookInstallOutcome::Repaired
+        }
+    } else {
+        session_start_entries.push(serde_json::json!({
+            "matcher": "*",
+            "hooks": [{ "type": "command", "command": command }],
+        }));
+        HookInstallOutcome::Installed
+    };
+
+    if matches!(
+        outcome,
+        HookInstallOutcome::Installed | HookInstallOutcome::Repaired
+    ) {
+        if let Some(parent) = settings_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+        }
+        let rendered = serde_json::to_string_pretty(&settings)
+            .map_err(|error| format!("failed to serialize settings: {error}"))?;
+        fs::write(settings_path, rendered + "\n")
+            .map_err(|error| format!("failed to write {}: {error}", settings_path.display()))?;
+    }
+
+    Ok(outcome)
+}
+
 fn admin_command(output: Output, command: AdminCommand) -> ExitCode {
     match command {
         AdminCommand::Unlock(arguments) => {
@@ -844,8 +1100,15 @@ fn admin_agent_command(output: Output, command: AdminAgentCommand) -> ExitCode {
         },
     };
     match client::request(operation) {
-        Ok(Reply::Principal(principal)) => print_principals(output, &[principal]),
-        Ok(Reply::Principals(principals)) => print_principals(output, &principals),
+        Ok(Reply::Principal(principal)) => print_principals(output, &[principal], &[]),
+        Ok(Reply::Principals(principals)) => {
+            let help: &[&str] = if principals.is_empty() {
+                &["Run `envault admin agent create \"<name>\"` to add an agent principal"]
+            } else {
+                &["Run `envault admin agent disable <principal-id>` to revoke an agent"]
+            };
+            print_principals(output, &principals, help)
+        }
         Ok(_) => print_error(output, &unexpected_response()),
         Err(error) => print_error(output, &client_error(error)),
     }
@@ -982,10 +1245,21 @@ fn profile_command(output: Output, command: ProfileCommand) -> ExitCode {
         | ProfileCommand::ImportEnv(_)
         | ProfileCommand::ExportEnv(_) => unreachable!("portability commands returned above"),
     };
+    let is_list = matches!(&operation, Operation::ListProfiles);
     match client::request(operation) {
-        Ok(Reply::Profile(profile)) => print_profiles(output, &[profile]),
-        Ok(Reply::Profiles(profiles)) => print_profiles(output, &profiles),
-        Ok(Reply::Acknowledged) => print_acknowledgement(output, "profile_deleted"),
+        Ok(Reply::Profile(profile)) => print_profiles(output, &[profile], &[]),
+        Ok(Reply::Profiles(profiles)) if is_list => {
+            let help: &[&str] = if profiles.is_empty() {
+                &["Run `envault profile create \"<name>\"` to add a profile"]
+            } else {
+                &["Run `envault profile show \"<name>\"` to see full details"]
+            };
+            print_profiles(output, &profiles, help)
+        }
+        Ok(Reply::Profiles(profiles)) => print_profiles(output, &profiles, &[]),
+        Ok(Reply::Acknowledged { no_op }) => {
+            print_acknowledgement(output, "profile_deleted", no_op)
+        }
         Ok(_) => print_error(output, &unexpected_response()),
         Err(error) => print_error(output, &client_error(error)),
     }
@@ -1181,7 +1455,7 @@ fn export_plaintext_env(output: Output, arguments: PlaintextExportArgs) -> ExitC
 fn secret_command(output: Output, command: SecretCommand) -> ExitCode {
     match command {
         SecretCommand::Create(arguments) => create_secret(output, arguments),
-        SecretCommand::List(arguments) => list_secrets(output, arguments),
+        SecretCommand::List(arguments) => list_secrets(output, &arguments),
         SecretCommand::Describe(arguments) => request_secret(
             output,
             Operation::DescribeSecret {
@@ -1213,7 +1487,14 @@ fn secret_command(output: Output, command: SecretCommand) -> ExitCode {
             match client::request(Operation::ListSecretVersions {
                 name: arguments.name,
             }) {
-                Ok(Reply::SecretVersions(versions)) => print_versions(output, &versions),
+                Ok(Reply::SecretVersions(versions)) => {
+                    let help: &[&str] = if versions.is_empty() {
+                        &[]
+                    } else {
+                        &["Run `envault secret value generate \"<name>\"` to add a new version"]
+                    };
+                    print_versions(output, &versions, help)
+                }
                 Ok(_) => print_error(output, &unexpected_response()),
                 Err(error) => print_error(output, &client_error(error)),
             }
@@ -1259,7 +1540,27 @@ fn create_secret(output: Output, arguments: SecretCreateArgs) -> ExitCode {
     request_secret(output, operation)
 }
 
-fn list_secrets(output: Output, arguments: SecretListArgs) -> ExitCode {
+const SECRET_LIST_SUPPORTED_FIELDS: &[&str] = &["description"];
+
+fn list_secrets(output: Output, arguments: &SecretListArgs) -> ExitCode {
+    if let Some(field) = arguments
+        .fields
+        .iter()
+        .find(|field| !SECRET_LIST_SUPPORTED_FIELDS.contains(&field.as_str()))
+    {
+        return print_error(
+            output,
+            &input_error(
+                "unknown_field",
+                &format!(
+                    "unknown field `{field}` for `secret list`; supported fields: {}",
+                    SECRET_LIST_SUPPORTED_FIELDS.join(", ")
+                ),
+            ),
+        );
+    }
+    let include_description =
+        arguments.describe || arguments.fields.iter().any(|field| field == "description");
     let result = if arguments.token_stdin {
         let token = match read_capability_token(true) {
             Ok(token) => token,
@@ -1271,12 +1572,17 @@ fn list_secrets(output: Output, arguments: SecretListArgs) -> ExitCode {
     };
     match result {
         Ok(Reply::Secrets(mut secrets)) => {
-            if !arguments.describe {
+            if !include_description {
                 for secret in &mut secrets {
                     secret.description = None;
                 }
             }
-            print_secrets(output, &secrets)
+            let help: &[&str] = if secrets.is_empty() {
+                &["Run `envault secret create \"<name>\" --stdin` to add a secret"]
+            } else {
+                &["Run `envault secret describe \"<name>\"` to see full details"]
+            };
+            print_secrets(output, &secrets, help)
         }
         Ok(_) => print_error(output, &unexpected_response()),
         Err(error) => print_error(output, &client_error(error)),
@@ -1313,7 +1619,7 @@ fn secret_value_command(output: Output, command: SecretValueCommand) -> ExitCode
         }
     };
     match client::request(operation) {
-        Ok(Reply::SecretVersion(version)) => print_versions(output, &[version]),
+        Ok(Reply::SecretVersion(version)) => print_versions(output, &[version], &[]),
         Ok(_) => print_error(output, &unexpected_response()),
         Err(error) => print_error(output, &client_error(error)),
     }
@@ -1321,7 +1627,7 @@ fn secret_value_command(output: Output, command: SecretValueCommand) -> ExitCode
 
 fn request_secret(output: Output, operation: Operation) -> ExitCode {
     match client::request(operation) {
-        Ok(Reply::Secret(secret)) => print_secrets(output, &[secret]),
+        Ok(Reply::Secret(secret)) => print_secrets(output, &[secret], &[]),
         Ok(_) => print_error(output, &unexpected_response()),
         Err(error) => print_error(output, &client_error(error)),
     }
@@ -1339,6 +1645,7 @@ fn http_request(output: Output, arguments: HttpRequestArgs) -> ExitCode {
         },
         None => Vec::new(),
     };
+    let full = arguments.full;
     let request = HttpRequest {
         url: arguments.url,
         method: http_method(arguments.method),
@@ -1352,7 +1659,7 @@ fn http_request(output: Output, arguments: HttpRequestArgs) -> ExitCode {
         },
         Some(token),
     ) {
-        Ok(Reply::HttpResponse(response)) => print_http_response(output, &response),
+        Ok(Reply::HttpResponse(response)) => print_http_response(output, &response, full),
         Ok(_) => print_error(output, &unexpected_response()),
         Err(error) => print_error(output, &client_error(error)),
     }
@@ -1562,11 +1869,16 @@ const fn http_content_type(content_type: HttpContentTypeArg) -> HttpContentType 
 
 fn lifecycle_request(output: Output, operation: Operation, state: &str) -> ExitCode {
     match client::request(operation) {
-        Ok(Reply::Acknowledged) => {
+        Ok(Reply::Acknowledged { no_op }) => {
             match output {
+                Output::Human if no_op => println!("service: {state} (no-op)"),
                 Output::Human => println!("service: {state}"),
-                Output::Json => println!("{{\"status\":{}}}", toon_string(state)),
-                Output::Toon => println!("service{{status}}: {}", toon_string(state)),
+                Output::Json => {
+                    println!("{{\"status\":{},\"no_op\":{no_op}}}", toon_string(state));
+                }
+                Output::Toon => {
+                    println!("service{{status,no_op}}: {},{no_op}", toon_string(state));
+                }
             }
             ExitCode::SUCCESS
         }
@@ -2048,139 +2360,223 @@ fn print_created_grant(output: Output, created: AgentSessionCreated) -> ExitCode
     ExitCode::SUCCESS
 }
 
-fn print_profiles(output: Output, profiles: &[ProfileView]) -> ExitCode {
-    if matches!(output, Output::Json) {
-        print_json(profiles);
-    } else if matches!(output, Output::Toon) {
+/// Prints the next-step suggestions a list or mutation view carries, per
+/// AXI guideline §9. Called after the primary data so the hints read as
+/// supplementary rather than part of the record itself.
+fn print_human_help(help: &[&str]) {
+    for item in help {
+        println!("help: {item}");
+    }
+}
+
+fn print_toon_help(help: &[&str]) {
+    if !help.is_empty() {
         println!(
-            "profiles[{}]{{id,scope_id,name,description,activate_on_start,generation}}:",
-            profiles.len()
+            "help[{}]: {}",
+            help.len(),
+            help.iter()
+                .map(|item| toon_string(item))
+                .collect::<Vec<_>>()
+                .join(",")
         );
-        for profile in profiles {
-            println!(
-                "  {},{},{},{},{},{}",
-                profile.id.0,
-                profile.scope_id.0,
-                toon_string(&profile.name),
-                optional_toon(profile.description.as_deref()),
-                profile.activate_on_start,
-                profile.generation
-            );
+    }
+}
+
+fn print_profiles(output: Output, profiles: &[ProfileView], help: &[&str]) -> ExitCode {
+    match output {
+        Output::Json => {
+            print_json(profiles);
         }
-    } else {
-        for profile in profiles {
+        Output::Toon => {
             println!(
-                "{} · id: {} · scope: {} · startup: {} · description: {}",
-                profile.name,
-                profile.id.0,
-                profile.scope_id.0,
-                profile.activate_on_start,
-                profile.description.as_deref().unwrap_or("none")
+                "profiles[{}]{{id,scope_id,name,description,activate_on_start,generation}}:",
+                profiles.len()
             );
+            for profile in profiles {
+                println!(
+                    "  {},{},{},{},{},{}",
+                    profile.id.0,
+                    profile.scope_id.0,
+                    toon_string(&profile.name),
+                    optional_toon(profile.description.as_deref()),
+                    profile.activate_on_start,
+                    profile.generation
+                );
+            }
+            print_toon_help(help);
+        }
+        Output::Human => {
+            if profiles.is_empty() {
+                println!("profiles: 0 profiles found");
+            } else {
+                for profile in profiles {
+                    println!(
+                        "{} · id: {} · scope: {} · startup: {} · description: {}",
+                        profile.name,
+                        profile.id.0,
+                        profile.scope_id.0,
+                        profile.activate_on_start,
+                        profile.description.as_deref().unwrap_or("none")
+                    );
+                }
+            }
+            print_human_help(help);
         }
     }
     ExitCode::SUCCESS
 }
 
-fn print_secrets(output: Output, secrets: &[SecretView]) -> ExitCode {
-    if matches!(output, Output::Json) {
-        print_json(secrets);
-    } else if matches!(output, Output::Toon) {
-        println!(
-            "secrets[{}]{{id,scope_id,name,description,current_version,status}}:",
-            secrets.len()
-        );
-        for secret in secrets {
-            println!(
-                "  {},{},{},{},{},{:?}",
-                secret.id.0,
-                secret.scope_id.0,
-                toon_string(&secret.name),
-                optional_toon(secret.description.as_deref()),
-                secret.current_version,
-                secret.status
-            );
+fn print_secrets(output: Output, secrets: &[SecretView], help: &[&str]) -> ExitCode {
+    match output {
+        Output::Json => {
+            print_json(secrets);
         }
-    } else {
-        for secret in secrets {
+        Output::Toon => {
             println!(
-                "{} · id: {} · scope: {} · version: {} · status: {:?} · description: {}",
-                secret.name,
-                secret.id.0,
-                secret.scope_id.0,
-                secret.current_version,
-                secret.status,
-                secret.description.as_deref().unwrap_or("none")
+                "secrets[{}]{{id,scope_id,name,description,current_version,status}}:",
+                secrets.len()
             );
+            for secret in secrets {
+                println!(
+                    "  {},{},{},{},{},{:?}",
+                    secret.id.0,
+                    secret.scope_id.0,
+                    toon_string(&secret.name),
+                    optional_toon(secret.description.as_deref()),
+                    secret.current_version,
+                    secret.status
+                );
+            }
+            print_toon_help(help);
         }
-    }
-    ExitCode::SUCCESS
-}
-
-fn print_versions(output: Output, versions: &[SecretVersionView]) -> ExitCode {
-    if matches!(output, Output::Json) {
-        print_json(versions);
-    } else if matches!(output, Output::Toon) {
-        println!(
-            "versions[{}]{{id,secret_id,version,generator,generated_length,entropy_bits}}:",
-            versions.len()
-        );
-        for version in versions {
-            println!(
-                "  {},{},{},{:?},{},{}",
-                version.id.0,
-                version.secret_id.0,
-                version.version,
-                version.generator,
-                optional_number(version.generated_length),
-                optional_number(version.entropy_bits)
-            );
-        }
-    } else {
-        for version in versions {
-            println!(
-                "version: {} · id: {} · generator: {:?} · length: {} · entropy_bits: {}",
-                version.version,
-                version.id.0,
-                version.generator,
-                optional_number(version.generated_length),
-                optional_number(version.entropy_bits)
-            );
+        Output::Human => {
+            if secrets.is_empty() {
+                println!("secrets: 0 secrets found");
+            } else {
+                for secret in secrets {
+                    println!(
+                        "{} · id: {} · scope: {} · version: {} · status: {:?} · description: {}",
+                        secret.name,
+                        secret.id.0,
+                        secret.scope_id.0,
+                        secret.current_version,
+                        secret.status,
+                        secret.description.as_deref().unwrap_or("none")
+                    );
+                }
+            }
+            print_human_help(help);
         }
     }
     ExitCode::SUCCESS
 }
 
-fn print_principals(output: Output, principals: &[envault_core::PrincipalView]) -> ExitCode {
-    if matches!(output, Output::Json) {
-        print_json(principals);
-    } else if matches!(output, Output::Toon) {
-        println!(
-            "principals[{}]{{id,kind,name,disabled,generation}}:",
-            principals.len()
-        );
-        for principal in principals {
-            println!(
-                "  {},{:?},{},{},{}",
-                principal.id.0,
-                principal.kind,
-                toon_string(&principal.name),
-                principal.disabled,
-                principal.generation
-            );
+fn print_versions(output: Output, versions: &[SecretVersionView], help: &[&str]) -> ExitCode {
+    match output {
+        Output::Json => {
+            print_json(versions);
         }
-    } else {
-        for principal in principals {
+        Output::Toon => {
             println!(
-                "{} · id: {} · kind: {:?} · disabled: {}",
-                principal.name, principal.id.0, principal.kind, principal.disabled
+                "versions[{}]{{id,secret_id,version,generator,generated_length,entropy_bits}}:",
+                versions.len()
             );
+            for version in versions {
+                println!(
+                    "  {},{},{},{:?},{},{}",
+                    version.id.0,
+                    version.secret_id.0,
+                    version.version,
+                    version.generator,
+                    optional_number(version.generated_length),
+                    optional_number(version.entropy_bits)
+                );
+            }
+            print_toon_help(help);
+        }
+        Output::Human => {
+            if versions.is_empty() {
+                println!("versions: 0 versions found");
+            } else {
+                for version in versions {
+                    println!(
+                        "version: {} · id: {} · generator: {:?} · length: {} · entropy_bits: {}",
+                        version.version,
+                        version.id.0,
+                        version.generator,
+                        optional_number(version.generated_length),
+                        optional_number(version.entropy_bits)
+                    );
+                }
+            }
+            print_human_help(help);
         }
     }
     ExitCode::SUCCESS
 }
 
-fn print_http_response(output: Output, response: &HttpResponse) -> ExitCode {
+fn print_principals(
+    output: Output,
+    principals: &[envault_core::PrincipalView],
+    help: &[&str],
+) -> ExitCode {
+    match output {
+        Output::Json => {
+            print_json(principals);
+        }
+        Output::Toon => {
+            println!(
+                "principals[{}]{{id,kind,name,disabled,generation}}:",
+                principals.len()
+            );
+            for principal in principals {
+                println!(
+                    "  {},{:?},{},{},{}",
+                    principal.id.0,
+                    principal.kind,
+                    toon_string(&principal.name),
+                    principal.disabled,
+                    principal.generation
+                );
+            }
+            print_toon_help(help);
+        }
+        Output::Human => {
+            if principals.is_empty() {
+                println!("principals: 0 principals found");
+            } else {
+                for principal in principals {
+                    println!(
+                        "{} · id: {} · kind: {:?} · disabled: {}",
+                        principal.name, principal.id.0, principal.kind, principal.disabled
+                    );
+                }
+            }
+            print_human_help(help);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Content large enough to justify truncation costs an agent tokens whether
+/// shown in full or omitted; per AXI guideline §3 the response is always a
+/// bounded preview plus the total size and the flag that reveals the rest,
+/// never a silent drop.
+const TRUNCATION_LIMIT: usize = 1000;
+
+fn truncate_preview(value: &str, full: bool) -> (&str, Option<usize>) {
+    if full || value.len() <= TRUNCATION_LIMIT {
+        return (value, None);
+    }
+    let mut boundary = TRUNCATION_LIMIT;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    (&value[..boundary], Some(value.len()))
+}
+
+fn print_http_response(output: Output, response: &HttpResponse, full: bool) -> ExitCode {
+    let (preview, total_size) = truncate_preview(&response.body, full);
     match output {
         Output::Human => {
             println!("status: {}", response.status);
@@ -2188,16 +2584,53 @@ fn print_http_response(output: Output, response: &HttpResponse) -> ExitCode {
                 "content-type: {}",
                 response.content_type.as_deref().unwrap_or("none")
             );
-            print!("{}", response.body);
+            print!("{preview}");
             let _ = io::stdout().flush();
+            if let Some(total) = total_size {
+                println!(
+                    "\n... (truncated, {total} bytes total, run with `--full` to see the complete body)"
+                );
+            }
         }
-        Output::Json => print_json(response),
-        Output::Toon => println!(
-            "http{{status,content_type,body}}: {},{},{}",
-            response.status,
-            optional_toon(response.content_type.as_deref()),
-            toon_string(&response.body)
-        ),
+        Output::Json => {
+            if let Some(total) = total_size {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": response.status,
+                        "content_type": response.content_type,
+                        "body": preview,
+                        "truncated": true,
+                        "total_bytes": total,
+                        "help": ["Rerun with `--full` to see the complete body"],
+                    })
+                );
+            } else {
+                print_json(response);
+            }
+        }
+        Output::Toon => {
+            if let Some(total) = total_size {
+                println!(
+                    "http{{status,content_type,body,truncated,total_bytes}}: {},{},{},true,{}",
+                    response.status,
+                    optional_toon(response.content_type.as_deref()),
+                    toon_string(preview),
+                    total
+                );
+                println!(
+                    "help[1]: {}",
+                    toon_string("Rerun with `--full` to see the complete body")
+                );
+            } else {
+                println!(
+                    "http{{status,content_type,body}}: {},{},{}",
+                    response.status,
+                    optional_toon(response.content_type.as_deref()),
+                    toon_string(preview)
+                );
+            }
+        }
     }
     ExitCode::SUCCESS
 }
@@ -2219,11 +2652,12 @@ fn print_json_or_debug<T: Serialize + core::fmt::Debug>(
     ExitCode::SUCCESS
 }
 
-fn print_acknowledgement(output: Output, state: &str) -> ExitCode {
+fn print_acknowledgement(output: Output, state: &str, no_op: bool) -> ExitCode {
     match output {
+        Output::Human if no_op => println!("status: {state} (no-op)"),
         Output::Human => println!("status: {state}"),
-        Output::Json => println!("{{\"status\":{}}}", toon_string(state)),
-        Output::Toon => println!("status{{state}}: {}", toon_string(state)),
+        Output::Json => println!("{{\"status\":{},\"no_op\":{no_op}}}", toon_string(state)),
+        Output::Toon => println!("status{{state,no_op}}: {},{no_op}", toon_string(state)),
     }
     ExitCode::SUCCESS
 }
@@ -2241,6 +2675,46 @@ fn optional_toon(value: Option<&str>) -> String {
 
 fn optional_number<T: ToString>(value: Option<T>) -> String {
     value.map_or_else(|| "null".into(), |number| number.to_string())
+}
+
+const HOME_HEADER_DESCRIPTION: &str = "Manage the local encrypted secrets vault and agent access";
+
+/// Identifies the tool itself ahead of live state, per AXI guideline §10: an
+/// agent seeing bare state has no way to tell what produced it or where the
+/// binary lives, so a no-args invocation names both first.
+fn print_home_header(output: Output) {
+    let bin = home_collapsed_executable_path();
+    match output {
+        Output::Human => {
+            println!("bin: {bin}");
+            println!("description: {HOME_HEADER_DESCRIPTION}");
+        }
+        Output::Json => {}
+        Output::Toon => println!(
+            "bin{{path,description}}: {},{}",
+            toon_string(&bin),
+            toon_string(HOME_HEADER_DESCRIPTION)
+        ),
+    }
+}
+
+fn home_collapsed_executable_path() -> String {
+    let Ok(executable) = std::env::current_exe() else {
+        return "envault".to_owned();
+    };
+    let home = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok());
+    collapse_home(&executable.display().to_string(), home.as_deref())
+}
+
+fn collapse_home(path: &str, home: Option<&str>) -> String {
+    match home {
+        Some(home) if !home.is_empty() && path.starts_with(home) => {
+            format!("~{}", &path[home.len()..])
+        }
+        _ => path.to_owned(),
+    }
 }
 
 fn print_status(output: Output) -> ExitCode {
@@ -2401,6 +2875,7 @@ fn service_error(error: &ServiceError) -> StructuredError {
         help: vec!["Run `envault status` for current state".into()],
         request_id: Uuid::new_v4(),
         retryable,
+        kind: ErrorKind::Runtime,
     }
 }
 
@@ -2413,6 +2888,7 @@ fn client_error(error: ClientError) -> StructuredError {
             help: vec!["Run `envault start`".into()],
             request_id: Uuid::new_v4(),
             retryable: true,
+            kind: ErrorKind::Runtime,
         },
         ClientError::Timeout => StructuredError {
             code: "request_timeout".into(),
@@ -2420,6 +2896,7 @@ fn client_error(error: ClientError) -> StructuredError {
             help: vec!["Retry the request".into()],
             request_id: Uuid::new_v4(),
             retryable: true,
+            kind: ErrorKind::Runtime,
         },
         ClientError::PortabilityTimeout => StructuredError {
             code: "request_timeout".into(),
@@ -2430,6 +2907,7 @@ fn client_error(error: ClientError) -> StructuredError {
             ],
             request_id: Uuid::new_v4(),
             retryable: false,
+            kind: ErrorKind::Runtime,
         },
         ClientError::UnsupportedPlatform => StructuredError {
             code: "platform_not_supported".into(),
@@ -2438,6 +2916,7 @@ fn client_error(error: ClientError) -> StructuredError {
             help: vec!["Use Linux or macOS until Phase 7".into()],
             request_id: Uuid::new_v4(),
             retryable: false,
+            kind: ErrorKind::Runtime,
         },
         ClientError::Protocol | ClientError::UnexpectedResponse => unexpected_response(),
     }
@@ -2450,6 +2929,7 @@ fn unexpected_response() -> StructuredError {
         help: vec!["Stop and restart EnVault".into()],
         request_id: Uuid::new_v4(),
         retryable: true,
+        kind: ErrorKind::Runtime,
     }
 }
 
@@ -2465,6 +2945,7 @@ fn input_error(code: &str, message: &str) -> StructuredError {
         }],
         request_id: Uuid::new_v4(),
         retryable,
+        kind: ErrorKind::Usage,
     }
 }
 
@@ -2496,7 +2977,10 @@ fn print_error(output: Output, error: &StructuredError) -> ExitCode {
                 .join(",")
         ),
     }
-    ExitCode::FAILURE
+    match error.kind {
+        ErrorKind::Usage => ExitCode::from(2),
+        ErrorKind::Runtime => ExitCode::FAILURE,
+    }
 }
 
 fn toon_string(value: &str) -> String {
@@ -2549,7 +3033,8 @@ mod tests {
                 "agent",
                 "request",
                 "workspace",
-                "convenience-unlock"
+                "convenience-unlock",
+                "session"
             ]
         );
     }
@@ -2683,6 +3168,59 @@ mod tests {
         assert_eq!(error.code, "request_timeout");
         assert!(!error.retryable);
         assert!(error.help[0].contains("Preview current state"));
+    }
+
+    #[test]
+    fn collapse_home_replaces_only_a_matching_prefix() {
+        assert_eq!(
+            collapse_home("/home/alice/.local/bin/envault", Some("/home/alice")),
+            "~/.local/bin/envault"
+        );
+        assert_eq!(
+            collapse_home("/usr/local/bin/envault", Some("/home/alice")),
+            "/usr/local/bin/envault"
+        );
+        assert_eq!(
+            collapse_home("/usr/local/bin/envault", None),
+            "/usr/local/bin/envault"
+        );
+    }
+
+    #[test]
+    fn shell_quote_protects_hook_paths() {
+        #[cfg(windows)]
+        assert_eq!(
+            shell_quote(r#"C:\Program Files\o\"matic"#),
+            r#""C:\Program Files\o\\"matic""#
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            shell_quote("/opt/En Vault/o'matic"),
+            "'/opt/En Vault/o'\\''matic'"
+        );
+    }
+
+    #[test]
+    fn truncate_preview_passes_short_values_through_untouched() {
+        let (preview, total) = truncate_preview("short body", false);
+        assert_eq!(preview, "short body");
+        assert_eq!(total, None);
+    }
+
+    #[test]
+    fn truncate_preview_bounds_long_values_and_reports_total_size() {
+        let body = "x".repeat(TRUNCATION_LIMIT + 500);
+        let (preview, total) = truncate_preview(&body, false);
+        assert_eq!(preview.len(), TRUNCATION_LIMIT);
+        assert_eq!(total, Some(body.len()));
+    }
+
+    #[test]
+    fn truncate_preview_full_flag_always_returns_the_complete_value() {
+        let body = "x".repeat(TRUNCATION_LIMIT + 500);
+        let (preview, total) = truncate_preview(&body, true);
+        assert_eq!(preview.len(), body.len());
+        assert_eq!(total, None);
     }
 
     #[test]
