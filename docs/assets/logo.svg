@@ -1,0 +1,19 @@
+<svg width="140" height="140" viewBox="0 0 140 140" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="EnVault logo">
+  <defs>
+    <linearGradient id="envault-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1B2A4A"/>
+      <stop offset="100%" stop-color="#0D3B4F"/>
+    </linearGradient>
+    <linearGradient id="envault-lock" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#5EEAD4"/>
+      <stop offset="100%" stop-color="#22D3AE"/>
+    </linearGradient>
+  </defs>
+
+  <circle cx="70" cy="70" r="66" fill="url(#envault-bg)" stroke="#22D3AE" stroke-width="2"/>
+
+  <rect x="44" y="66" width="52" height="40" rx="8" fill="url(#envault-lock)"/>
+  <path d="M52 66 V50 a18 18 0 0 1 36 0 V66" fill="none" stroke="url(#envault-lock)" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="70" cy="84" r="6" fill="#0D3B4F"/>
+  <rect x="67" y="84" width="6" height="14" rx="3" fill="#0D3B4F"/>
+</svg>
