@@ -146,59 +146,65 @@ fn verify_contract() -> Result<()> {
     for command in &contract.command {
         validate_command_contract(command, &mut paths)?;
     }
-    let skill = fs::read_to_string(".agents/skills/envault/SKILL.md").context("read skill")?;
-    for required in [
-        "envault start",
-        "context --token-stdin",
-        "secret list --describe --token-stdin",
-        "request http URL",
-        "Never reveal",
-        "Never start the daemon",
-        "Never authenticate",
-    ] {
-        if !skill.contains(required) {
-            bail!("skill is missing contract text: {required}");
+    if Path::new(".agents/skills/envault").is_dir() {
+        let skill = fs::read_to_string(".agents/skills/envault/SKILL.md").context("read skill")?;
+        for required in [
+            "envault start",
+            "context --token-stdin",
+            "secret list --describe --token-stdin",
+            "request http URL",
+            "Never reveal",
+            "Never start the daemon",
+            "Never authenticate",
+        ] {
+            if !skill.contains(required) {
+                bail!("skill is missing contract text: {required}");
+            }
         }
-    }
-    for path in [
-        ".agents/skills/envault/references/command-contract.md",
-        ".agents/skills/envault/references/security-boundary.md",
-        ".agents/skills/envault/agents/openai.yaml",
-    ] {
-        if !Path::new(path).is_file() {
-            bail!("required skill resource is missing: {path}");
+        for path in [
+            ".agents/skills/envault/references/command-contract.md",
+            ".agents/skills/envault/references/security-boundary.md",
+            ".agents/skills/envault/agents/openai.yaml",
+        ] {
+            if !Path::new(path).is_file() {
+                bail!("required skill resource is missing: {path}");
+            }
         }
-    }
-    let command_reference =
-        fs::read_to_string(".agents/skills/envault/references/command-contract.md")
-            .context("read skill command reference")?;
-    for required in [
-        "context --token-stdin",
-        "secret list --describe --token-stdin",
-        "agent session status --token-stdin",
-        "request http URL --method METHOD --secret UUID --token-stdin",
-    ] {
-        if !command_reference.contains(required) {
-            bail!("skill command reference is missing: {required}");
+        let command_reference =
+            fs::read_to_string(".agents/skills/envault/references/command-contract.md")
+                .context("read skill command reference")?;
+        for required in [
+            "context --token-stdin",
+            "secret list --describe --token-stdin",
+            "agent session status --token-stdin",
+            "request http URL --method METHOD --secret UUID --token-stdin",
+        ] {
+            if !command_reference.contains(required) {
+                bail!("skill command reference is missing: {required}");
+            }
         }
-    }
-    let security_reference =
-        fs::read_to_string(".agents/skills/envault/references/security-boundary.md")
-            .context("read skill security reference")?;
-    for required in [
-        "Never use admin commands",
-        "Never start EnVault",
-        "Never authenticate",
-        "Never ask for plaintext",
-    ] {
-        if !security_reference.contains(required) {
-            bail!("skill security reference is missing: {required}");
+        let security_reference =
+            fs::read_to_string(".agents/skills/envault/references/security-boundary.md")
+                .context("read skill security reference")?;
+        for required in [
+            "Never use admin commands",
+            "Never start EnVault",
+            "Never authenticate",
+            "Never ask for plaintext",
+        ] {
+            if !security_reference.contains(required) {
+                bail!("skill security reference is missing: {required}");
+            }
         }
-    }
-    let openai = fs::read_to_string(".agents/skills/envault/agents/openai.yaml")
-        .context("read skill OpenAI metadata")?;
-    if !openai.contains("$envault") || !openai.contains("short_description: \"") {
-        bail!("skill OpenAI metadata is not generated from the contract");
+        let openai = fs::read_to_string(".agents/skills/envault/agents/openai.yaml")
+            .context("read skill OpenAI metadata")?;
+        if !openai.contains("$envault") || !openai.contains("short_description: \"") {
+            bail!("skill OpenAI metadata is not generated from the contract");
+        }
+    } else {
+        println!(
+            "skipping agent skill contract check: .agents/ is untracked dev-only content and absent here"
+        );
     }
     for path in [
         "docs/threat-model.md",
@@ -213,6 +219,9 @@ fn verify_contract() -> Result<()> {
         "docs/adr/0009-daemon-runtime-state.md",
         "docs/adr/0010-agent-context-and-http-broker.md",
         "docs/adr/0011-portability-import-plans.md",
+        "docs/adr/0012-tui-no-plaintext-disclosure.md",
+        "docs/adr/0013-windows-named-pipe-transport.md",
+        "docs/adr/0014-os-keystore-convenience-unlock.md",
     ] {
         if !Path::new(path).is_file() {
             bail!("required architecture document is missing: {path}");
