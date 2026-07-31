@@ -327,3 +327,27 @@ daemon = "required"
 agent = false
 outputs = ["human", "json", "toon"]
 errors = ["admin_auth_required", "package_error", "package_authentication_failed", "stale_import_plan", "conflict", "io_error"]
+
+[[command]]
+path = "convenience-unlock enable"
+auth = "human"
+daemon = "forbidden"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["vault_not_initialized", "authentication_failed", "io_error"]
+
+[[command]]
+path = "convenience-unlock disable"
+auth = "human"
+daemon = "forbidden"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["io_error"]
+
+[[command]]
+path = "convenience-unlock status"
+auth = "human"
+daemon = "forbidden"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["io_error"]

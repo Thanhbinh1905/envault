@@ -19,6 +19,7 @@ envault-platform = { version = "=0.0.1", path = "../envault-platform" }
 envault-policy = { version = "=0.0.1", path = "../envault-policy" }
 envault-protocol = { version = "=0.0.1", path = "../envault-protocol" }
 envault-service = { version = "=0.0.1", path = "../envault-service" }
+keyring.workspace = true
 ratatui.workspace = true
 rpassword.workspace = true
 serde.workspace = true
