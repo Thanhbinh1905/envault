@@ -21,7 +21,7 @@ The daemon listens on a named pipe instead of a Unix domain socket when compiled
 Both ends read and write through the existing length-prefixed CBOR framing unchanged, since framing operates on any `Read` and `Write` implementation rather than on socket-specific types.
 The pipe is created with an explicit security descriptor restricting access to the owning user, mirroring the Unix socket's directory-permission-based restriction rather than relying on default pipe ACLs.
 Connection handling preserves the existing one-request-per-connection contract; a client that sends a second request on an already-answered connection observes the connection close, exactly as the Unix transport already behaves.
-Constructing the named-pipe security descriptor requires raw Win32 FFI with no adequate safe published wrapper; ADR 0013 grants one narrowly scoped `unsafe`-code exception for this, isolated to a single `#[cfg(windows)]` module in `envault-platform`, rather than relaxing the workspace's no-unsafe-code policy generally.
+Constructing the named-pipe security descriptor requires raw Win32 FFI with no adequate safe published wrapper; ADR 0013 grants one narrowly scoped `unsafe`-code exception for this, isolated to a new, dedicated, Windows-only crate (`envault-windows-ffi`) rather than relaxing the no-unsafe-code policy of any existing crate.
 
 ## Windows peer authentication
 
@@ -30,14 +30,14 @@ Windows named pipes have no equivalent kernel-supplied UID; peer identity is ins
 A mismatched or unresolvable client identity is rejected before any operation reaches the application service, with the same fail-closed posture the Unix path already requires.
 This is a materially different security primitive from `SO_PEERCRED`, not a drop-in substitution, and is treated as such in the implementation and its tests rather than assumed equivalent by construction.
 Resolving a named pipe's connected client process and its token's security identifier requires `GetNamedPipeClientProcessId`, `OpenProcessToken`, and `GetTokenInformation`, each raw Win32 FFI with no adequate safe published wrapper.
-ADR 0013 resolves this the same way as the pipe's security descriptor: one narrowly scoped, isolated, `#[cfg(windows)]`, safety-commented `unsafe` module in `envault-platform`, exposing only safe function signatures to every caller, with no change to any other crate's `forbid(unsafe_code)`.
+ADR 0013 resolves this the same way as the pipe's security descriptor: the same dedicated, isolated, safety-commented `envault-windows-ffi` crate, exposing only safe function signatures to every caller, with no change to any existing crate's `forbid(unsafe_code)`.
 Because this sandbox has no Windows runtime, this code cannot be exercised end-to-end until the Windows runtime CI job runs it; the review gate for this phase treats that first green Windows runtime CI run as required evidence, not merely a nice-to-have, before treating peer authentication as trustworthy.
 
 ## Windows filesystem and permission hardening
 
 Path validation rejects reparse points (the Windows analog of symbolic links) on every component between the stable parent and the target, mirroring the no-follow discipline the Unix implementation already applies, and same-file identity after creation, opening, or publication is verified using `file_index` and `volume_serial_number`, the safe `std`-exposed equivalent of the Unix `(dev, ino)` pair.
 Every platform test that currently exercises Unix symlink-rejection and same-file-identity behavior gains a Windows-native counterpart.
-Restricting a private file or directory's access control list to the owning user's security identifier uses the same isolated `unsafe` module ADR 0013 establishes for the named-pipe security descriptor and peer-token comparison, rather than a second, separately reviewed exception.
+Restricting a private file or directory's access control list to the owning user's security identifier uses the same isolated `envault-windows-ffi` crate ADR 0013 establishes for the named-pipe security descriptor and peer-token comparison, rather than a second, separately reviewed exception.
 
 ## Windows runtime CI
 
