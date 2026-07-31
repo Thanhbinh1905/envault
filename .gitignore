@@ -16,3 +16,8 @@
 /docs/plans/
 /docs/reviews/
 
+# Local agent-tooling state (per-machine, not part of the shipped project)
+/.claude/
+/.codegraph/
+/skills-lock.json
+
