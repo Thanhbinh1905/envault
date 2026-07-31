@@ -898,9 +898,19 @@ fn session_hook_command(executable: &Path) -> String {
     let program = if resolves_to_current {
         binary_name.to_owned()
     } else {
-        executable.display().to_string()
+        shell_quote(&executable.display().to_string())
     };
     format!("{program} session context --output toon")
+}
+
+#[cfg(windows)]
+fn shell_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+#[cfg(not(windows))]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn which_on_path(binary_name: &str) -> Option<PathBuf> {
@@ -2673,10 +2683,7 @@ fn print_home_header(output: Output) {
             println!("bin: {bin}");
             println!("description: {HOME_HEADER_DESCRIPTION}");
         }
-        Output::Json => println!(
-            "{}",
-            serde_json::json!({ "bin": bin, "description": HOME_HEADER_DESCRIPTION })
-        ),
+        Output::Json => {}
         Output::Toon => println!(
             "bin{{path,description}}: {},{}",
             toon_string(&bin),
@@ -3170,6 +3177,20 @@ mod tests {
         assert_eq!(
             collapse_home("/usr/local/bin/envault", None),
             "/usr/local/bin/envault"
+        );
+    }
+
+    #[test]
+    fn shell_quote_protects_hook_paths() {
+        #[cfg(windows)]
+        assert_eq!(
+            shell_quote(r#"C:\Program Files\o\"matic"#),
+            r#""C:\Program Files\o\"matic""#
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            shell_quote("/opt/En Vault/o'matic"),
+            "'/opt/En Vault/o'\\''matic'"
         );
     }
 
