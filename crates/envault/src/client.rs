@@ -7,17 +7,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(unix)]
 use envault_protocol::{
-    AuthenticatedRequest, BootstrapRequest, PROTOCOL_VERSION, ProtocolError, Request, Response,
-    ResponseBody, ServiceState, validate_version,
+    AuthenticatedRequest, PROTOCOL_VERSION, ProtocolError, Request, Response, ResponseBody,
+    validate_version,
 };
+#[cfg(unix)]
+use envault_protocol::{BootstrapRequest, ServiceState};
 use envault_protocol::{DaemonStatus, Operation, Reply, SensitiveBytes, StructuredError};
 use thiserror::Error;
-#[cfg(unix)]
 use uuid::Uuid;
 
-#[cfg(unix)]
 use crate::ipc::{read_sync_frame, write_sync_frame};
 
 #[cfg(unix)]
@@ -94,7 +93,14 @@ pub fn start(password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
     }
 }
 
-#[cfg(not(unix))]
+/// The named-pipe transport and peer authentication `request_at` uses below
+/// are implemented and cross-checked on Windows (see ADR 0013), but the
+/// daemon-side listener that would actually serve a pipe for `start` to
+/// bootstrap against does not exist yet; `envaultd` still reports Windows
+/// runtime support as unavailable and exits. Spawning it here would only
+/// reproduce that failure, so `start` remains explicitly unsupported until
+/// the daemon-side accept loop lands as a follow-up.
+#[cfg(windows)]
 pub fn start(_password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
     Err(ClientError::UnsupportedPlatform)
 }
@@ -401,11 +407,77 @@ mod tests {
     }
 }
 
-#[cfg(not(unix))]
+/// Named pipes live in their own namespace (`\\.\pipe\`), not on a
+/// filesystem the runtime directory's ownership/permission metadata
+/// describes, so this derives a pipe name from the same `socket_path`
+/// input instead of treating it as a literal path, keeping one scoped name
+/// per runtime directory the same way the Unix socket file is scoped.
+#[cfg(windows)]
+fn windows_pipe_name(socket_path: &std::path::Path) -> String {
+    let sanitized: String = socket_path
+        .to_string_lossy()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!(r"\\.\pipe\{sanitized}")
+}
+
+/// Known gap: unlike the Unix path, which sets a socket read/write timeout
+/// via `set_read_timeout`/`set_write_timeout`, a `File`-wrapped named-pipe
+/// handle has no equivalent synchronous timeout primitive in `std`; enforcing
+/// `IPC_RESPONSE_TIMEOUT`/`PORTABILITY_RESPONSE_TIMEOUT` here requires either
+/// a watchdog thread that closes the handle past the deadline or switching to
+/// overlapped I/O, neither of which is implemented in this pass. Tracked as a
+/// follow-up alongside the daemon-side listener this transport currently has
+/// nothing to connect to.
+#[cfg(windows)]
 pub fn request_at(
-    _path: &std::path::Path,
-    _operation: Operation,
-    _capability_token: Option<SensitiveBytes>,
+    path: &std::path::Path,
+    operation: Operation,
+    capability_token: Option<SensitiveBytes>,
 ) -> Result<Reply, ClientError> {
-    Err(ClientError::UnsupportedPlatform)
+    let pipe_name = windows_pipe_name(path);
+    let mut stream =
+        envault_windows_ffi::connect_named_pipe_client(std::ffi::OsStr::new(&pipe_name))
+            .map_err(|_| ClientError::NotRunning)?;
+    match envault_windows_ffi::verify_pipe_server_is_current_user(&stream) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return Err(ClientError::Protocol),
+    }
+    let is_portability = operation.is_portability();
+    let request_id = Uuid::new_v4();
+    let request = Request {
+        version: PROTOCOL_VERSION,
+        request_id,
+        body: AuthenticatedRequest {
+            capability_token,
+            operation,
+        },
+    };
+    write_sync_frame(&mut stream, &request).map_err(|_| ClientError::Protocol)?;
+    let response: Response<Reply> = read_sync_frame(&mut stream).map_err(|error| {
+        if matches!(error, ProtocolError::DeadlineExceeded) {
+            if is_portability {
+                ClientError::PortabilityTimeout
+            } else {
+                ClientError::Timeout
+            }
+        } else {
+            ClientError::Protocol
+        }
+    })?;
+    validate_version(response.version).map_err(|_| ClientError::Protocol)?;
+    if response.request_id != request_id {
+        return Err(ClientError::Protocol);
+    }
+    match response.body {
+        ResponseBody::Ok(reply) => Ok(reply),
+        ResponseBody::Error(error) => Err(ClientError::Remote(error)),
+    }
 }

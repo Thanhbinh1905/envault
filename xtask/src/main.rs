@@ -43,6 +43,7 @@ fn main() -> Result<()> {
 fn verify_packages() -> Result<()> {
     const PACKAGES: &[&str] = &[
         "envault-core",
+        "envault-windows-ffi",
         "envault-platform",
         "envault-policy",
         "envault-broker",

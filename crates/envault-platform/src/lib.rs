@@ -71,7 +71,7 @@ fn read_bounded_file(
     Ok(bytes)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn read_bounded_file(
     path: &std::path::Path,
     maximum_bytes: usize,
@@ -177,7 +177,7 @@ pub fn validate_private_file_path(
     validate_same_private_file(&expected_metadata, &actual)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn publish_private_file_no_replace(
     source: &std::path::Path,
     destination: &std::path::Path,
@@ -207,7 +207,7 @@ pub fn publish_private_file_no_replace(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn validate_private_file_path(
     path: &std::path::Path,
     expected: &fs::File,
@@ -225,13 +225,14 @@ pub fn validate_private_file_path(
     Ok(())
 }
 
-/// Windows lacks an `O_NOFOLLOW`/`openat`-equivalent reachable without `unsafe`
-/// FFI, which this workspace forbids. This walk rejects any ancestor that is
-/// already a reparse point before the caller opens or creates the final path,
+/// Windows lacks a stable-parent-descriptor/`openat`-with-`O_NOFOLLOW`
+/// equivalent; building one from scratch is out of scope here. This walk
+/// rejects any ancestor that is already a reparse point before the caller
+/// opens or creates the final path,
 /// narrowing but not eliminating the race between this check and the
 /// subsequent filesystem call; identity is re-validated afterward wherever a
 /// handle is available (see `same_file_identity`).
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn reject_reparse_point_ancestors(path: &std::path::Path) -> Result<(), PlatformError> {
     use std::path::Component;
 
@@ -262,21 +263,12 @@ fn reject_reparse_point_ancestors(path: &std::path::Path) -> Result<(), Platform
 /// `volume_serial_number` is the `std`-exposed equivalent of the Unix
 /// `(dev, ino)` pair already used for same-file validation, and requires no
 /// `unsafe` FFI.
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn same_file_identity(file: &fs::File) -> Result<(u64, u64), PlatformError> {
-    use std::os::windows::fs::MetadataExt;
-
-    let metadata = file.metadata()?;
-    let index = metadata.file_index().ok_or_else(invalid_private_path)?;
-    let volume = u64::from(
-        metadata
-            .volume_serial_number()
-            .ok_or_else(invalid_private_path)?,
-    );
-    Ok((volume, index))
+    envault_windows_ffi::file_identity(file).map_err(PlatformError::Io)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn sync_parent_directory(path: &std::path::Path) -> Result<(), PlatformError> {
     let _ = path.parent().ok_or_else(invalid_private_path)?;
     Ok(())
@@ -310,10 +302,11 @@ pub fn harden_sensitive_process() -> Result<(), PlatformError> {
 }
 
 /// Disabling Windows Error Reporting crash dumps and process-mitigation
-/// hardening both require `unsafe` FFI, which this workspace forbids
-/// crate-wide; this is a documented, tracked no-op rather than parity with
-/// the Unix `RLIMIT_CORE`/non-dumpable hardening.
-#[cfg(not(unix))]
+/// hardening both require the same kind of raw Win32 FFI `envault-windows-ffi`
+/// exists for, but are out of scope for the ADR 0013 named-pipe transport and
+/// peer-authentication work; this remains a documented, tracked no-op rather
+/// than parity with the Unix `RLIMIT_CORE`/non-dumpable hardening.
+#[cfg(windows)]
 pub fn harden_sensitive_process() -> Result<(), PlatformError> {
     Ok(())
 }
@@ -529,7 +522,7 @@ fn open_stable_parent(
     Ok((descriptor, name))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(unix, target_os = "macos"))]
 fn normalize_platform_path(path: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
     for (alias, target) in [
         ("/var", "/private/var"),
@@ -543,7 +536,7 @@ fn normalize_platform_path(path: &std::path::Path) -> std::borrow::Cow<'_, std::
     std::borrow::Cow::Borrowed(path)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn normalize_platform_path(path: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
     std::borrow::Cow::Borrowed(path)
 }
@@ -577,18 +570,19 @@ fn set_mode_no_follow(
     fchmodat(AT_FDCWD, path, mode, FchmodatFlags::NoFollowSymlink).map_err(nix_error)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn create_private_file(path: &std::path::Path) -> Result<fs::File, PlatformError> {
     reject_reparse_point_ancestors(path)?;
-    fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
-        .open(path)
-        .map_err(PlatformError::from)
+        .open(path)?;
+    envault_windows_ffi::restrict_path_to_owner(path).map_err(PlatformError::Io)?;
+    Ok(file)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn open_private_lock_file(path: &std::path::Path) -> Result<fs::File, PlatformError> {
     reject_reparse_point_ancestors(path)?;
     if matches!(fs::symlink_metadata(path), Ok(metadata) if metadata.file_type().is_symlink()) {
@@ -603,38 +597,37 @@ pub fn open_private_lock_file(path: &std::path::Path) -> Result<fs::File, Platfo
     if !file.metadata()?.file_type().is_file() {
         return Err(invalid_private_path());
     }
+    envault_windows_ffi::restrict_path_to_owner(path).map_err(PlatformError::Io)?;
     Ok(file)
 }
 
-/// Restricting the access control list to the owning user's security
-/// identifier requires `unsafe` FFI (`windows-sys` or an equivalent binding),
-/// which this workspace forbids crate-wide. Until a vetted safe wrapper is
-/// adopted, or a narrowly scoped and heavily reviewed exception is made, this
-/// function verifies the path is a stable, non-reparse regular file rather
-/// than actually restricting its access control list; this is a known,
-/// tracked gap, not parity with the Unix mode-0600 guarantee.
-#[cfg(not(unix))]
+/// Restricts the path's access control list to its owner only, via
+/// `envault-windows-ffi`'s isolated FFI wrapper (see ADR 0013), replacing
+/// what was previously a documented, tracked gap: verification without
+/// actual restriction.
+#[cfg(windows)]
 pub fn set_private_file_permissions(path: &std::path::Path) -> Result<(), PlatformError> {
     reject_reparse_point_ancestors(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Err(invalid_private_path());
     }
-    Ok(())
+    envault_windows_ffi::restrict_path_to_owner(path).map_err(PlatformError::Io)
 }
 
-/// See `set_private_file_permissions`: the same access-control-list gap
-/// applies to the daemon's IPC transport endpoint on Windows.
-#[cfg(not(unix))]
+/// See `set_private_file_permissions`: the daemon's IPC transport endpoint
+/// on Windows is a named pipe path rather than a socket file, and is
+/// restricted the same way.
+#[cfg(windows)]
 pub fn set_private_socket_permissions(path: &std::path::Path) -> Result<(), PlatformError> {
     reject_reparse_point_ancestors(path)?;
     if fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Err(invalid_private_path());
     }
-    Ok(())
+    envault_windows_ffi::restrict_path_to_owner(path).map_err(PlatformError::Io)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn create_private_directory(path: &std::path::Path) -> Result<(), PlatformError> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() {
@@ -648,7 +641,7 @@ pub fn create_private_directory(path: &std::path::Path) -> Result<(), PlatformEr
     if !after.file_type().is_dir() || after.file_type().is_symlink() {
         return Err(invalid_private_path());
     }
-    Ok(())
+    envault_windows_ffi::restrict_path_to_owner(path).map_err(PlatformError::Io)
 }
 
 #[cfg(all(test, unix))]

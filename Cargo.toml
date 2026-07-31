@@ -9,6 +9,7 @@ members = [
   "crates/envault-protocol",
   "crates/envault-service",
   "crates/envault-store",
+  "crates/envault-windows-ffi",
   "xtask",
 ]
 resolver = "3"
@@ -52,6 +53,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v4"] }
+windows-sys = "0.61"
 zeroize = { version = "1.8", features = ["derive"] }
 
 [workspace.lints.rust]

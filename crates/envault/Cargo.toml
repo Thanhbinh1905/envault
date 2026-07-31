@@ -31,6 +31,9 @@ zeroize.workspace = true
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+envault-windows-ffi = { version = "=0.0.1", path = "../envault-windows-ffi" }
+
 [dev-dependencies]
 tempfile.workspace = true
 toml.workspace = true

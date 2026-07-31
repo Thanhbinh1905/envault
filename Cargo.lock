@@ -936,6 +936,7 @@ dependencies = [
  "envault-policy",
  "envault-protocol",
  "envault-service",
+ "envault-windows-ffi",
  "nix",
  "ratatui",
  "rpassword",
@@ -993,6 +994,7 @@ dependencies = [
 name = "envault-platform"
 version = "0.0.1"
 dependencies = [
+ "envault-windows-ffi",
  "nix",
  "rustix",
  "tempfile",
@@ -1057,6 +1059,13 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "uuid",
+]
+
+[[package]]
+name = "envault-windows-ffi"
+version = "0.0.1"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
