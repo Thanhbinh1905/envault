@@ -57,4 +57,4 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the workspace layout, build c
 
 ## License
 
-Licensed under either the Apache License, Version 2.0 or the MIT license, at your option.
+Licensed under either the Apache License, Version 2.0 or the MIT license.
