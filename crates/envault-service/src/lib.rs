@@ -128,6 +128,8 @@ pub enum ServiceError {
     StartupProfileRequired,
     #[error("profile is not loaded in this session")]
     ProfileNotLoaded,
+    #[error("multiple profiles in the workspace resolve a secret with the same name")]
+    DuplicateSecretAcrossProfiles,
     #[error("vault data is corrupt")]
     Corrupt,
     #[error("path has no parent directory")]
@@ -630,7 +632,9 @@ impl VaultSession {
                     .last()
                     .ok_or(ServiceError::Corrupt)?;
                 let value = self.decrypt_secret_version(&secret, &version)?;
-                values.insert(item.secret.name, value);
+                if values.insert(item.secret.name, value).is_some() {
+                    return Err(ServiceError::DuplicateSecretAcrossProfiles);
+                }
             }
         }
         Ok(values.into_iter().collect())

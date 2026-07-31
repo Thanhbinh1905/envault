@@ -1110,6 +1110,78 @@ fn run_injects_resolved_secrets_into_child_env_never_into_its_own_stdout() {
 }
 
 #[test]
+fn run_workspace_rejects_duplicate_secret_name_across_profiles() {
+    let fixture = DaemonFixture::initialize_and_start();
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+    assert_success(&fixture.run(
+        &["--output", "json", "workspace", "create", "team"],
+        None,
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "profile",
+            "create",
+            "team-a",
+            "--workspace",
+            "team",
+        ],
+        None,
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "profile",
+            "create",
+            "team-b",
+            "--workspace",
+            "team",
+        ],
+        None,
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "team-a.SHARED_TOKEN",
+            "--stdin",
+        ],
+        Some(b"team-a-secret"),
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "team-b.SHARED_TOKEN",
+            "--stdin",
+        ],
+        Some(b"team-b-secret"),
+    ));
+
+    let output = fixture.run(
+        &["run", "--workspace", "team", "--", "printenv", "SHARED_TOKEN"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("duplicate_secret_across_profiles"),
+        "stderr: {stderr}"
+    );
+    assert_no_bytes(&output.stdout, b"team-a-secret");
+    assert_no_bytes(&output.stdout, b"team-b-secret");
+}
+
+#[test]
 fn describe_secret_typo_suggests_the_closest_existing_name() {
     let fixture = DaemonFixture::initialize_and_start();
     assert_success(&fixture.run(
