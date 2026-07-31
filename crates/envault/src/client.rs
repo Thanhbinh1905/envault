@@ -71,7 +71,7 @@ pub fn request_with_capability(
 #[cfg(unix)]
 pub fn start(password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
     let _start_lock = acquire_start_lock()?;
-    match request(Operation::Status) {
+    match probe_status_tolerating_startup_race() {
         Ok(Reply::Status(status)) if status.service == ServiceState::Unlocked => return Ok(status),
         Ok(Reply::Status(_)) => {
             match request(Operation::Stop) {
@@ -90,6 +90,32 @@ pub fn start(password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
     match spawn_daemon(password) {
         Err(ClientError::Remote(error)) if error.code == "daemon_busy" => wait_for_running_daemon(),
         result => result,
+    }
+}
+
+/// A process that acquires the start lock right after another `start`
+/// released it can connect to the daemon's socket in the narrow window
+/// between the daemon writing its bootstrap handshake response (which is
+/// what unblocks the lock holder) and the daemon actually entering its
+/// accept loop. That window is transient and self-resolving, so this probe
+/// retries a bounded number of times on exactly a protocol-level hiccup
+/// before treating it as a real failure, mirroring `wait_for_daemon_exit`'s
+/// existing tolerance for the same class of startup-transition ambiguity.
+/// `Status` is read-only and idempotent, so retrying it has no side effect.
+#[cfg(unix)]
+fn probe_status_tolerating_startup_race() -> Result<Reply, ClientError> {
+    const MAX_ATTEMPTS: u32 = 10;
+    const RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+    let mut attempt = 0;
+    loop {
+        match request(Operation::Status) {
+            Err(ClientError::Protocol) if attempt < MAX_ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(RETRY_INTERVAL);
+            }
+            result => return result,
+        }
     }
 }
 
