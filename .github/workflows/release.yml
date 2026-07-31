@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  quality:
+    name: Release quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+
+      - run: cargo xtask verify
+      - run: cargo xtask package-verify
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+
+      - name: Check tag matches package version
+        shell: bash
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "envault") | .version')
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$version" = "$tag_version" || {
+            echo "tag $GITHUB_REF_NAME does not match envault version $version" >&2
+            exit 1
+          }
+
+      - name: Build release binaries
+        run: cargo build --locked --release -p envault --bins --target ${{ matrix.target }}
+
+      - name: Package Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          name="envault-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$name"
+          cp "target/${{ matrix.target }}/release/envault" \
+            "target/${{ matrix.target }}/release/envaultd" \
+            "target/${{ matrix.target }}/release/envault-tui" "$name/"
+          cp README.md LICENSE-MIT LICENSE-APACHE docs/INSTALLATION.md install.sh "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $name = "envault-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\envault.exe", "target\${{ matrix.target }}\release\envaultd.exe", "target\${{ matrix.target }}\release\envault-tui.exe" $name
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE, docs\INSTALLATION.md, install.sh $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name.zip" | Set-Content "$name.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            envault-v*.tar.gz
+            envault-v*.zip
+            envault-v*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksums manifest
+        working-directory: dist
+        run: cat *.sha256 | sort -k2 > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "EnVault $GITHUB_REF_NAME" --generate-notes --verify-tag

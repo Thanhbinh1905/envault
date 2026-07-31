@@ -21,10 +21,42 @@ Read [the threat model](docs/threat-model.md) for the full security guarantees.
 
 ## Status
 
-The project is in early development. No release or crate is published yet.
+Release candidate `v0.0.1` is prepared on this branch.
+After this branch merges into `main`, pushing tag `v0.0.1` will run the release quality gate, build the supported binaries, publish checksums, and create the GitHub Release.
+The Rust crates remain unpublished to crates.io.
 
-## Getting started
+## Quick setup
 
+On macOS or Linux, install the latest release with the verified installer:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Thanhbinh1905/envault/main/install.sh | sh
+```
+
+The installer detects the platform, downloads the matching archive, verifies its SHA-256 checksum, and installs the binaries into `$HOME/.local/bin`.
+
+Initialize the vault and start the daemon explicitly:
+
+```sh
+envault init
+envault start
+envault status
+```
+
+Install the EnVault Agent Skill for on-demand guidance in an agent harness:
+
+```sh
+npx skills add Thanhbinh1905/envault --skill envault
+```
+
+Alternatively, configure the explicit session hook:
+
+```sh
+envault session setup
+```
+
+Use either the Agent Skill or the session hook.
+See [docs/INSTALLATION.md](docs/INSTALLATION.md) for Windows, source installation, upgrades, and security details.
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the workspace layout, build commands, and CLI usage.
 
 ## License
