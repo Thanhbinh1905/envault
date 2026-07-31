@@ -39,6 +39,7 @@ Revoking access means removing the rule or unloading the profile, which affects 
 
 Resolves the secrets visible to one profile (or every profile in a workspace) and injects them as environment variables directly into a spawned child process.
 This is the only path that lets plaintext leave the daemon into a CLI-driven process; the CLI itself never prints the value to stdout, stderr, or a log.
+With `--workspace`, if two member profiles resolve a secret with the same name, resolution fails with `duplicate_secret_across_profiles` instead of silently picking one; use `--profile` to disambiguate.
 
 ## Reveal
 

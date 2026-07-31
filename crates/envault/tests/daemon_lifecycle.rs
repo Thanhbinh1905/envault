@@ -1116,10 +1116,7 @@ fn run_workspace_rejects_duplicate_secret_name_across_profiles() {
         &["--output", "json", "admin", "unlock", "--password-stdin"],
         Some(PASSWORD),
     ));
-    assert_success(&fixture.run(
-        &["--output", "json", "workspace", "create", "team"],
-        None,
-    ));
+    assert_success(&fixture.run(&["--output", "json", "workspace", "create", "team"], None));
     assert_success(&fixture.run(
         &[
             "--output",
@@ -1168,7 +1165,14 @@ fn run_workspace_rejects_duplicate_secret_name_across_profiles() {
     ));
 
     let output = fixture.run(
-        &["run", "--workspace", "team", "--", "printenv", "SHARED_TOKEN"],
+        &[
+            "run",
+            "--workspace",
+            "team",
+            "--",
+            "printenv",
+            "SHARED_TOKEN",
+        ],
         None,
     );
     assert_eq!(output.status.code(), Some(1));

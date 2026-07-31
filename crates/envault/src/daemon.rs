@@ -1499,7 +1499,9 @@ fn map_service_failure(error: &ServiceError) -> RuntimeFailure {
         ServiceError::Conflict | ServiceError::StartupProfileRequired => RuntimeFailure::Conflict,
         ServiceError::NotFound => RuntimeFailure::NotFound,
         ServiceError::ProfileNotLoaded => RuntimeFailure::ProfileNotLoaded,
-        ServiceError::DuplicateSecretAcrossProfiles => RuntimeFailure::DuplicateSecretAcrossProfiles,
+        ServiceError::DuplicateSecretAcrossProfiles => {
+            RuntimeFailure::DuplicateSecretAcrossProfiles
+        }
         ServiceError::Corrupt | ServiceError::Store(_) => RuntimeFailure::Corrupt,
         ServiceError::Invariant(_) | ServiceError::InvalidPasswordLength => {
             RuntimeFailure::InvalidInput
@@ -1552,6 +1554,7 @@ fn structured_error(request_id: Uuid, failure: RuntimeFailure) -> StructuredErro
 
 type FailureDetails = (&'static str, &'static str, &'static str, bool);
 
+#[allow(clippy::too_many_lines)]
 fn failure_details(failure: RuntimeFailure) -> FailureDetails {
     match failure {
         RuntimeFailure::Locked => (

@@ -85,7 +85,10 @@ On Windows, start `envaultd.exe` from a supervised process or terminal before us
 
 ## Shell completions
 
-`envault completions <shell>` prints a completion script for `bash`, `zsh`, `fish`, `elvish`, or `powershell`.
+The quick installer (`install.sh`) detects `bash`, `zsh`, and `fish` on the machine and installs a completion script for each into the shell's standard completion directory, adding an `fpath` entry to `~/.zshrc` for zsh if one is not already present.
+Restart the shell, or source the generated file directly, to pick up completions immediately.
+
+For a manual install, a build without `install.sh`, or `elvish`/`powershell`, generate the script directly:
 
 ```sh
 # bash
@@ -97,8 +100,6 @@ envault completions zsh > "${fpath[1]}/_envault"
 # fish
 envault completions fish > ~/.config/fish/completions/envault.fish
 ```
-
-Restart the shell, or source the generated file directly, to pick up completions immediately.
 
 ## Agent integration
 
