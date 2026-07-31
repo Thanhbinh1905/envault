@@ -17,17 +17,11 @@ A trusted local daemon, started only by an explicit human or automation action, 
 Agent principals can receive narrow, short-lived capabilities scoped to exactly what they need, but they can never request admin actions, plaintext export, reveal, or arbitrary execution.
 Everything is local-first: no cloud dependency, no third party holding your secrets.
 
-Read [the threat model](docs/threat-model.md) for the full security guarantees.
-
-## Status
-
-Release candidate `v0.0.1` is prepared on this branch.
-After this branch merges into `main`, pushing tag `v0.0.1` will run the release quality gate, build the supported binaries, publish checksums, and create the GitHub Release.
-The Rust crates remain unpublished to crates.io.
+Read [the threat model](docs/threat-model.md) for the full security.
 
 ## Quick setup
 
-After `v0.0.1` is published, install the latest release on macOS or Linux with the verified installer:
+Install the latest release on macOS or Linux with the verified installer:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Thanhbinh1905/envault/main/install.sh | sh
