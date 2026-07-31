@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for Phase 2 of the 2026-07-31 rework.
+Accepted for Phase 2.
 
 ## Context
 

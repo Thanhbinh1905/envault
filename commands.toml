@@ -334,7 +334,7 @@ auth = "service"
 daemon = "required"
 agent = true
 outputs = ["human", "json", "toon"]
-errors = ["envault_locked", "run_target_required", "secret_not_utf8", "run_spawn_failed", "protocol_error"]
+errors = ["envault_locked", "run_target_required", "secret_not_utf8", "run_spawn_failed", "protocol_error", "duplicate_secret_across_profiles"]
 
 [[command]]
 path = "completions"

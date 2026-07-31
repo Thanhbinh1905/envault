@@ -451,6 +451,7 @@ enum RuntimeFailure {
     Conflict,
     NotFound,
     ProfileNotLoaded,
+    DuplicateSecretAcrossProfiles,
     RequestRejected,
     ResponseRejected,
     ProviderRejected(u16),
@@ -1498,6 +1499,9 @@ fn map_service_failure(error: &ServiceError) -> RuntimeFailure {
         ServiceError::Conflict | ServiceError::StartupProfileRequired => RuntimeFailure::Conflict,
         ServiceError::NotFound => RuntimeFailure::NotFound,
         ServiceError::ProfileNotLoaded => RuntimeFailure::ProfileNotLoaded,
+        ServiceError::DuplicateSecretAcrossProfiles => {
+            RuntimeFailure::DuplicateSecretAcrossProfiles
+        }
         ServiceError::Corrupt | ServiceError::Store(_) => RuntimeFailure::Corrupt,
         ServiceError::Invariant(_) | ServiceError::InvalidPasswordLength => {
             RuntimeFailure::InvalidInput
@@ -1550,6 +1554,7 @@ fn structured_error(request_id: Uuid, failure: RuntimeFailure) -> StructuredErro
 
 type FailureDetails = (&'static str, &'static str, &'static str, bool);
 
+#[allow(clippy::too_many_lines)]
 fn failure_details(failure: RuntimeFailure) -> FailureDetails {
     match failure {
         RuntimeFailure::Locked => (
@@ -1615,6 +1620,12 @@ fn failure_details(failure: RuntimeFailure) -> FailureDetails {
             "profile_not_loaded",
             "the profile is not loaded in this session",
             "Run `envault profile load \"<profile>\"` first",
+            false,
+        ),
+        RuntimeFailure::DuplicateSecretAcrossProfiles => (
+            "duplicate_secret_across_profiles",
+            "two or more profiles in the workspace resolve a secret with the same name",
+            "Run with `--profile \"<profile>\"` to select one profile, or rename the secret in one profile to remove the collision",
             false,
         ),
         failure @ (RuntimeFailure::RequestRejected

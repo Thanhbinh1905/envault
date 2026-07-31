@@ -27,5 +27,5 @@ Users who need a secret value outside the vault continue to use the plaintext ex
 
 ## Addendum (2026-07-31): superseded by ADR 0016
 
-Phase 7 of the 2026-07-31 rework introduces exactly the superseding ADR this document anticipated: ADR 0016 adds an admin-lease-gated `Reveal` action to the Secrets and Versions screens, with its own authorization gesture (admin lease required on TUI entry, re-checked at reveal time) and rendering constraint (a transient popup dismissed by any keypress, never written to disk or CLI stdout).
+Phase 7 introduces exactly the superseding ADR this document anticipated: ADR 0016 adds an admin-lease-gated `Reveal` action to the Secrets and Versions screens, with its own authorization gesture (admin lease required on TUI entry, re-checked at reveal time) and rendering constraint (a transient popup dismissed by any keypress, never written to disk or CLI stdout).
 This document's original decision and reasoning remain the historical record of why Phase 6 shipped with no reveal capability at all; ADR 0016 is the design that replaced it.
