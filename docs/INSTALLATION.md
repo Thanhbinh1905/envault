@@ -116,7 +116,7 @@ npx skills add Thanhbinh1905/envault --skill envault
 ```
 
 These are complementary options, and a user only needs one of them.
-The skill never starts the daemon, authenticates, creates grants, or requests plaintext credentials.
+The skill never starts the daemon, authenticates, loads or unloads a profile, or requests plaintext credentials.
 
 ## Install from source
 

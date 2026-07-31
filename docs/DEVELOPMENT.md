@@ -68,7 +68,7 @@ target/debug/envault profile export base \
 Use one or more public age X25519 recipients instead of, or in addition to, the transfer password:
 
 ```sh
-target/debug/envault workspace export \
+target/debug/envault portability export \
   --output-file ./workspace.envault-workspace \
   --age-recipient "$AGE_RECIPIENT"
 ```
@@ -76,10 +76,10 @@ target/debug/envault workspace export \
 Imports are preview-first and never commit without the exact returned plan hash:
 
 ```sh
-target/debug/envault workspace import ./workspace.envault-workspace \
+target/debug/envault portability import ./workspace.envault-workspace \
   --transfer-password
 
-target/debug/envault workspace import ./workspace.envault-workspace \
+target/debug/envault portability import ./workspace.envault-workspace \
   --transfer-password \
   --strategy abort \
   --commit \
