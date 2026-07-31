@@ -54,3 +54,16 @@ jobs:
         with:
           toolchain: 1.97.1
       - run: cargo check --workspace --all-targets
+
+  windows-runtime:
+    name: Windows runtime tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace
