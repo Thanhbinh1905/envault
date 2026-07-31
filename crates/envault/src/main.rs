@@ -91,11 +91,17 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
-    Context,
+    Context(SessionContextArgs),
     #[command(
         long_about = "Installs a SessionStart hook into a Claude Code settings.json so `session context` runs automatically at session start.\nFor Codex, add an equivalent SessionStart hook running `envault session context --output toon` to `.codex/hooks.json` (with `[features].hooks = true` in config.toml) by hand; for OpenCode, wire the same command into a managed plugin under `~/.config/opencode/plugins/`. Neither is automated by this command."
     )]
     Setup(SessionSetupArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct SessionContextArgs {
+    #[arg(long, hide = true)]
+    envault_session_hook: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -807,7 +813,7 @@ fn convenience_unlock_command(output: Output, command: ConvenienceUnlockCommand)
 /// session count or admin lease detail, and never secret material.
 fn session_command(output: Output, command: SessionCommand) -> ExitCode {
     match command {
-        SessionCommand::Context => print_session_context(output),
+        SessionCommand::Context(_) => print_session_context(output),
         SessionCommand::Setup(arguments) => session_setup(output, &arguments),
     }
 }
@@ -854,7 +860,7 @@ fn print_session_context_view(
     ExitCode::SUCCESS
 }
 
-const SESSION_HOOK_MARKER: &str = "session context";
+const SESSION_HOOK_MARKER: &str = "--envault-session-hook";
 
 fn session_setup(output: Output, arguments: &SessionSetupArgs) -> ExitCode {
     let Ok(executable) = std::env::current_exe() else {
@@ -900,7 +906,7 @@ fn session_hook_command(executable: &Path) -> String {
     } else {
         shell_quote(&executable.display().to_string())
     };
-    format!("{program} session context --output toon")
+    format!("{program} session context --output toon {SESSION_HOOK_MARKER}")
 }
 
 #[cfg(windows)]

@@ -562,7 +562,10 @@ fn session_setup_is_idempotent_and_repairs_a_stale_command() {
         serde_json::from_slice(&unchanged.stdout).expect("structured setup result");
     assert_eq!(unchanged_body["status"], "unchanged");
 
-    let stale = settings_text.replace(&command, "/stale/relocated/envault session context");
+    let stale = settings_text.replace(
+        &command,
+        "/stale/relocated/envault session context --output toon --envault-session-hook",
+    );
     fs::write(&settings_path, stale).expect("write stale settings");
     let repaired = Command::new(env!("CARGO_BIN_EXE_envault"))
         .args([
@@ -632,6 +635,50 @@ fn session_setup_preserves_unrelated_settings_and_hooks() {
             .as_str()
             .expect("command")
             .contains("session context")
+    );
+}
+
+#[test]
+fn session_setup_preserves_hooks_that_only_contain_session_context_text() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let settings_path = directory.path().join(".claude/settings.json");
+    fs::create_dir_all(settings_path.parent().expect("parent")).expect("settings dir");
+    fs::write(
+        &settings_path,
+        r#"{"hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"echo 'session context from another tool'"}]}]}}"#,
+    )
+    .expect("write existing settings");
+    let settings_arg = settings_path.to_string_lossy().into_owned();
+
+    let installed = Command::new(env!("CARGO_BIN_EXE_envault"))
+        .args([
+            "--output",
+            "json",
+            "session",
+            "setup",
+            "--settings-file",
+            &settings_arg,
+        ])
+        .output()
+        .expect("spawn envault session setup");
+    assert_success(&installed);
+
+    let settings: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).expect("settings file"))
+            .expect("settings JSON");
+    let session_start = settings["hooks"]["SessionStart"]
+        .as_array()
+        .expect("SessionStart array");
+    assert_eq!(session_start.len(), 2);
+    assert_eq!(
+        session_start[0]["hooks"][0]["command"],
+        "echo 'session context from another tool'"
+    );
+    assert!(
+        session_start[1]["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("--envault-session-hook")
     );
 }
 
