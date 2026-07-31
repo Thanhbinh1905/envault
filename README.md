@@ -27,13 +27,15 @@ The Rust crates remain unpublished to crates.io.
 
 ## Quick setup
 
-On macOS or Linux, install the latest release with the verified installer:
+After `v0.0.1` is published, install the latest release on macOS or Linux with the verified installer:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Thanhbinh1905/envault/main/install.sh | sh
 ```
 
 The installer detects the platform, downloads the matching archive, verifies its SHA-256 checksum, and installs the binaries into `$HOME/.local/bin`.
+
+Until then, use the [source installation instructions](docs/INSTALLATION.md#install-from-source).
 
 Initialize the vault and start the daemon explicitly:
 
