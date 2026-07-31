@@ -3,8 +3,7 @@
 pub mod client;
 pub mod tui;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod daemon;
 
-#[cfg(unix)]
 mod ipc;

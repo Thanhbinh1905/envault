@@ -1,121 +1,31 @@
-# EnVault
+<h1 align="center">EnVault</h1>
 
-EnVault is a local-first encrypted secret vault for developers and AI agents.
-It lets trusted local brokers use credentials without exposing plaintext values to an agent.
+<p align="center">
+  A local-first encrypted secret vault for developers and AI agents.
+</p>
 
-The project is in early development.
-No release or crate is published yet.
+## The problem
 
-## Security model
+Developers and AI agents need credentials to do their job, but handing an agent a plaintext API key or database password is a standing risk.
+Once a secret is in an agent's context or environment, you can't take it back, scope it down, or make it expire.
+A single prompt injection, misconfigured tool, or leaked log line can turn one credential into a full compromise.
 
-EnVault uses an explicit daemon lifecycle and denies access by default.
-Only `envault start` may launch the daemon.
-Agent principals can receive narrow, expiring capabilities but can never receive admin actions, plaintext export, reveal, or generic execution.
+## The solution
 
-Read [the threat model](docs/threat-model.md) before relying on EnVault.
+EnVault keeps secrets in an encrypted local vault and never releases plaintext to an agent.
+A trusted local daemon, started only by an explicit human or automation action, brokers access on behalf of callers.
+Agent principals can receive narrow, short-lived capabilities scoped to exactly what they need, but they can never request admin actions, plaintext export, reveal, or arbitrary execution.
+Everything is local-first: no cloud dependency, no third party holding your secrets.
 
-## Workspace
+Read [the threat model](docs/threat-model.md) for the full security guarantees.
 
-The Rust workspace separates domain, crypto, storage, policy, protocol, platform, broker, and executable concerns.
-CLI and TUI code must access secrets through application services and IPC, never through crypto or storage directly.
+## Status
 
-## Development
+The project is in early development. No release or crate is published yet.
 
-```sh
-cargo xtask verify
-cargo xtask package-verify
-```
+## Getting started
 
-Run `cargo xtask sync-contract` after intentionally changing the canonical `commands.toml`, then rerun both verification commands.
-
-The pinned toolchain is Rust 1.97.1 with Rust Edition 2024.
-
-## Bootstrap
-
-Initialize a vault from an interactive masked terminal prompt:
-
-```sh
-cargo run -p envault -- init
-```
-
-Automation may provide the master password only through piped standard input:
-
-```sh
-read -r -s bootstrap_password
-printf '%s\n' "$bootstrap_password" | cargo run -p envault -- init --password-stdin
-unset bootstrap_password
-```
-
-The shell variable is not exported and is never read as an environment input by EnVault.
-Do not place a real password directly in shell history.
-
-Build the complete executable set before running from a development checkout:
-
-```sh
-cargo build -p envault --bins
-```
-
-Start the authenticated daemon from a masked terminal prompt:
-
-```sh
-target/debug/envault start
-```
-
-Automation may use `start --password-stdin` with the same safe input constraints as initialization.
-Use `envault status`, `envault lock`, and `envault stop` for explicit lifecycle control.
-Use `envault admin unlock --minutes 5`, `envault admin status`, and `envault admin lock` for the bounded admin lease.
-Profile, versioned secret, policy-filtered agent discovery, capability inspection, and constrained HTTP broker workflows run only through daemon IPC.
-
-## Encrypted portability
-
-Export a profile with a masked transfer password:
-
-```sh
-target/debug/envault profile export base \
-  --output-file ./base.envault-profile \
-  --transfer-password
-```
-
-Use one or more public age X25519 recipients instead of, or in addition to, the transfer password:
-
-```sh
-target/debug/envault workspace export \
-  --output-file ./workspace.envault-workspace \
-  --age-recipient "$AGE_RECIPIENT"
-```
-
-Imports are preview-first and never commit without the exact returned plan hash:
-
-```sh
-target/debug/envault workspace import ./workspace.envault-workspace \
-  --transfer-password
-
-target/debug/envault workspace import ./workspace.envault-workspace \
-  --transfer-password \
-  --strategy abort \
-  --commit \
-  --plan-hash PLAN_HASH_FROM_PREVIEW
-```
-
-Transfer passwords are accepted only from a masked terminal or piped standard input.
-Age identity files and plaintext `.env` input files must be stable private files on Unix.
-Encrypted package files and plaintext export files are created without replacement at mode `0600` on Unix.
-
-Preview and atomically import a private `.env` file into one profile:
-
-```sh
-target/debug/envault profile import-env base ./.env --strategy abort
-```
-
-Plaintext export is a human-only recovery escape hatch that requires an active admin lease, an explicit acknowledgement, and a new destination path:
-
-```sh
-target/debug/envault profile export-env base \
-  --output-file ./recovery.env \
-  --allow-plaintext
-```
-
-Never commit plaintext exports or transfer passwords to a repository or shell history.
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the workspace layout, build commands, and CLI usage.
 
 ## License
 

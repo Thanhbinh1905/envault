@@ -11,3 +11,8 @@
 *.db-wal
 .lavish/
 
+# Internal dev-only artifacts, not needed by external contributors
+/.agents/
+/docs/plans/
+/docs/reviews/
+

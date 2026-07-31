@@ -71,7 +71,7 @@ fn read_bounded_file(
     Ok(bytes)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn read_bounded_file(
     path: &std::path::Path,
     maximum_bytes: usize,
@@ -79,6 +79,10 @@ fn read_bounded_file(
 ) -> Result<Vec<u8>, PlatformError> {
     use std::io::Read;
 
+    reject_reparse_point_ancestors(path)?;
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(invalid_private_path());
+    }
     let mut file = fs::OpenOptions::new().read(true).open(path)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(invalid_private_path());
@@ -173,7 +177,7 @@ pub fn validate_private_file_path(
     validate_same_private_file(&expected_metadata, &actual)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn publish_private_file_no_replace(
     source: &std::path::Path,
     destination: &std::path::Path,
@@ -181,29 +185,90 @@ pub fn publish_private_file_no_replace(
     if source.parent() != destination.parent() {
         return Err(invalid_private_path());
     }
+    reject_reparse_point_ancestors(source)?;
+    reject_reparse_point_ancestors(destination)?;
+    if fs::symlink_metadata(source)?.file_type().is_symlink() {
+        return Err(invalid_private_path());
+    }
     set_private_file_permissions(source)?;
+    let source_identity = same_file_identity(&fs::File::open(source)?)?;
     fs::hard_link(source, destination)?;
     if let Err(error) = fs::remove_file(source) {
         let _ = fs::remove_file(destination);
         return Err(PlatformError::Io(error));
+    }
+    if fs::symlink_metadata(destination)?.file_type().is_symlink()
+        || same_file_identity(&fs::File::open(destination)?)? != source_identity
+    {
+        return Err(invalid_private_path());
     }
     set_private_file_permissions(destination)?;
     sync_parent_directory(destination)?;
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn validate_private_file_path(
     path: &std::path::Path,
     expected: &fs::File,
 ) -> Result<(), PlatformError> {
-    if !expected.metadata()?.file_type().is_file() || !fs::metadata(path)?.file_type().is_file() {
+    reject_reparse_point_ancestors(path)?;
+    if !expected.metadata()?.file_type().is_file()
+        || fs::symlink_metadata(path)?.file_type().is_symlink()
+        || !fs::metadata(path)?.file_type().is_file()
+    {
+        return Err(invalid_private_path());
+    }
+    if same_file_identity(expected)? != same_file_identity(&fs::File::open(path)?)? {
         return Err(invalid_private_path());
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// Windows lacks a stable-parent-descriptor/`openat`-with-`O_NOFOLLOW`
+/// equivalent; building one from scratch is out of scope here. This walk
+/// rejects any ancestor that is already a reparse point before the caller
+/// opens or creates the final path,
+/// narrowing but not eliminating the race between this check and the
+/// subsequent filesystem call; identity is re-validated afterward wherever a
+/// handle is available (see `same_file_identity`).
+#[cfg(windows)]
+fn reject_reparse_point_ancestors(path: &std::path::Path) -> Result<(), PlatformError> {
+    use std::path::Component;
+
+    let mut probe = std::path::PathBuf::new();
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        match component {
+            Component::ParentDir => return Err(invalid_private_path()),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                probe.push(component);
+            }
+        }
+        if components.peek().is_none() {
+            break;
+        }
+        match fs::symlink_metadata(&probe) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_private_path());
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Stable, safe identity of an open file on Windows: `file_index` plus
+/// `volume_serial_number` is the `std`-exposed equivalent of the Unix
+/// `(dev, ino)` pair already used for same-file validation, and requires no
+/// `unsafe` FFI.
+#[cfg(windows)]
+fn same_file_identity(file: &fs::File) -> Result<(u64, u64), PlatformError> {
+    envault_windows_ffi::file_identity(file).map_err(PlatformError::Io)
+}
+
+#[cfg(windows)]
 fn sync_parent_directory(path: &std::path::Path) -> Result<(), PlatformError> {
     let _ = path.parent().ok_or_else(invalid_private_path)?;
     Ok(())
@@ -213,10 +278,25 @@ pub fn data_directory() -> Result<PathBuf, PlatformError> {
     if let Some(path) = env::var_os("XDG_DATA_HOME") {
         return Ok(PathBuf::from(path).join("envault"));
     }
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|path| path.join(".local/share/envault"))
-        .ok_or(PlatformError::MissingDataDirectory)
+    if let Some(path) = env::var_os("HOME") {
+        return Ok(PathBuf::from(path).join(".local/share/envault"));
+    }
+    // Windows has no `HOME`/XDG convention; `%LOCALAPPDATA%` is the standard
+    // per-user, non-roaming application data location, with `%USERPROFILE%`
+    // as a fallback on the rare host where it is unset.
+    #[cfg(windows)]
+    {
+        if let Some(path) = env::var_os("LOCALAPPDATA") {
+            return Ok(PathBuf::from(path).join("envault"));
+        }
+        if let Some(path) = env::var_os("USERPROFILE") {
+            return Ok(PathBuf::from(path)
+                .join("AppData")
+                .join("Local")
+                .join("envault"));
+        }
+    }
+    Err(PlatformError::MissingDataDirectory)
 }
 
 pub fn runtime_directory() -> Result<PathBuf, PlatformError> {
@@ -236,7 +316,12 @@ pub fn harden_sensitive_process() -> Result<(), PlatformError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// Disabling Windows Error Reporting crash dumps and process-mitigation
+/// hardening both require the same kind of raw Win32 FFI `envault-windows-ffi`
+/// exists for, but are out of scope for the ADR 0013 named-pipe transport and
+/// peer-authentication work; this remains a documented, tracked no-op rather
+/// than parity with the Unix `RLIMIT_CORE`/non-dumpable hardening.
+#[cfg(windows)]
 pub fn harden_sensitive_process() -> Result<(), PlatformError> {
     Ok(())
 }
@@ -452,7 +537,7 @@ fn open_stable_parent(
     Ok((descriptor, name))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(unix, target_os = "macos"))]
 fn normalize_platform_path(path: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
     for (alias, target) in [
         ("/var", "/private/var"),
@@ -466,7 +551,7 @@ fn normalize_platform_path(path: &std::path::Path) -> std::borrow::Cow<'_, std::
     std::borrow::Cow::Borrowed(path)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn normalize_platform_path(path: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
     std::borrow::Cow::Borrowed(path)
 }
@@ -500,42 +585,78 @@ fn set_mode_no_follow(
     fchmodat(AT_FDCWD, path, mode, FchmodatFlags::NoFollowSymlink).map_err(nix_error)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn create_private_file(path: &std::path::Path) -> Result<fs::File, PlatformError> {
-    fs::OpenOptions::new()
+    reject_reparse_point_ancestors(path)?;
+    let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
-        .open(path)
-        .map_err(PlatformError::from)
+        .open(path)?;
+    envault_windows_ffi::restrict_path_to_owner(path).map_err(PlatformError::Io)?;
+    Ok(file)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn open_private_lock_file(path: &std::path::Path) -> Result<fs::File, PlatformError> {
+    reject_reparse_point_ancestors(path)?;
+    if matches!(fs::symlink_metadata(path), Ok(metadata) if metadata.file_type().is_symlink()) {
+        return Err(invalid_private_path());
+    }
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(invalid_private_path());
+    }
+    envault_windows_ffi::restrict_path_to_owner(path).map_err(PlatformError::Io)?;
     Ok(file)
 }
 
-#[cfg(not(unix))]
+/// Restricts the path's access control list to its owner only, via
+/// `envault-windows-ffi`'s isolated FFI wrapper (see ADR 0013), replacing
+/// what was previously a documented, tracked gap: verification without
+/// actual restriction.
+#[cfg(windows)]
 pub fn set_private_file_permissions(path: &std::path::Path) -> Result<(), PlatformError> {
-    let _ = fs::metadata(path)?;
-    Ok(())
+    reject_reparse_point_ancestors(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(invalid_private_path());
+    }
+    envault_windows_ffi::restrict_path_to_owner(path).map_err(PlatformError::Io)
 }
 
-#[cfg(not(unix))]
+/// See `set_private_file_permissions`: the daemon's IPC transport endpoint
+/// on Windows is a named pipe path rather than a socket file, and is
+/// restricted the same way.
+#[cfg(windows)]
 pub fn set_private_socket_permissions(path: &std::path::Path) -> Result<(), PlatformError> {
-    set_private_file_permissions(path)
+    reject_reparse_point_ancestors(path)?;
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(invalid_private_path());
+    }
+    envault_windows_ffi::restrict_path_to_owner(path).map_err(PlatformError::Io)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn create_private_directory(path: &std::path::Path) -> Result<(), PlatformError> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(invalid_private_path());
+        }
+    } else {
+        reject_reparse_point_ancestors(path)?;
+    }
     fs::create_dir_all(path)?;
-    Ok(())
+    let after = fs::symlink_metadata(path)?;
+    if !after.file_type().is_dir() || after.file_type().is_symlink() {
+        return Err(invalid_private_path());
+    }
+    envault_windows_ffi::restrict_path_to_owner(path).map_err(PlatformError::Io)
 }
 
 #[cfg(all(test, unix))]
@@ -753,5 +874,100 @@ mod tests {
             normalize_platform_path(std::path::Path::new("/tmp/package")),
             std::path::Path::new("/private/tmp/package")
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn private_directory_is_created() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("private");
+        create_private_directory(&path).expect("create");
+        assert!(fs::metadata(&path).expect("metadata").is_dir());
+    }
+
+    #[test]
+    fn private_file_is_created_and_rejects_replay() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("private-created");
+        drop(create_private_file(&path).expect("create"));
+        assert!(create_private_file(&path).is_err());
+    }
+
+    #[test]
+    fn reusable_lock_file_round_trips() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("daemon.lock");
+        drop(open_private_lock_file(&path).expect("open"));
+        drop(open_private_lock_file(&path).expect("reopen"));
+    }
+
+    #[test]
+    fn reparse_point_ancestors_are_rejected() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let target_directory = directory.path().join("target-directory");
+        fs::create_dir(&target_directory).expect("target directory");
+        let linked_directory = directory.path().join("linked-directory");
+        if std::os::windows::fs::symlink_dir(&target_directory, &linked_directory).is_err() {
+            // Creating a directory symlink requires either Developer Mode or
+            // an elevated token; skip on hosts without that privilege rather
+            // than failing a permission probe.
+            return;
+        }
+        assert!(create_private_directory(&linked_directory.join("nested")).is_err());
+
+        let target_file = directory.path().join("target-file");
+        fs::write(&target_file, b"target").expect("target file");
+        let linked_file = directory.path().join("linked-file");
+        std::os::windows::fs::symlink_file(&target_file, &linked_file).expect("file symlink");
+        assert!(open_private_lock_file(&linked_file).is_err());
+        assert!(create_private_file(&linked_file).is_err());
+        assert_eq!(fs::read(&target_file).expect("target remains"), b"target");
+    }
+
+    #[test]
+    fn stable_path_operations_reject_parent_traversal() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).expect("nested");
+        let traversing = nested.join("..").join("output");
+
+        assert!(create_private_file(&traversing).is_err());
+        assert!(!directory.path().join("output").exists());
+    }
+
+    #[test]
+    fn private_publish_is_no_replace_and_preserves_identity() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let source = directory.path().join("temporary");
+        let destination = directory.path().join("package");
+        let mut file = create_private_file(&source).expect("create");
+        file.write_all(b"package").expect("write");
+        file.sync_all().expect("sync");
+        drop(file);
+        publish_private_file_no_replace(&source, &destination).expect("publish");
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).expect("read"), b"package");
+
+        let replacement = directory.path().join("replacement");
+        drop(create_private_file(&replacement).expect("replacement"));
+        assert!(publish_private_file_no_replace(&replacement, &destination).is_err());
+        assert_eq!(fs::read(&destination).expect("unchanged"), b"package");
+    }
+
+    #[test]
+    fn private_file_path_validation_rejects_replacement() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("output");
+        let file = create_private_file(&path).expect("create");
+        validate_private_file_path(&path, &file).expect("owned path");
+        fs::remove_file(&path).expect("unlink");
+        drop(create_private_file(&path).expect("replacement"));
+        assert!(validate_private_file_path(&path, &file).is_err());
     }
 }

@@ -25,6 +25,8 @@ use envault_service::{SensitiveInput, ServiceError};
 use serde::Serialize;
 use uuid::Uuid;
 
+mod convenience_unlock;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "envault",
@@ -77,6 +79,29 @@ enum Command {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    ConvenienceUnlock {
+        #[command(subcommand)]
+        command: ConvenienceUnlockCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConvenienceUnlockCommand {
+    Enable(ConvenienceUnlockEnableArgs),
+    Disable,
+    Status,
+}
+
+#[derive(Debug, clap::Args)]
+struct ConvenienceUnlockEnableArgs {
+    #[command(flatten)]
+    password: PasswordArgs,
+    #[arg(
+        long,
+        required = true,
+        help = "Acknowledge that the master password will be stored in this operating system's native credential store"
+    )]
+    acknowledge_os_keystore: bool,
 }
 
 #[derive(Clone, Copy, Debug, clap::Args)]
@@ -612,6 +637,7 @@ fn main() -> ExitCode {
             command: RequestCommand::Http(arguments),
         } => http_request(cli.output, arguments),
         Command::Workspace { command } => workspace_command(cli.output, command),
+        Command::ConvenienceUnlock { command } => convenience_unlock_command(cli.output, command),
     }
 }
 
@@ -657,13 +683,89 @@ fn start_daemon(output: Output, arguments: PasswordArgs) -> ExitCode {
         Ok(_) => return print_error(output, &unexpected_response()),
         Err(error) => return print_error(output, &client_error(error)),
     }
-    let password = match read_master_password(arguments.password_stdin, false) {
+    let password = match resolve_start_password(arguments.password_stdin) {
         Ok(password) => password,
         Err(error) => return print_error(output, &error),
     };
     match client::start(password) {
         Ok(status) => print_running_status(output, &status),
         Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn resolve_start_password(password_stdin: bool) -> Result<SensitiveBytes, StructuredError> {
+    if convenience_unlock::is_enabled() {
+        match convenience_unlock::read_stored_password(&convenience_unlock::RealKeystore) {
+            Ok(password) => return Ok(password),
+            Err(_) => eprintln!(
+                "convenience unlock: stored master password is unavailable, falling back to the password prompt"
+            ),
+        }
+    }
+    read_master_password(password_stdin, false)
+}
+
+fn convenience_unlock_command(output: Output, command: ConvenienceUnlockCommand) -> ExitCode {
+    match command {
+        ConvenienceUnlockCommand::Enable(arguments) => {
+            let password = match read_master_password(arguments.password.password_stdin, false) {
+                Ok(password) => password,
+                Err(error) => return print_error(output, &error),
+            };
+            let database_path = match vault_database_path() {
+                Ok(path) => path,
+                Err(error) => return print_error(output, &error),
+            };
+            let verification = SensitiveInput::new(password.as_slice().to_vec());
+            if let Err(error) = envault_service::VaultSession::unlock(&database_path, &verification)
+            {
+                return print_error(output, &service_error(&error));
+            }
+            match convenience_unlock::enable(&password, &convenience_unlock::RealKeystore) {
+                Ok(()) => {
+                    println!(
+                        "convenience unlock: enabled · the master password is now stored in this operating system's native credential store and `start` will no longer prompt for it · this lowers the vault's practical unlock guarantee to \"requires access to the current OS session\" · disable with `envault convenience-unlock disable`"
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => print_error(
+                    output,
+                    &input_error(
+                        "io_error",
+                        &format!("failed to enable convenience unlock: {error}"),
+                    ),
+                ),
+            }
+        }
+        ConvenienceUnlockCommand::Disable => {
+            match convenience_unlock::disable(&convenience_unlock::RealKeystore) {
+                Ok(()) => {
+                    println!(
+                        "convenience unlock: disabled · the stored master password was removed from the OS credential store · `start` will prompt again"
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => print_error(
+                    output,
+                    &input_error(
+                        "io_error",
+                        &format!("failed to disable convenience unlock: {error}"),
+                    ),
+                ),
+            }
+        }
+        ConvenienceUnlockCommand::Status => {
+            let enabled = convenience_unlock::is_enabled();
+            match output {
+                Output::Human => println!(
+                    "convenience unlock: {}",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+                Output::Json => println!("{{\"enabled\":{enabled}}}"),
+                Output::Toon => println!("convenience_unlock{{enabled}}: {enabled}"),
+            }
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -2446,8 +2548,26 @@ mod tests {
                 "secret",
                 "agent",
                 "request",
-                "workspace"
+                "workspace",
+                "convenience-unlock"
             ]
+        );
+    }
+
+    #[test]
+    fn convenience_unlock_enable_requires_explicit_acknowledgement() {
+        assert!(
+            Cli::try_parse_from(["envault", "convenience-unlock", "enable"]).is_err(),
+            "enabling without --acknowledge-os-keystore must fail to parse"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "envault",
+                "convenience-unlock",
+                "enable",
+                "--acknowledge-os-keystore",
+            ])
+            .is_ok()
         );
     }
 

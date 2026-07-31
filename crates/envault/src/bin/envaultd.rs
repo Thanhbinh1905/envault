@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::main]
 async fn main() {
     if let Err(error) = envault::daemon::run_from_stdio().await {
@@ -9,8 +9,8 @@ async fn main() {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn main() {
-    eprintln!("envaultd: runtime support is available on Linux and macOS in this release phase");
+    eprintln!("envaultd: runtime support is available on Linux, macOS, and Windows only");
     std::process::exit(1);
 }

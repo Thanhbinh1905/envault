@@ -1,0 +1,25 @@
+[package]
+name = "envault-windows-ffi"
+description = "Isolated Windows FFI primitives for named-pipe security descriptors and peer authentication"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+tokio = { workspace = true, features = ["net"] }
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Memory",
+  "Win32_System_Pipes",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_Threading",
+] }
+
+[dev-dependencies]

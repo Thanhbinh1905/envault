@@ -36,9 +36,16 @@ pub(crate) fn write_sync_frame<T: Serialize>(
     writer.flush().map_err(|_| ProtocolError::Encode)
 }
 
-#[cfg(unix)]
+/// Reads one length-prefixed CBOR frame from any async byte stream. Generic
+/// over the stream type rather than a concrete `tokio::net::UnixStream`
+/// because the daemon's connection-handling and dispatch logic is shared
+/// between the Unix socket transport and the Windows named-pipe transport;
+/// both `tokio::net::UnixStream` and
+/// `tokio::net::windows::named_pipe::NamedPipeServer` implement
+/// `AsyncRead`/`AsyncWrite`, so this framing code needs no platform-specific
+/// variant of its own.
 pub(crate) async fn read_async_frame<T: DeserializeOwned>(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
 ) -> Result<T, ProtocolError> {
     use tokio::io::AsyncReadExt;
 
@@ -62,9 +69,10 @@ pub(crate) async fn read_async_frame<T: DeserializeOwned>(
     decode_frame(&frame)
 }
 
-#[cfg(unix)]
+/// Writes one length-prefixed CBOR frame to any async byte stream. See
+/// `read_async_frame` for why this is generic rather than Unix-specific.
 pub(crate) async fn write_async_frame<T: Serialize>(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     value: &T,
 ) -> Result<(), ProtocolError> {
     use tokio::io::{AsyncWriteExt, BufWriter};

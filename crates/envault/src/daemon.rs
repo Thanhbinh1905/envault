@@ -1,8 +1,9 @@
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::{
     collections::BTreeMap,
     fs::File,
     io,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,8 +22,11 @@ use envault_service::{
     normalize_agent_http_constraint,
 };
 use thiserror::Error;
+#[cfg(unix)]
+use tokio::net::UnixListener;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::{
-    net::{UnixListener, UnixStream},
     sync::{Notify, Semaphore},
     task::JoinSet,
 };
@@ -653,6 +657,19 @@ enum RuntimeFailure {
     Internal,
 }
 
+/// A fixed placeholder `PeerIdentity.uid` for every Windows connection.
+/// Windows named pipes have no per-connection UID the way Unix sockets do;
+/// by the time a connection reaches `RuntimeState`, `is_current_user_pid`
+/// has already verified the connecting process shares the daemon's own
+/// security identifier, so every authenticated peer is equally "the owner"
+/// and a constant here is exactly as meaningful as comparing real UIDs would
+/// be on Unix, where every accepted connection also has `peer.uid ==
+/// owner_uid` by construction. `peer.session_id`, not `peer.uid`, is what
+/// actually distinguishes separate login sessions of that one owner.
+#[cfg(windows)]
+const WINDOWS_PEER_UID: u32 = 0;
+
+#[cfg(unix)]
 struct Server {
     listener: UnixListener,
     state: Arc<Mutex<RuntimeState>>,
@@ -664,6 +681,18 @@ struct Server {
     authentication: Arc<Semaphore>,
 }
 
+#[cfg(windows)]
+struct Server {
+    listener: NamedPipeServer,
+    pipe_name: String,
+    state: Arc<Mutex<RuntimeState>>,
+    _lock_file: File,
+    shutdown: Arc<Notify>,
+    connections: Arc<Semaphore>,
+    authentication: Arc<Semaphore>,
+}
+
+#[cfg(unix)]
 impl Server {
     fn prepare(config: &DaemonConfig, password: SensitiveBytes) -> Result<Self, DaemonError> {
         envault_platform::create_private_directory(&config.runtime_directory)?;
@@ -693,6 +722,10 @@ impl Server {
             connections: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             authentication: Arc::new(Semaphore::new(1)),
         })
+    }
+
+    fn peer_uid(&self) -> u32 {
+        self.owner_uid
     }
 
     async fn run(self) -> Result<(), DaemonError> {
@@ -749,6 +782,111 @@ impl Server {
     }
 }
 
+#[cfg(windows)]
+impl Server {
+    fn prepare(config: &DaemonConfig, password: SensitiveBytes) -> Result<Self, DaemonError> {
+        envault_platform::create_private_directory(&config.runtime_directory)?;
+        let lock_file = envault_platform::open_private_lock_file(&config.lock_path)?;
+        match lock_file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(DaemonError::AlreadyRunning),
+            Err(std::fs::TryLockError::Error(error)) => return Err(DaemonError::Io(error)),
+        }
+        let sensitive = SensitiveInput::new(password.into_vec());
+        let vault = VaultSession::unlock(&config.database_path, &sensitive)?;
+        drop(sensitive);
+        let pipe_name = crate::client::windows_pipe_name(&config.socket_path);
+        let listener = envault_windows_ffi::create_named_pipe_server(&pipe_name, true)?;
+        let state = RuntimeState::new(vault, config.database_path.clone())
+            .map_err(|_| DaemonError::BootstrapProtocol)?;
+        Ok(Self {
+            listener,
+            pipe_name,
+            state: Arc::new(Mutex::new(state)),
+            _lock_file: lock_file,
+            shutdown: Arc::new(Notify::new()),
+            connections: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
+            authentication: Arc::new(Semaphore::new(1)),
+        })
+    }
+
+    fn peer_uid(&self) -> u32 {
+        WINDOWS_PEER_UID
+    }
+
+    async fn run(mut self) -> Result<(), DaemonError> {
+        use std::os::windows::io::AsRawHandle;
+
+        let mut tasks = JoinSet::new();
+        let signal = shutdown_signal();
+        tokio::pin!(signal);
+        loop {
+            tokio::select! {
+                connected = self.listener.connect() => {
+                    if connected.is_err() {
+                        continue;
+                    }
+                    // Recycle the instance immediately: hand the
+                    // now-connected pipe off to the spawned task and put a
+                    // fresh, not-yet-connected instance in its place so the
+                    // next client can connect while this one is served,
+                    // mirroring how a Unix listener keeps accepting after
+                    // handing off one accepted connection.
+                    let Ok(next) = envault_windows_ffi::create_named_pipe_server(&self.pipe_name, false) else {
+                        continue;
+                    };
+                    let stream = std::mem::replace(&mut self.listener, next);
+                    let handle = stream.as_raw_handle();
+                    let Ok(pid) = envault_windows_ffi::named_pipe_client_process_id(handle) else {
+                        continue;
+                    };
+                    if !matches!(envault_windows_ffi::is_current_user_pid(pid), Ok(true)) {
+                        continue;
+                    }
+                    let Ok(session_id) = envault_windows_ffi::named_pipe_client_session_id(pid) else {
+                        continue;
+                    };
+                    let peer = PeerIdentity {
+                        uid: WINDOWS_PEER_UID,
+                        pid,
+                        session_id,
+                    };
+                    if self
+                        .state
+                        .lock()
+                        .map_or(true, |mut state| state.check_connection_rate(peer).is_err())
+                    {
+                        continue;
+                    }
+                    let Ok(permit) = Arc::clone(&self.connections).try_acquire_owned() else {
+                        continue;
+                    };
+                    let state = Arc::clone(&self.state);
+                    let shutdown = Arc::clone(&self.shutdown);
+                    let authentication = Arc::clone(&self.authentication);
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        handle_connection(stream, peer, state, shutdown, authentication).await;
+                    });
+                }
+                () = self.shutdown.notified() => break,
+                result = &mut signal => {
+                    result?;
+                    break;
+                },
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+            }
+        }
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        self.state
+            .lock()
+            .map_err(|_| DaemonError::BootstrapProtocol)?
+            .lock();
+        Ok(())
+    }
+}
+
 pub async fn run_from_stdio() -> Result<(), DaemonError> {
     envault_platform::harden_sensitive_process()?;
     let request: Request<BootstrapRequest> =
@@ -767,7 +905,7 @@ pub async fn run_from_stdio() -> Result<(), DaemonError> {
                 .lock()
                 .map_err(|_| DaemonError::BootstrapProtocol)?
                 .status(PeerIdentity {
-                    uid: server.owner_uid,
+                    uid: server.peer_uid(),
                     pid: std::process::id(),
                     session_id: current_session_id()?,
                 })
@@ -801,13 +939,15 @@ pub async fn run_from_stdio() -> Result<(), DaemonError> {
     }
 }
 
-async fn handle_connection(
-    stream: UnixStream,
+async fn handle_connection<S>(
+    stream: S,
     peer: PeerIdentity,
     state: Arc<Mutex<RuntimeState>>,
     shutdown: Arc<Notify>,
     authentication: Arc<Semaphore>,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     handle_connection_with_timing(
         stream,
         peer,
@@ -819,14 +959,16 @@ async fn handle_connection(
     .await;
 }
 
-async fn handle_connection_with_timing(
-    mut stream: UnixStream,
+async fn handle_connection_with_timing<S>(
+    mut stream: S,
     peer: PeerIdentity,
     state: Arc<Mutex<RuntimeState>>,
     shutdown: Arc<Notify>,
     authentication: Arc<Semaphore>,
     timing: ConnectionTiming,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let read_deadline = tokio::time::Instant::now() + timing.request_timeout;
     let request = tokio::time::timeout_at(read_deadline, read_async_frame(&mut stream)).await;
     let (response, stop, write_deadline) = match request {
@@ -1733,6 +1875,7 @@ fn unix_seconds() -> Result<i64, RuntimeFailure> {
     i64::try_from(seconds).map_err(|_| RuntimeFailure::Internal)
 }
 
+#[cfg(unix)]
 fn remove_stale_socket(path: &Path) -> Result<(), io::Error> {
     use std::os::unix::fs::FileTypeExt;
 
@@ -1747,6 +1890,7 @@ fn remove_stale_socket(path: &Path) -> Result<(), io::Error> {
     }
 }
 
+#[cfg(unix)]
 fn peer_identity(credentials: tokio::net::unix::UCred) -> Option<PeerIdentity> {
     use nix::unistd::{Pid, getsid};
 
@@ -1760,10 +1904,12 @@ fn peer_identity(credentials: tokio::net::unix::UCred) -> Option<PeerIdentity> {
     })
 }
 
+#[cfg(unix)]
 fn authenticated_peer(owner_uid: u32, peer: PeerIdentity) -> bool {
     peer.uid == owner_uid && peer.pid != 0 && peer.session_id != 0
 }
 
+#[cfg(unix)]
 fn current_session_id() -> Result<u32, DaemonError> {
     use nix::unistd::getsid;
 
@@ -1771,12 +1917,22 @@ fn current_session_id() -> Result<u32, DaemonError> {
     u32::try_from(raw.as_raw()).map_err(|_| DaemonError::BootstrapProtocol)
 }
 
+/// The Windows analog of `current_session_id`: the Terminal Services session
+/// ID of the daemon's own process, used for the bootstrap status query's
+/// `PeerIdentity` before the accept loop starts serving real connections.
+#[cfg(windows)]
+fn current_session_id() -> Result<u32, DaemonError> {
+    envault_windows_ffi::named_pipe_client_session_id(std::process::id()).map_err(DaemonError::Io)
+}
+
+#[cfg(unix)]
 struct SocketGuard {
     path: PathBuf,
     device: u64,
     inode: u64,
 }
 
+#[cfg(unix)]
 impl SocketGuard {
     fn new(path: PathBuf) -> Result<Self, io::Error> {
         let metadata = std::fs::symlink_metadata(&path)?;
@@ -1793,6 +1949,7 @@ impl SocketGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         if self.still_owns_path() {
@@ -1801,6 +1958,7 @@ impl Drop for SocketGuard {
     }
 }
 
+#[cfg(unix)]
 async fn shutdown_signal() -> Result<(), io::Error> {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -1812,6 +1970,22 @@ async fn shutdown_signal() -> Result<(), io::Error> {
         _ = terminate.recv() => {}
         _ = hangup.recv() => {}
     }
+    Ok(())
+}
+
+/// The Windows shutdown signal set is narrower than Unix's by design for
+/// this pass: it handles Ctrl+C, the interactive-console signal every
+/// Windows process receives, and not yet the service-manager/close/logoff
+/// signals `tokio::signal::windows` also exposes (`ctrl_break`,
+/// `ctrl_close`, `ctrl_shutdown`). Those matter for a process running as a
+/// Windows service or responding to console-window close, which is out of
+/// scope until `envaultd` actually ships as a service; tracked as a
+/// follow-up rather than silently assumed equivalent to the Unix signal
+/// set.
+#[cfg(windows)]
+async fn shutdown_signal() -> Result<(), io::Error> {
+    let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+    ctrl_c.recv().await;
     Ok(())
 }
 
@@ -1859,6 +2033,11 @@ mod tests {
         assert!(state.admin_lease.is_none());
         assert!(state.capabilities.is_empty());
         assert!(state.token_hash_key.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_peer_requires_matching_owner_uid() {
         assert!(authenticated_peer(1000, peer()));
         assert!(!authenticated_peer(1001, peer()));
     }
@@ -1920,6 +2099,7 @@ mod tests {
         assert_eq!(state.rate_limits.len(), MAX_RATE_WINDOWS);
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_guard_never_removes_a_replaced_path() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -1940,7 +2120,11 @@ mod tests {
     async fn deadline_error_preserves_the_decoded_request_id() {
         let (_directory, state, _password) = state();
         let request_id = Uuid::new_v4();
-        let (mut client, server) = UnixStream::pair().expect("stream pair");
+        // An in-memory duplex pair, not a real Unix socket or named pipe,
+        // since `handle_connection_with_timing` is generic over any
+        // `AsyncRead + AsyncWrite` stream and this test only exercises its
+        // framing/deadline logic, which is identical on every platform.
+        let (mut client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(handle_connection_with_timing(
             server,
             peer(),
