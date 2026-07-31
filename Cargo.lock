@@ -1065,6 +1065,7 @@ dependencies = [
 name = "envault-windows-ffi"
 version = "0.0.1"
 dependencies = [
+ "tokio",
  "windows-sys 0.61.2",
 ]
 

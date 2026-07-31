@@ -93,13 +93,21 @@ pub fn start(password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
     }
 }
 
-/// The named-pipe transport and peer authentication `request_at` uses below
-/// are implemented and cross-checked on Windows (see ADR 0013), but the
-/// daemon-side listener that would actually serve a pipe for `start` to
-/// bootstrap against does not exist yet; `envaultd` still reports Windows
-/// runtime support as unavailable and exits. Spawning it here would only
-/// reproduce that failure, so `start` remains explicitly unsupported until
-/// the daemon-side accept loop lands as a follow-up.
+/// The named-pipe transport, peer authentication, and the daemon-side
+/// accept loop `envaultd` now runs on Windows are all implemented (see ADR
+/// 0013) and reachable by `request_at` below once a daemon is already
+/// running. What remains unimplemented here is specifically the
+/// spawn-on-demand convenience `start` provides on Unix: launching
+/// `envaultd` as a detached background process and waiting for its
+/// bootstrap handshake. Unix daemonization (`setsid`, closing inherited
+/// descriptors, the bootstrap stdio protocol in `spawn_daemon`) has no
+/// direct Windows equivalent, and getting that process-launch and
+/// detachment story right is a distinct piece of work from the transport
+/// itself; it has not been attempted yet under the same no-real-Windows-
+/// runtime constraint that shaped the rest of this phase, and is tracked as
+/// a follow-up rather than guessed at. A human or supervisor can still run
+/// `envaultd` directly today and reach it through every other client
+/// operation.
 #[cfg(windows)]
 pub fn start(_password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
     Err(ClientError::UnsupportedPlatform)
@@ -413,7 +421,7 @@ mod tests {
 /// input instead of treating it as a literal path, keeping one scoped name
 /// per runtime directory the same way the Unix socket file is scoped.
 #[cfg(windows)]
-fn windows_pipe_name(socket_path: &std::path::Path) -> String {
+pub(crate) fn windows_pipe_name(socket_path: &std::path::Path) -> String {
     let sanitized: String = socket_path
         .to_string_lossy()
         .chars()

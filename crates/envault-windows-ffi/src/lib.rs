@@ -45,6 +45,7 @@ use windows_sys::Win32::{
             PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
             PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
         },
+        RemoteDesktop::ProcessIdToSessionId,
         Threading::{
             GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken,
             PROCESS_QUERY_LIMITED_INFORMATION,
@@ -220,6 +221,80 @@ pub fn create_named_pipe_instance(path: &OsStr, first_instance: bool) -> io::Res
     // fresh, uniquely owned handle; wrapping it in `File` transfers
     // ownership so it is closed exactly once when the `File` drops.
     Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
+}
+
+/// Creates one instance of an async, tokio-native named pipe server
+/// restricted to the owning user, for use by the daemon's async accept loop.
+/// Mirrors `create_named_pipe_instance`, but returns tokio's
+/// [`tokio::net::windows::named_pipe::NamedPipeServer`] instead of a
+/// blocking [`File`], since the daemon dispatches connections on a tokio
+/// runtime rather than blocking threads.
+#[allow(unsafe_code)]
+pub fn create_named_pipe_server(
+    name: &str,
+    first_instance: bool,
+) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    let mut security = owner_only_security_attributes()?;
+    let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
+    options
+        .first_pipe_instance(first_instance)
+        .reject_remote_clients(true);
+    // SAFETY: `security` is a fully initialized `SECURITY_ATTRIBUTES` whose
+    // `lpSecurityDescriptor` points at a live descriptor buffer for the
+    // duration of this call; `security` is not dropped until after
+    // `create_with_security_attributes_raw` returns, by which point the
+    // pipe object has already been constructed from it. Tokio's documented
+    // contract for this function is exactly that the pointer be valid for
+    // the duration of the call, which this satisfies.
+    unsafe {
+        options
+            .create_with_security_attributes_raw(name, security.as_ptr().cast::<std::ffi::c_void>())
+    }
+}
+
+/// Returns the process ID of the client connected to `handle`, which must be
+/// an open named-pipe server-side handle (e.g. from a tokio
+/// `NamedPipeServer`'s `AsRawHandle`).
+#[allow(unsafe_code)]
+pub fn named_pipe_client_process_id(handle: std::os::windows::io::RawHandle) -> io::Result<u32> {
+    let mut pid: u32 = 0;
+    // SAFETY: the caller guarantees `handle` is a valid, open named-pipe
+    // server handle for the duration of this call. `pid` is a valid
+    // out-parameter location.
+    let ok = unsafe { GetNamedPipeClientProcessId(handle as HANDLE, &raw mut pid) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(pid)
+}
+
+/// Returns `true` only if `pid` names a process owned by the same security
+/// identifier as the current process. A thin, differently named entry point
+/// onto the same check `verify_pipe_client_is_current_user` uses, for
+/// callers that have already resolved a raw process ID (for example the
+/// daemon's async accept loop, which reads the client PID directly off a
+/// tokio `NamedPipeServer` handle rather than a blocking `File`).
+pub fn is_current_user_pid(pid: u32) -> io::Result<bool> {
+    verify_pid_is_current_user(pid)
+}
+
+/// Returns the Windows Terminal Services session ID that `pid` belongs to.
+/// This is the Windows analog of the Unix login-session ID
+/// (`getsid`/`setsid`): stable across every process a human starts within
+/// one logon session, which is exactly the granularity the daemon's
+/// per-session rate limiting and admin-lease binding needs, rather than a
+/// per-process value that would change on every new CLI invocation.
+#[allow(unsafe_code)]
+pub fn named_pipe_client_session_id(pid: u32) -> io::Result<u32> {
+    let mut session_id: u32 = 0;
+    // SAFETY: `pid` is any `u32`; the API validates it internally and
+    // reports failure through its return value, checked below. `session_id`
+    // is a valid out-parameter location.
+    let ok = unsafe { ProcessIdToSessionId(pid, &raw mut session_id) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(session_id)
 }
 
 /// Connects to an existing named pipe server as a client. Does not retry on
