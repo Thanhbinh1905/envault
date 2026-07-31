@@ -3185,7 +3185,7 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(
             shell_quote(r#"C:\Program Files\o\"matic"#),
-            r#""C:\Program Files\o\"matic""#
+            r#""C:\Program Files\o\\"matic""#
         );
         #[cfg(not(windows))]
         assert_eq!(
