@@ -7,7 +7,7 @@ Accepted on 2026-07-30.
 ## Context
 
 Encrypted packages and `.env` files can change between preview and commit.
-Destination names, identifiers, profile activation, policies, and secret versions can also change after a preview.
+Destination names, identifiers, profile activation, and secret versions can also change after a preview.
 A preview that is not bound to the exact source bytes and destination state can misrepresent the operation that is later committed.
 
 ## Decision

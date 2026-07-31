@@ -36,3 +36,10 @@ Chain verification fails on mutation, deletion, insertion, or reordering.
 Scope and policy behavior can be property-tested independently from storage order.
 The daemon can later attach operating-system peer identity and in-memory capability hashes without changing the evaluator.
 Import and portability code must preserve stable identifiers and rebuild deterministic resolution plans before commit.
+
+## Addendum (2026-07-31): policy removed, workspace added on the same scope tree
+
+Static allow/deny policy rules were removed entirely.
+They were pure ceremony duplicating the access decision already made by loading a profile and, for HTTP, by the `secret_http_access` record described in ADR 0004's addendum: a rule that always mirrored an existing grant added no independent protection.
+Agent grants and the audit hash chain were removed alongside them, since both existed to support policy explanation and revocation that no longer has anything to point at.
+The scope tree, its override and tombstone semantics, and profile binding described above are unchanged and now also carry the new Workspace grouping scope (ADR 0015), which needed no changes to the evaluator.

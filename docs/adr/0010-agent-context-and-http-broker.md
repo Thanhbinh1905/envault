@@ -39,3 +39,11 @@ Stopping or locking the daemon invalidates every HTTP constraint and token toget
 Changing a provider constraint requires a new human-approved capability instead of mutating an existing grant.
 HTTP request failures may consume one bounded grant use after authorization because an attempted provider action is auditable even when transport or response filtering fails.
 The first broker deliberately supports Bearer authentication only and cannot proxy generic sockets, commands, database sessions, or arbitrary headers.
+
+## Addendum (2026-07-31): agent sessions and principals removed
+
+`Operation::Context`, `CreateAgentSession`, `AgentSessionStatus`, `RevokeAgentSession`, and the entire `Principal`/`PrincipalKind::Agent` concept were removed.
+There is no session, token, or identity distinguishing one agent process from another, or from a human's own CLI use.
+Agent access to secret metadata is now governed purely by the loaded set (whether a profile has `activate_on_start = true`); agent access to an HTTP action is governed purely by the `secret_http_access` record on the target secret (ADR 0004's addendum).
+Both checks depend only on same-uid trust in the daemon's peer authentication (ADR 0009), not on any claim the caller presents.
+The broker's own constraints (HTTPS-only, no redirects, host/method/path matching, response firewall) are unchanged, per ADR 0006's addendum.

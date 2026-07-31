@@ -4,12 +4,10 @@ use std::{fmt, io::Write};
 
 pub use envault_broker::{HttpConstraint, HttpContentType, HttpMethod, HttpRequest, HttpResponse};
 use envault_core::{
-    ApprovalId, EnvImportPreview, GeneratorSpec, GrantId, ImportConflictStrategy, PackageKind,
-    PlaintextExportSummary, PortabilityExportSummary, PortabilityImportSummary, PortabilityPreview,
-    PrincipalId, PrincipalKind, PrincipalView, ProfileView, SecretId, SecretVersionView,
-    SecretView, VaultId,
+    EnvImportPreview, GeneratorSpec, ImportConflictStrategy, PackageKind, PlaintextExportSummary,
+    PortabilityExportSummary, PortabilityImportSummary, PortabilityPreview, ProfileView,
+    ResolvedSecretView, ScopeView, SecretVersionView, SecretView,
 };
-use envault_policy::{Action, Effect, ResourceSelector, Rule};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use uuid::Uuid;
@@ -91,58 +89,40 @@ pub struct BootstrapRequest {
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AuthenticatedRequest {
-    pub capability_token: Option<SensitiveBytes>,
     pub operation: Operation,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     Status,
-    Context,
     Lock,
     Stop,
     AdminUnlock {
         password: SensitiveBytes,
-        ttl_minutes: u8,
+        /// `None` requests a lease with no expiration (`--no-expiration`).
+        ttl_minutes: Option<u8>,
     },
     AdminStatus,
     AdminLock,
-    CreateAgentSession {
-        principal_id: PrincipalId,
-        action: Action,
-        resource: ResourceSelector,
-        http_constraint: Option<HttpConstraint>,
-        ttl_minutes: u8,
-        max_requests: u32,
-    },
-    AgentSessionStatus,
-    RevokeAgentSession {
-        grant_id: GrantId,
-    },
-    CreatePrincipal {
-        kind: PrincipalKind,
-        name: String,
-    },
-    ListPrincipals,
-    SetPrincipalDisabled {
-        principal_id: PrincipalId,
-        disabled: bool,
-    },
-    CreatePolicyRule {
-        principal_id: PrincipalId,
-        effect: Effect,
-        action: Action,
-        resource: ResourceSelector,
-    },
-    ListPolicyRules,
     CreateProfile {
         name: String,
         description: Option<String>,
+        workspace: Option<String>,
     },
     ShowProfile {
         name: String,
     },
     ListProfiles,
+    CreateWorkspace {
+        name: String,
+    },
+    ListWorkspaces,
+    ShowWorkspace {
+        name: String,
+    },
+    LoadWorkspace {
+        name: String,
+    },
     UpdateProfile {
         name: String,
         description: Option<String>,
@@ -154,49 +134,86 @@ pub enum Operation {
     DeleteProfile {
         name: String,
     },
-    ActivateProfile {
+    LoadProfile {
+        name: String,
+    },
+    UnloadProfile {
         name: String,
     },
     CreateSecret {
+        profile: String,
         name: String,
         description: Option<String>,
         value: SensitiveBytes,
     },
     CreateGeneratedSecret {
+        profile: String,
         name: String,
         description: Option<String>,
         generator: GeneratorSpec,
     },
     ListSecrets,
+    ListResolvedSecrets {
+        profile: String,
+    },
     DescribeSecret {
+        profile: String,
         name: String,
     },
     UpdateSecret {
+        profile: String,
         name: String,
         description: Option<String>,
     },
     RenameSecret {
+        profile: String,
         old_name: String,
         new_name: String,
     },
     DeleteSecret {
+        profile: String,
         name: String,
     },
     SetSecretValue {
+        profile: String,
         name: String,
         value: SensitiveBytes,
     },
     GenerateSecretValue {
+        profile: String,
         name: String,
         generator: GeneratorSpec,
     },
     ListSecretVersions {
+        profile: String,
         name: String,
     },
-    DiscoverSecrets,
+    SetSecretHttpAccess {
+        profile: String,
+        name: String,
+        constraint: HttpConstraint,
+    },
+    RemoveSecretHttpAccess {
+        profile: String,
+        name: String,
+    },
     HttpRequest {
-        secret_id: SecretId,
+        profile: String,
+        name: String,
         request: HttpRequest,
+    },
+    /// Resolves plaintext env values for `envault run` - the sole path that
+    /// hands plaintext to a CLI client, never through stdout.
+    RunEnv {
+        profiles: Vec<String>,
+    },
+    /// Decrypts a secret's value for the TUI's admin-gated `Reveal` popup -
+    /// the sole path that hands plaintext to a human's eyes. `version`
+    /// selects a historical version; `None` means the current version.
+    RevealSecretValue {
+        profile: String,
+        name: String,
+        version: Option<u64>,
     },
     ExportPackage {
         kind: PackageKind,
@@ -241,17 +258,6 @@ pub enum Operation {
 }
 
 impl Operation {
-    pub const fn accepts_agent_capability(&self) -> bool {
-        matches!(
-            self,
-            Self::Status
-                | Self::Context
-                | Self::AgentSessionStatus
-                | Self::DiscoverSecrets
-                | Self::HttpRequest { .. }
-        )
-    }
-
     pub const fn is_portability(&self) -> bool {
         matches!(
             self,
@@ -275,9 +281,8 @@ pub enum ServiceState {
 pub struct DaemonStatus {
     pub service: ServiceState,
     pub pid: u32,
-    pub active_profile: Option<String>,
+    pub loaded_profiles: Vec<String>,
     pub admin_lease_active: bool,
-    pub agent_session_count: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -286,49 +291,27 @@ pub struct AdminLeaseStatus {
     pub expires_at: Option<i64>,
 }
 
+/// A single resolved `envault run` env var. Carries plaintext across the IPC
+/// boundary to the CLI client only so it can be set on a child process's
+/// environment - never printed.
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentSessionCreated {
-    pub token: SensitiveBytes,
-    pub grant_id: GrantId,
-    pub approval_id: ApprovalId,
-    pub expires_at: i64,
-    pub max_requests: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentSessionView {
-    pub grant_id: GrantId,
-    pub principal_id: PrincipalId,
-    pub action: Action,
-    pub resource: ResourceSelector,
-    pub http_constraint: Option<HttpConstraint>,
-    pub expires_at: i64,
-    pub remaining_requests: u32,
-    pub revoked: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentContext {
-    pub vault_id: VaultId,
-    pub active_profile: ProfileView,
-    pub session: AgentSessionView,
+pub struct EnvVar {
+    pub name: String,
+    pub value: SensitiveBytes,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Reply {
     Status(DaemonStatus),
-    Context(AgentContext),
     AdminStatus(AdminLeaseStatus),
-    AgentSessionCreated(AgentSessionCreated),
-    AgentSessionStatus(AgentSessionView),
-    Principal(PrincipalView),
-    Principals(Vec<PrincipalView>),
-    PolicyRule(Rule),
-    PolicyRules(Vec<Rule>),
     Profile(ProfileView),
     Profiles(Vec<ProfileView>),
+    Workspace(ScopeView),
+    Workspaces(Vec<ScopeView>),
+    WorkspaceProfiles(Vec<ProfileView>),
     Secret(SecretView),
     Secrets(Vec<SecretView>),
+    ResolvedSecrets(Vec<ResolvedSecretView>),
     SecretVersion(SecretVersionView),
     SecretVersions(Vec<SecretVersionView>),
     HttpResponse(HttpResponse),
@@ -337,6 +320,8 @@ pub enum Reply {
     PortabilityImport(PortabilityImportSummary),
     EnvImportPreview(EnvImportPreview),
     PlaintextExport(PlaintextExportSummary),
+    RunEnv(Vec<EnvVar>),
+    SecretPlaintext(SensitiveBytes),
     Acknowledged { no_op: bool },
 }
 
@@ -465,7 +450,6 @@ mod tests {
             version: PROTOCOL_VERSION,
             request_id: Uuid::new_v4(),
             body: AuthenticatedRequest {
-                capability_token: None,
                 operation: Operation::Status,
             },
         };
@@ -521,11 +505,5 @@ mod tests {
             validate_version(PROTOCOL_VERSION + 1),
             Err(ProtocolError::UnsupportedVersion)
         ));
-        assert!(Operation::Status.accepts_agent_capability());
-        assert!(Operation::Context.accepts_agent_capability());
-        assert!(Operation::AgentSessionStatus.accepts_agent_capability());
-        assert!(Operation::DiscoverSecrets.accepts_agent_capability());
-        assert!(!Operation::Lock.accepts_agent_capability());
-        assert!(!Operation::AdminLock.accepts_agent_capability());
     }
 }

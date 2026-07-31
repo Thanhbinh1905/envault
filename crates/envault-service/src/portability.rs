@@ -13,17 +13,17 @@ use envault_core::{
     EntityKind, EnvImportEntryView, EnvImportPreview, ImportAction, ImportConflictStrategy,
     ImportConflictView, MAX_ENV_FILE_BYTES, MAX_ENV_LINE_BYTES, MAX_NAME_BYTES,
     MAX_PORTABILITY_ENTITIES, MAX_PORTABILITY_KEY_SLOTS, MAX_PORTABILITY_PACKAGE_BYTES,
-    MAX_SECRET_VALUE_BYTES, PackageKind, PlaintextExportSummary, PolicyRuleId, PortabilityCounts,
-    PortabilityExportSummary, PortabilityImportSummary, PortabilityPreview, PrincipalId, ProfileId,
-    ScopeId, ScopeKind, SecretId, SecretVersionId, VaultId, normalize_name,
+    MAX_SECRET_VALUE_BYTES, PackageKind, PlaintextExportSummary, PortabilityCounts,
+    PortabilityExportSummary, PortabilityImportSummary, PortabilityPreview, ProfileId, ScopeId,
+    ScopeKind, SecretId, SecretVersionId, VaultId, normalize_name,
 };
 use envault_crypto::{
     Ciphertext, KEY_BYTES, KdfParameters, SALT_BYTES, SecretBytes, SecretKey, decrypt, derive_key,
     encrypt, lookup_digest, random_array, unwrap_key, wrap_key,
 };
 use envault_store::{
-    ImportBatch, ImportReset, PolicyRuleRecord, PrincipalRecord, ProfileRecord, ScopeRecord,
-    SecretRecord, SecretVersionAppend, SecretVersionRecord,
+    ImportBatch, ImportReset, ProfileRecord, ScopeRecord, SecretRecord, SecretVersionAppend,
+    SecretVersionRecord,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -80,8 +80,6 @@ struct PackagePayload {
     scopes: Vec<PortableScope>,
     profiles: Vec<PortableProfile>,
     secrets: Vec<PortableSecret>,
-    principals: Vec<PortablePrincipal>,
-    policy_rules: Vec<PortablePolicyRule>,
 }
 
 impl Drop for PackagePayload {
@@ -105,9 +103,6 @@ impl Drop for PackagePayload {
                 version.transfer_wrapped_dek.zeroize();
                 version.aad_digest.zeroize();
             }
-        }
-        for principal in &mut self.principals {
-            principal.name.zeroize();
         }
     }
 }
@@ -154,27 +149,6 @@ struct PortableSecretVersion {
     created_at: i64,
 }
 
-#[derive(Serialize, Deserialize)]
-struct PortablePrincipal {
-    id: PrincipalId,
-    kind: u8,
-    name: String,
-    disabled: bool,
-    generation: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PortablePolicyRule {
-    id: PolicyRuleId,
-    principal_id: PrincipalId,
-    effect: u8,
-    action: u8,
-    resource_kind: u8,
-    resource_id: Uuid,
-    disabled: bool,
-    created_at: i64,
-}
-
 struct LoadedPackage {
     envelope: PackageEnvelope,
     payload: PackagePayload,
@@ -206,8 +180,6 @@ struct PackageIdMaps {
     profiles: BTreeMap<ProfileId, ProfileId>,
     secrets: BTreeMap<SecretId, SecretId>,
     versions: BTreeMap<SecretVersionId, SecretVersionId>,
-    principals: BTreeMap<PrincipalId, PrincipalId>,
-    rules: BTreeMap<PolicyRuleId, PolicyRuleId>,
 }
 
 enum PackagePlanMode {
@@ -637,7 +609,6 @@ impl VaultSession {
         let scopes = self.export_scopes(&all_scopes, &selected_scope_ids)?;
         let profiles = self.export_profiles(&profile_records)?;
         let secrets = self.export_secrets(package_id, transfer_key, &selected_scope_ids)?;
-        let (principals, policy_rules) = self.export_security_records(kind)?;
         Ok(PackagePayload {
             version: PACKAGE_VERSION,
             package_id,
@@ -647,8 +618,6 @@ impl VaultSession {
             scopes,
             profiles,
             secrets,
-            principals,
-            policy_rules,
         })
     }
 
@@ -764,49 +733,6 @@ impl VaultSession {
         Ok(secrets)
     }
 
-    fn export_security_records(
-        &self,
-        kind: PackageKind,
-    ) -> Result<(Vec<PortablePrincipal>, Vec<PortablePolicyRule>), ServiceError> {
-        if kind != PackageKind::Workspace {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        let principals = self
-            .store
-            .principals()?
-            .iter()
-            .map(|principal| {
-                Ok(PortablePrincipal {
-                    id: principal.id,
-                    kind: principal.kind,
-                    name: self.principal_view(principal)?.name,
-                    disabled: principal.disabled,
-                    generation: principal.generation,
-                })
-            })
-            .collect::<Result<Vec<_>, ServiceError>>()?;
-        let policy_rules = self
-            .store
-            .policy_rules()?
-            .iter()
-            .map(|rule| {
-                let resource_id =
-                    Uuid::from_slice(&rule.resource_id).map_err(|_| ServiceError::Corrupt)?;
-                Ok(PortablePolicyRule {
-                    id: rule.id,
-                    principal_id: rule.principal_id,
-                    effect: rule.effect,
-                    action: rule.action,
-                    resource_kind: rule.resource_kind,
-                    resource_id,
-                    disabled: rule.disabled,
-                    created_at: rule.created_at,
-                })
-            })
-            .collect::<Result<Vec<_>, ServiceError>>()?;
-        Ok((principals, policy_rules))
-    }
-
     fn plan_package_import(
         &self,
         loaded: &LoadedPackage,
@@ -895,8 +821,6 @@ impl VaultSession {
             &mut ids.profiles,
             &mut ids.secrets,
             &mut ids.versions,
-            &mut ids.principals,
-            &mut ids.rules,
         );
         Ok(if actions.is_empty() {
             PackagePlanMode::Workspace
@@ -960,30 +884,22 @@ impl VaultSession {
             }
             (Some(existing), ImportConflictStrategy::Replace) => {
                 let removed_scope_ids = self.profile_subtree_scope_ids(existing.scope_id)?;
-                if self.profile_replacement_has_policy_dependencies(
-                    existing.scope_id,
-                    &removed_scope_ids,
-                )? {
-                    actions.push(profile_import_action(desired_name, ImportAction::Reject));
-                    PackagePlanMode::Reject
-                } else {
-                    ids.scopes.insert(source_root.id, existing.scope_id);
-                    ids.profiles.insert(source_profile.id, existing.id);
-                    map_profile_ids(
-                        loaded.envelope.package_id,
-                        self.vault_id,
-                        &normalized,
-                        payload,
-                        &mut ids.scopes,
-                        &mut ids.profiles,
-                        &mut ids.secrets,
-                        &mut ids.versions,
-                    );
-                    actions.push(profile_import_action(desired_name, ImportAction::Replace));
-                    PackagePlanMode::ProfileReplace {
-                        existing_profile: existing,
-                        removed_scope_ids,
-                    }
+                ids.scopes.insert(source_root.id, existing.scope_id);
+                ids.profiles.insert(source_profile.id, existing.id);
+                map_profile_ids(
+                    loaded.envelope.package_id,
+                    self.vault_id,
+                    &normalized,
+                    payload,
+                    &mut ids.scopes,
+                    &mut ids.profiles,
+                    &mut ids.secrets,
+                    &mut ids.versions,
+                );
+                actions.push(profile_import_action(desired_name, ImportAction::Replace));
+                PackagePlanMode::ProfileReplace {
+                    existing_profile: existing,
+                    removed_scope_ids,
                 }
             }
             (None, _) => {
@@ -1054,7 +970,6 @@ impl VaultSession {
         )?;
         self.append_import_profiles(payload, plan, &mut batch)?;
         self.append_import_secrets(loaded, plan, &mut batch)?;
-        self.append_import_security(payload, plan, &mut batch)?;
         Ok(batch)
     }
 
@@ -1221,61 +1136,6 @@ impl VaultSession {
                 )?);
             }
             batch.secrets.push(record);
-        }
-        Ok(())
-    }
-
-    fn append_import_security(
-        &self,
-        payload: &PackagePayload,
-        plan: &PackagePlan,
-        batch: &mut ImportBatch,
-    ) -> Result<(), ServiceError> {
-        if payload.kind != PackageKind::Workspace {
-            return Ok(());
-        }
-        for source in &payload.principals {
-            let id = mapped(&plan.ids.principals, source.id)?;
-            batch.principals.push(PrincipalRecord {
-                id,
-                vault_id: self.vault_id,
-                kind: source.kind,
-                encrypted_name: self.encrypt_entity_text(
-                    EntityKind::Principal,
-                    id.0,
-                    "name",
-                    &source.name,
-                )?,
-                name_lookup: lookup_digest(
-                    &self.master_key,
-                    scope_policy::PRINCIPAL_LOOKUP_DOMAIN,
-                    normalize_name(&source.name)?.as_bytes(),
-                )
-                .to_vec(),
-                disabled: source.disabled,
-                generation: source.generation.max(1),
-            });
-        }
-        for source in &payload.policy_rules {
-            let id = mapped(&plan.ids.rules, source.id)?;
-            let principal_id = mapped(&plan.ids.principals, source.principal_id)?;
-            let resource_id = match source.resource_kind {
-                0 => self.vault_id.0,
-                1 => mapped(&plan.ids.scopes, ScopeId(source.resource_id))?.0,
-                2 => mapped(&plan.ids.secrets, SecretId(source.resource_id))?.0,
-                _ => return Err(ServiceError::InvalidPackage),
-            };
-            batch.policy_rules.push(PolicyRuleRecord {
-                id,
-                vault_id: self.vault_id,
-                principal_id,
-                effect: source.effect,
-                action: source.action,
-                resource_kind: source.resource_kind,
-                resource_id: resource_id.as_bytes().to_vec(),
-                disabled: source.disabled,
-                created_at: source.created_at,
-            });
         }
         Ok(())
     }
@@ -1522,40 +1382,13 @@ impl VaultSession {
                 hash_state_field(&mut hasher, &version.created_at.to_be_bytes());
             }
         }
-        let mut principals = self.store.principals()?;
-        principals.sort_by_key(|record| record.id);
-        for record in principals {
-            hash_state_field(&mut hasher, b"principal");
-            hash_state_field(&mut hasher, record.id.0.as_bytes());
-            hash_state_field(&mut hasher, &[record.kind]);
-            hash_state_field(&mut hasher, &record.encrypted_name);
-            hash_state_field(&mut hasher, &record.name_lookup);
-            hash_state_field(&mut hasher, &[u8::from(record.disabled)]);
-            hash_state_field(&mut hasher, &record.generation.to_be_bytes());
-        }
-        let mut rules = self.store.policy_rules()?;
-        rules.sort_by_key(|record| record.id);
-        for record in rules {
-            hash_state_field(&mut hasher, b"rule");
-            hash_state_field(&mut hasher, record.id.0.as_bytes());
-            hash_state_field(&mut hasher, record.principal_id.0.as_bytes());
-            hash_state_field(
-                &mut hasher,
-                &[record.effect, record.action, record.resource_kind],
-            );
-            hash_state_field(&mut hasher, &record.resource_id);
-            hash_state_field(&mut hasher, &[u8::from(record.disabled)]);
-            hash_state_field(&mut hasher, &record.created_at.to_be_bytes());
-        }
         Ok(*hasher.finalize().as_bytes())
     }
 
     fn workspace_is_portably_empty(&self) -> Result<bool, ServiceError> {
         Ok(self.store.scopes()?.len() == 1
             && self.store.profiles()?.len() == 1
-            && self.store.secrets()?.is_empty()
-            && self.store.principals()?.is_empty()
-            && self.store.policy_rules()?.is_empty())
+            && self.store.secrets()?.is_empty())
     }
 
     fn destination_base_profile(&self) -> Result<ProfileRecord, ServiceError> {
@@ -1593,41 +1426,6 @@ impl VaultSession {
         let mut ordered = selected.into_iter().collect::<Vec<_>>();
         ordered.sort_by_key(|id| scope_depth_records(&scopes, *id).unwrap_or(usize::MAX));
         Ok(ordered)
-    }
-
-    fn profile_replacement_has_policy_dependencies(
-        &self,
-        retained_scope_id: ScopeId,
-        removed_scope_ids: &[ScopeId],
-    ) -> Result<bool, ServiceError> {
-        let removed_scopes = removed_scope_ids.iter().copied().collect::<BTreeSet<_>>();
-        let removed_secrets = self
-            .store
-            .secrets()?
-            .into_iter()
-            .filter_map(|secret| {
-                removed_scopes
-                    .contains(&secret.scope_id)
-                    .then_some(secret.id)
-            })
-            .collect::<BTreeSet<_>>();
-        for rule in self.store.policy_rules()? {
-            let resource_id =
-                Uuid::from_slice(&rule.resource_id).map_err(|_| ServiceError::Corrupt)?;
-            let depends_on_removed_resource = match rule.resource_kind {
-                0 => false,
-                1 => {
-                    let scope_id = ScopeId(resource_id);
-                    scope_id != retained_scope_id && removed_scopes.contains(&scope_id)
-                }
-                2 => removed_secrets.contains(&SecretId(resource_id)),
-                _ => return Err(ServiceError::Corrupt),
-            };
-            if depends_on_removed_resource {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 }
 
@@ -1789,14 +1587,11 @@ fn validate_payload(payload: &PackagePayload) -> Result<(), ServiceError> {
     let ids = payload_ids(payload)?;
     validate_payload_scopes_and_profiles(payload, &ids.scopes)?;
     validate_payload_secrets(payload, &ids.scopes)?;
-    validate_payload_security(payload, &ids)?;
     Ok(())
 }
 
 struct PayloadIds {
     scopes: BTreeSet<ScopeId>,
-    secrets: BTreeSet<SecretId>,
-    principals: BTreeSet<PrincipalId>,
 }
 
 fn validate_payload_header(payload: &PackagePayload) -> Result<(), ServiceError> {
@@ -1808,11 +1603,7 @@ fn validate_payload_header(payload: &PackagePayload) -> Result<(), ServiceError>
     {
         return Err(ServiceError::InvalidPackage);
     }
-    if payload.kind == PackageKind::Profile
-        && (payload.profiles.len() != 1
-            || !payload.principals.is_empty()
-            || !payload.policy_rules.is_empty())
-    {
+    if payload.kind == PackageKind::Profile && payload.profiles.len() != 1 {
         return Err(ServiceError::InvalidPackage);
     }
     let total = payload
@@ -1820,8 +1611,6 @@ fn validate_payload_header(payload: &PackagePayload) -> Result<(), ServiceError>
         .len()
         .saturating_add(payload.profiles.len())
         .saturating_add(payload.secrets.len())
-        .saturating_add(payload.principals.len())
-        .saturating_add(payload.policy_rules.len())
         .saturating_add(
             payload
                 .secrets
@@ -1839,16 +1628,8 @@ fn payload_ids(payload: &PackagePayload) -> Result<PayloadIds, ServiceError> {
     ensure_unique(payload.scopes.iter().map(|scope| scope.id.0))?;
     ensure_unique(payload.profiles.iter().map(|profile| profile.id.0))?;
     ensure_unique(payload.secrets.iter().map(|secret| secret.id.0))?;
-    ensure_unique(payload.principals.iter().map(|principal| principal.id.0))?;
-    ensure_unique(payload.policy_rules.iter().map(|rule| rule.id.0))?;
     Ok(PayloadIds {
         scopes: payload.scopes.iter().map(|scope| scope.id).collect(),
-        secrets: payload.secrets.iter().map(|secret| secret.id).collect(),
-        principals: payload
-            .principals
-            .iter()
-            .map(|principal| principal.id)
-            .collect(),
     })
 }
 
@@ -2020,38 +1801,6 @@ fn validate_payload_secrets(
     Ok(())
 }
 
-fn validate_payload_security(
-    payload: &PackagePayload,
-    ids: &PayloadIds,
-) -> Result<(), ServiceError> {
-    let mut principal_names = BTreeSet::new();
-    for principal in &payload.principals {
-        let normalized =
-            normalize_name(&principal.name).map_err(|_| ServiceError::InvalidPackage)?;
-        if principal.kind > 2 || principal.generation == 0 || !principal_names.insert(normalized) {
-            return Err(ServiceError::InvalidPackage);
-        }
-    }
-    for rule in &payload.policy_rules {
-        if rule.id.0.is_nil()
-            || !ids.principals.contains(&rule.principal_id)
-            || rule.effect > 1
-            || rule.action > 7
-            || rule.resource_kind > 2
-            || rule.created_at < 0
-            || match rule.resource_kind {
-                0 => rule.resource_id != payload.source_vault_id.0,
-                1 => !ids.scopes.contains(&ScopeId(rule.resource_id)),
-                2 => !ids.secrets.contains(&SecretId(rule.resource_id)),
-                _ => true,
-            }
-        {
-            return Err(ServiceError::InvalidPackage);
-        }
-    }
-    Ok(())
-}
-
 fn validate_payload_crypto(
     payload: &PackagePayload,
     transfer_key: &SecretKey,
@@ -2191,10 +1940,6 @@ fn payload_counts(payload: &PackagePayload) -> Result<PortabilityCounts, Service
                 .sum::<usize>(),
         )
         .map_err(|_| ServiceError::InvalidPackage)?,
-        principals: u64::try_from(payload.principals.len())
-            .map_err(|_| ServiceError::InvalidPackage)?,
-        policy_rules: u64::try_from(payload.policy_rules.len())
-            .map_err(|_| ServiceError::InvalidPackage)?,
     })
 }
 
@@ -2275,8 +2020,6 @@ fn map_workspace_ids(
     profile_ids: &mut BTreeMap<ProfileId, ProfileId>,
     secret_ids: &mut BTreeMap<SecretId, SecretId>,
     version_ids: &mut BTreeMap<SecretVersionId, SecretVersionId>,
-    principal_ids: &mut BTreeMap<PrincipalId, PrincipalId>,
-    rule_ids: &mut BTreeMap<PolicyRuleId, PolicyRuleId>,
 ) {
     for scope in &payload.scopes {
         scope_ids.entry(scope.id).or_insert(scope.id);
@@ -2289,12 +2032,6 @@ fn map_workspace_ids(
         for version in &secret.versions {
             version_ids.entry(version.id).or_insert(version.id);
         }
-    }
-    for principal in &payload.principals {
-        principal_ids.entry(principal.id).or_insert(principal.id);
-    }
-    for rule in &payload.policy_rules {
-        rule_ids.entry(rule.id).or_insert(rule.id);
     }
 }
 
@@ -2927,6 +2664,7 @@ mod tests {
         let mut source = test_session(&source_path);
         let base_secret = source
             .create_secret(
+                "base",
                 "API_TOKEN",
                 Some("provider token"),
                 SensitiveInput::copy_from_slice(b"workspace-secret-sentinel"),
@@ -2934,6 +2672,7 @@ mod tests {
             .expect("base secret");
         source
             .set_secret_value(
+                "base",
                 "API_TOKEN",
                 SensitiveInput::copy_from_slice(b"workspace-secret-current"),
             )
@@ -2949,17 +2688,6 @@ mod tests {
                 SensitiveInput::copy_from_slice(b"postgres://private"),
             )
             .expect("scoped secret");
-        let principal = source
-            .create_principal(envault_core::PrincipalKind::Agent, "deploy-agent")
-            .expect("principal");
-        source
-            .create_policy_rule(
-                principal.id,
-                envault_policy::Effect::Allow,
-                envault_policy::Action::Discover,
-                envault_policy::ResourceSelector::Vault(source.vault_id()),
-            )
-            .expect("policy");
         let transfer = SensitiveInput::copy_from_slice(TRANSFER_PASSWORD);
         let summary = source
             .export_package(
@@ -3067,9 +2795,9 @@ mod tests {
             )
             .expect("commit");
         assert_eq!(destination.profiles().expect("profiles").len(), 2);
-        assert_eq!(destination.principals().expect("principals").len(), 1);
-        assert_eq!(destination.policy_rules().expect("policies").len(), 1);
-        let imported_base = destination.secret("API_TOKEN").expect("base secret");
+        let imported_base = destination
+            .secret("base", "API_TOKEN")
+            .expect("base secret");
         assert_eq!(imported_base.current_version, 2);
         assert_eq!(
             secret_value(&destination, imported_base.id),
@@ -3087,75 +2815,6 @@ mod tests {
     }
 
     #[test]
-    fn profile_replace_rejects_policy_resource_orphans_without_mutation() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let source_path = directory.path().join("source.db");
-        let destination_path = directory.path().join("destination.db");
-        let package_path = directory.path().join("profile.envault-profile");
-        let mut source = test_session(&source_path);
-        source
-            .create_secret(
-                "NEW_TOKEN",
-                None,
-                SensitiveInput::copy_from_slice(b"replacement-value"),
-            )
-            .expect("source secret");
-        let transfer = SensitiveInput::copy_from_slice(TRANSFER_PASSWORD);
-        source
-            .export_package(
-                PackageKind::Profile,
-                Some("base"),
-                &package_path,
-                Some(&transfer),
-                &[],
-            )
-            .expect("export");
-
-        let mut destination = test_session(&destination_path);
-        let protected = destination
-            .create_secret(
-                "PROTECTED_TOKEN",
-                None,
-                SensitiveInput::copy_from_slice(b"protected-value"),
-            )
-            .expect("protected secret");
-        let principal = destination
-            .create_principal(envault_core::PrincipalKind::Agent, "protected-agent")
-            .expect("principal");
-        destination
-            .create_policy_rule(
-                principal.id,
-                envault_policy::Effect::Allow,
-                envault_policy::Action::Discover,
-                envault_policy::ResourceSelector::Secret(protected.id),
-            )
-            .expect("policy");
-        let preview = destination
-            .preview_package_import(
-                &package_path,
-                Some(&transfer),
-                None,
-                ImportConflictStrategy::Replace,
-                None,
-            )
-            .expect("preview");
-        assert_eq!(preview.conflicts[0].action, ImportAction::Reject);
-        assert!(matches!(
-            destination.commit_package_import(
-                &package_path,
-                Some(&transfer),
-                None,
-                ImportConflictStrategy::Replace,
-                None,
-                &preview.plan_hash,
-            ),
-            Err(ServiceError::Conflict)
-        ));
-        assert_eq!(secret_value(&destination, protected.id), b"protected-value");
-        assert_eq!(destination.policy_rules().expect("policy remains").len(), 1);
-    }
-
-    #[test]
     fn age_profile_import_tamper_and_stale_plan_fail_without_partial_mutation() {
         use age::secrecy::ExposeSecret as _;
 
@@ -3168,6 +2827,7 @@ mod tests {
         let mut source = test_session(&source_path);
         source
             .create_secret(
+                "base",
                 "PROFILE_TOKEN",
                 None,
                 SensitiveInput::copy_from_slice(b"age-secret-sentinel"),
@@ -3274,6 +2934,7 @@ mod tests {
         let mut source = test_session(&source_path);
         source
             .create_secret(
+                "base",
                 "MIXED_TOKEN",
                 None,
                 SensitiveInput::copy_from_slice(b"mixed-slot-secret"),
@@ -3473,6 +3134,7 @@ mod tests {
         let mut source = test_session(&source_path);
         source
             .create_secret(
+                "base",
                 "DUPLICATED_TOKEN",
                 None,
                 SensitiveInput::copy_from_slice(b"duplicated-profile-value"),
@@ -3558,6 +3220,7 @@ mod tests {
         let mut source = test_session(&source_path);
         source
             .create_secret(
+                "base",
                 "IMPORTED_TOKEN",
                 None,
                 SensitiveInput::copy_from_slice(b"imported-profile-value"),
@@ -3578,6 +3241,7 @@ mod tests {
         let base_before = destination.profile("base").expect("base");
         destination
             .create_secret(
+                "base",
                 "OLD_TOKEN",
                 None,
                 SensitiveInput::copy_from_slice(b"old-value"),
@@ -3607,7 +3271,7 @@ mod tests {
             ),
             Err(ServiceError::Conflict)
         ));
-        assert!(destination.secret("OLD_TOKEN").is_ok());
+        assert!(destination.secret("base", "OLD_TOKEN").is_ok());
 
         let skip = destination
             .preview_package_import(
@@ -3629,7 +3293,7 @@ mod tests {
             )
             .expect("skip commit");
         assert_eq!(skipped.skipped, 1);
-        assert!(destination.secret("OLD_TOKEN").is_ok());
+        assert!(destination.secret("base", "OLD_TOKEN").is_ok());
 
         let replace = destination
             .preview_package_import(
@@ -3651,10 +3315,12 @@ mod tests {
             )
             .expect("replace commit");
         assert!(matches!(
-            destination.secret("OLD_TOKEN"),
+            destination.secret("base", "OLD_TOKEN"),
             Err(ServiceError::NotFound)
         ));
-        let imported = destination.secret("IMPORTED_TOKEN").expect("imported");
+        let imported = destination
+            .secret("base", "IMPORTED_TOKEN")
+            .expect("imported");
         assert_eq!(
             secret_value(&destination, imported.id),
             b"imported-profile-value"
@@ -3695,7 +3361,7 @@ mod tests {
                 &preview.plan_hash,
             )
             .expect("commit");
-        let api_key = session.secret("API_KEY").expect("secret");
+        let api_key = session.secret("base", "API_KEY").expect("secret");
         assert_eq!(secret_value(&session, api_key.id), b"first-secret");
 
         std::fs::write(&env_path, b"API_KEY=second-secret\n").expect("replace source");
@@ -3724,7 +3390,10 @@ mod tests {
             )
             .expect("skip commit");
         assert_eq!(
-            session.secret_versions("API_KEY").expect("versions").len(),
+            session
+                .secret_versions("base", "API_KEY")
+                .expect("versions")
+                .len(),
             1
         );
         let stale_preview = session
@@ -3741,7 +3410,10 @@ mod tests {
             Err(ServiceError::StaleImportPlan)
         ));
         assert_eq!(
-            session.secret_versions("API_KEY").expect("versions").len(),
+            session
+                .secret_versions("base", "API_KEY")
+                .expect("versions")
+                .len(),
             1
         );
         let refreshed = session
@@ -3756,7 +3428,10 @@ mod tests {
             )
             .expect("replace commit");
         assert_eq!(
-            session.secret_versions("API_KEY").expect("versions").len(),
+            session
+                .secret_versions("base", "API_KEY")
+                .expect("versions")
+                .len(),
             2
         );
         assert_eq!(secret_value(&session, api_key.id), b"third-secret");

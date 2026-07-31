@@ -24,3 +24,8 @@ Phase 6 introduces no new plaintext-disclosure path and no new protocol operatio
 The terminal UI's threat surface for secret leakage is limited to the same structural redaction the CLI's read commands already rely on.
 A future reveal feature starts from an explicit design decision instead of inheriting Phase 6 rendering code not built for that purpose.
 Users who need a secret value outside the vault continue to use the plaintext export command, which remains the sole reviewed path for that disclosure.
+
+## Addendum (2026-07-31): superseded by ADR 0016
+
+Phase 7 of the 2026-07-31 rework introduces exactly the superseding ADR this document anticipated: ADR 0016 adds an admin-lease-gated `Reveal` action to the Secrets and Versions screens, with its own authorization gesture (admin lease required on TUI entry, re-checked at reveal time) and rendering constraint (a transient popup dismissed by any keypress, never written to disk or CLI stdout).
+This document's original decision and reasoning remain the historical record of why Phase 6 shipped with no reveal capability at all; ADR 0016 is the design that replaced it.

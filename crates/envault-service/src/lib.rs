@@ -140,6 +140,8 @@ pub enum ServiceError {
     PermissionDenied,
     #[error("the startup profile cannot be deleted")]
     StartupProfileRequired,
+    #[error("profile is not loaded in this session")]
+    ProfileNotLoaded,
     #[error("vault data is corrupt")]
     Corrupt,
     #[error("path has no parent directory")]
@@ -174,8 +176,6 @@ pub enum ServiceError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Platform(#[from] envault_platform::PlatformError),
-    #[error(transparent)]
-    Policy(#[from] envault_policy::PolicyError),
     #[error(transparent)]
     Broker(#[from] envault_broker::BrokerError),
     #[error("filesystem operation failed")]
@@ -283,7 +283,6 @@ fn initialize_temporary(
     let mut store = Store::open(database_path)?;
     envault_platform::set_private_file_permissions(database_path)?;
     store.initialize(&vault, &root_scope, &base_profile)?;
-    store.initialize_audit_state(scope_policy::audit_state_mac(&master_key, 0, &[0; 32]))?;
     store.integrity_check()?;
     store.checkpoint()?;
     drop(store);
@@ -302,7 +301,7 @@ impl VaultSession {
             return Err(ServiceError::NotInitialized);
         }
         envault_platform::set_private_file_permissions(database_path)?;
-        let mut store = Store::open(database_path)?;
+        let store = Store::open(database_path)?;
         let vault = store.vault().map_err(map_store_initialization)?;
         let parameters: KdfParameters = decode_cbor(&vault.kdf_parameters)?;
         let salt: [u8; SALT_BYTES] = vault
@@ -314,7 +313,6 @@ impl VaultSession {
         let wrapped = Ciphertext::decode(&vault.wrapped_master_key)?;
         let master_key = unwrap_key(&kek, &wrapped, &vmk_aad(vault.id))
             .map_err(|_| ServiceError::AuthenticationFailed)?;
-        store.initialize_audit_state(scope_policy::audit_state_mac(&master_key, 0, &[0; 32]))?;
         let root_scope = store.root_scope().map_err(|_| ServiceError::Corrupt)?;
         let profiles = store.profiles()?;
         let summaries = profiles
@@ -354,6 +352,28 @@ impl VaultSession {
         name: &str,
         description: Option<&str>,
     ) -> Result<ProfileView, ServiceError> {
+        self.create_profile_under(self.root_scope_id, name, description)
+    }
+
+    /// Creates a profile whose scope is a child of `workspace`'s scope
+    /// instead of the vault root, so it is grouped under that workspace
+    /// (`profile_subtree_scope_ids`/`workspace load` can find it).
+    pub fn create_profile_in_workspace(
+        &mut self,
+        workspace: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<ProfileView, ServiceError> {
+        let workspace_scope = self.workspace_by_name(workspace)?;
+        self.create_profile_under(workspace_scope.id, name, description)
+    }
+
+    fn create_profile_under(
+        &mut self,
+        parent_scope_id: ScopeId,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<ProfileView, ServiceError> {
         let normalized = normalize_name(name)?;
         validate_optional_description(description)?;
         let lookup = lookup_digest(
@@ -370,14 +390,21 @@ impl VaultSession {
         }
         let id = ProfileId(Uuid::new_v4());
         let scope_id = ScopeId(Uuid::new_v4());
-        let root = self.store.root_scope()?;
-        let root_path =
-            self.decrypt_entity_text(EntityKind::Scope, root.id.0, "path", &root.encrypted_path)?;
-        let scope_path = format!("{root_path}/profile/{}", scope_id.0);
+        let parent = self
+            .store
+            .scope_by_id(parent_scope_id)?
+            .ok_or(ServiceError::NotFound)?;
+        let parent_path = self.decrypt_entity_text(
+            EntityKind::Scope,
+            parent.id.0,
+            "path",
+            &parent.encrypted_path,
+        )?;
+        let scope_path = format!("{parent_path}/profile/{}", scope_id.0);
         let scope = ScopeRecord {
             id: scope_id,
             vault_id: self.vault_id,
-            parent_id: Some(self.root_scope_id),
+            parent_id: Some(parent_scope_id),
             kind: scope_policy::scope_kind_code(ScopeKind::Profile),
             encrypted_path: self.encrypt_entity_text(
                 EntityKind::Scope,
@@ -480,32 +507,63 @@ impl VaultSession {
         self.profile_view(&record)
     }
 
-    pub fn activate_profile(&mut self, name: &str) -> Result<ProfileView, ServiceError> {
+    /// Adds `name` to the loaded set (`activate_on_start`), making its
+    /// secrets (and any other already-loaded profile's) reachable this
+    /// session and every future daemon start, until `unload_profile`.
+    pub fn load_profile(&mut self, name: &str) -> Result<ProfileView, ServiceError> {
         let record = self.profile_by_name(name)?;
         if record.activate_on_start {
             return self.profile_view(&record);
         }
-        self.store.set_startup_profile(record.id)?;
+        self.store.set_profile_loaded(record.id, true)?;
         self.profile_by_name(name)
             .and_then(|updated| self.profile_view(&updated))
     }
 
-    pub fn delete_profile(&mut self, name: &str) -> Result<(), ServiceError> {
+    /// Removes `name` from the loaded set. The base profile (root scope)
+    /// can never be unloaded - it is the permanent underlay.
+    pub fn unload_profile(&mut self, name: &str) -> Result<ProfileView, ServiceError> {
         let record = self.profile_by_name(name)?;
-        if record.activate_on_start {
+        if record.scope_id == self.root_scope_id {
             return Err(ServiceError::StartupProfileRequired);
         }
+        if !record.activate_on_start {
+            return self.profile_view(&record);
+        }
+        self.store.set_profile_loaded(record.id, false)?;
+        self.profile_by_name(name)
+            .and_then(|updated| self.profile_view(&updated))
+    }
+
+    /// Every profile grouped under `workspace` (its own profiles plus any
+    /// nested further down the scope subtree).
+    pub fn profiles_in_workspace(&self, workspace: &str) -> Result<Vec<ProfileView>, ServiceError> {
+        let workspace_scope = self.workspace_by_name(workspace)?;
+        let subtree = self.subtree_scope_ids(workspace_scope.id)?;
+        Ok(self
+            .profiles()?
+            .into_iter()
+            .filter(|profile| subtree.contains(&profile.scope_id))
+            .collect())
+    }
+
+    /// Loads every profile grouped under `workspace` in one shot.
+    pub fn load_workspace(&mut self, workspace: &str) -> Result<Vec<ProfileView>, ServiceError> {
+        let names = self
+            .profiles_in_workspace(workspace)?
+            .into_iter()
+            .map(|profile| profile.name)
+            .collect::<Vec<_>>();
+        names.iter().map(|name| self.load_profile(name)).collect()
+    }
+
+    pub fn delete_profile(&mut self, name: &str) -> Result<(), ServiceError> {
+        let record = self.profile_by_name(name)?;
         if record.scope_id == self.root_scope_id {
             return Err(ServiceError::Conflict);
         }
-        if self.policy_rules()?.iter().any(|rule| {
-            matches!(
-                rule.resource,
-                envault_policy::ResourceSelector::ScopeTree(scope_id)
-                    if scope_id == record.scope_id
-            )
-        }) {
-            return Err(ServiceError::Conflict);
+        if record.activate_on_start {
+            return Err(ServiceError::StartupProfileRequired);
         }
         self.store
             .delete_profile_and_scope(record.id, record.scope_id)?;
@@ -514,33 +572,24 @@ impl VaultSession {
 
     pub fn create_secret(
         &mut self,
+        profile: &str,
         name: &str,
         description: Option<&str>,
         value: SensitiveInput,
     ) -> Result<SecretView, ServiceError> {
-        self.create_secret_inner(
-            self.root_scope_id,
-            name,
-            description,
-            value.into_secret(),
-            None,
-        )
+        let scope_id = self.bind_profile(profile)?.scope_id;
+        self.create_secret_in_scope(scope_id, name, description, value)
     }
 
     pub fn create_generated_secret(
         &mut self,
+        profile: &str,
         name: &str,
         description: Option<&str>,
         spec: GeneratorSpec,
     ) -> Result<SecretView, ServiceError> {
-        let generated = generate_value(spec)?;
-        self.create_secret_inner(
-            self.root_scope_id,
-            name,
-            description,
-            generated.value,
-            Some(generated.metadata),
-        )
+        let scope_id = self.bind_profile(profile)?.scope_id;
+        self.create_generated_secret_in_scope(scope_id, name, description, spec)
     }
 
     pub fn secrets(&self) -> Result<Vec<SecretView>, ServiceError> {
@@ -551,18 +600,64 @@ impl VaultSession {
             .collect()
     }
 
-    pub fn secret(&self, name: &str) -> Result<SecretView, ServiceError> {
-        let record = self.secret_by_name(name)?;
+    /// Effective secret view for a profile: its own secrets overlaid on top
+    /// of every ancestor scope (base included), nearer scope wins on name
+    /// collision, via `resolved_secrets`.
+    pub fn secrets_in_profile(
+        &self,
+        profile: &str,
+    ) -> Result<Vec<envault_core::ResolvedSecretView>, ServiceError> {
+        let record = self.profile_by_name(profile)?;
+        if !record.activate_on_start {
+            return Err(ServiceError::ProfileNotLoaded);
+        }
+        self.resolved_secrets(record.scope_id)
+    }
+
+    pub fn secret(&self, profile: &str, name: &str) -> Result<SecretView, ServiceError> {
+        let record = self.secret_by_ref(profile, name, true)?;
         self.secret_view(&record)
+    }
+
+    /// Resolves the effective (name, plaintext) pairs across one or more
+    /// profiles for `envault run` - the sole path that lets plaintext leave
+    /// the daemon into a process, never through CLI stdout. Deliberately
+    /// does not require the profile to already be in the loaded set: naming
+    /// it here is itself the explicit action. Later profiles in `profiles`
+    /// override earlier ones on name collision.
+    pub fn resolve_run_env(
+        &self,
+        profiles: &[String],
+    ) -> Result<Vec<(String, SecretBytes)>, ServiceError> {
+        let mut values: BTreeMap<String, SecretBytes> = BTreeMap::new();
+        for profile_name in profiles {
+            let scope_id = self.bind_profile(profile_name)?.scope_id;
+            for item in self.resolved_secrets(scope_id)? {
+                let secret = self
+                    .store
+                    .secret_by_id(item.secret.id)?
+                    .ok_or(ServiceError::Corrupt)?;
+                let version = self
+                    .store
+                    .secret_versions(secret.id)?
+                    .into_iter()
+                    .last()
+                    .ok_or(ServiceError::Corrupt)?;
+                let value = self.decrypt_secret_version(&secret, &version)?;
+                values.insert(item.secret.name, value);
+            }
+        }
+        Ok(values.into_iter().collect())
     }
 
     pub fn update_secret(
         &mut self,
+        profile: &str,
         name: &str,
         description: Option<&str>,
     ) -> Result<SecretView, ServiceError> {
         validate_optional_description(description)?;
-        let mut record = self.secret_by_name(name)?;
+        let mut record = self.secret_by_ref(profile, name, false)?;
         if record.status != 0 {
             return Err(ServiceError::Conflict);
         }
@@ -578,10 +673,11 @@ impl VaultSession {
 
     pub fn rename_secret(
         &mut self,
+        profile: &str,
         old_name: &str,
         new_name: &str,
     ) -> Result<SecretView, ServiceError> {
-        let mut record = self.secret_by_name(old_name)?;
+        let mut record = self.secret_by_ref(profile, old_name, false)?;
         let normalized = normalize_name(new_name)?;
         let lookup = lookup_digest(
             &self.master_key,
@@ -590,7 +686,7 @@ impl VaultSession {
         );
         if self
             .store
-            .secret_by_lookup(self.root_scope_id, &lookup)?
+            .secret_by_lookup(record.scope_id, &lookup)?
             .is_some_and(|existing| existing.id != record.id)
         {
             return Err(ServiceError::Conflict);
@@ -604,25 +700,31 @@ impl VaultSession {
 
     pub fn set_secret_value(
         &mut self,
+        profile: &str,
         name: &str,
         value: SensitiveInput,
     ) -> Result<SecretVersionView, ServiceError> {
-        let record = self.secret_by_name(name)?;
+        let record = self.secret_by_ref(profile, name, false)?;
         self.add_secret_version(&record, value.into_secret(), None)
     }
 
     pub fn generate_secret_value(
         &mut self,
+        profile: &str,
         name: &str,
         spec: GeneratorSpec,
     ) -> Result<SecretVersionView, ServiceError> {
-        let record = self.secret_by_name(name)?;
+        let record = self.secret_by_ref(profile, name, false)?;
         let generated = generate_value(spec)?;
         self.add_secret_version(&record, generated.value, Some(generated.metadata))
     }
 
-    pub fn secret_versions(&self, name: &str) -> Result<Vec<SecretVersionView>, ServiceError> {
-        let secret = self.secret_by_name(name)?;
+    pub fn secret_versions(
+        &self,
+        profile: &str,
+        name: &str,
+    ) -> Result<Vec<SecretVersionView>, ServiceError> {
+        let secret = self.secret_by_ref(profile, name, true)?;
         self.store
             .secret_versions(secret.id)?
             .iter()
@@ -630,8 +732,29 @@ impl VaultSession {
             .collect()
     }
 
-    pub fn delete_secret(&mut self, name: &str) -> Result<(), ServiceError> {
-        let record = self.secret_by_name(name)?;
+    /// Decrypts a secret's value for display - the sole path that hands
+    /// plaintext to the TUI for a human to look at. `version` selects a
+    /// specific historical version; `None` means the current version.
+    pub fn reveal_secret_value(
+        &self,
+        profile: &str,
+        name: &str,
+        version: Option<u64>,
+    ) -> Result<SecretBytes, ServiceError> {
+        let secret = self.secret_by_ref(profile, name, true)?;
+        let versions = self.store.secret_versions(secret.id)?;
+        let record = match version {
+            Some(requested) => versions
+                .into_iter()
+                .find(|record| record.version == requested)
+                .ok_or(ServiceError::NotFound)?,
+            None => versions.into_iter().last().ok_or(ServiceError::Corrupt)?,
+        };
+        self.decrypt_secret_version(&secret, &record)
+    }
+
+    pub fn delete_secret(&mut self, profile: &str, name: &str) -> Result<(), ServiceError> {
+        let record = self.secret_by_ref(profile, name, false)?;
         self.store.delete_secret(record.id)?;
         Ok(())
     }
@@ -691,7 +814,6 @@ impl VaultSession {
                 );
             }
         }
-        self.verify_audit_chain()?;
         Ok(())
     }
 
@@ -837,10 +959,6 @@ impl VaultSession {
         self.validate_scopes()?;
         self.validate_profiles()?;
         self.validate_secrets()?;
-        self.validate_principals()?;
-        self.validate_policy_rules()?;
-        self.audit_events()?;
-        self.verify_audit_chain()?;
         Ok(())
     }
 
@@ -978,41 +1096,20 @@ impl VaultSession {
         Ok(())
     }
 
-    fn validate_principals(&self) -> Result<(), ServiceError> {
-        for record in self.store.principals()? {
-            if record.vault_id != self.vault_id {
-                return Err(ServiceError::Corrupt);
-            }
-            let view = self.principal_view(&record)?;
-            let normalized = normalize_name(&view.name)?;
-            if record.name_lookup
-                != lookup_digest(
-                    &self.master_key,
-                    scope_policy::PRINCIPAL_LOOKUP_DOMAIN,
-                    normalized.as_bytes(),
-                )
-                .as_slice()
-            {
-                return Err(ServiceError::Corrupt);
-            }
+    /// Resolves a secret within `profile`'s own scope. When `require_loaded`
+    /// is set, the profile must be in the loaded set (`activate_on_start`) -
+    /// used for ambient/ad-hoc reads (describe, versions), not for direct
+    /// admin management (rename/update/delete/rotate).
+    fn secret_by_ref(
+        &self,
+        profile: &str,
+        name: &str,
+        require_loaded: bool,
+    ) -> Result<SecretRecord, ServiceError> {
+        let profile_record = self.profile_by_name(profile)?;
+        if require_loaded && !profile_record.activate_on_start {
+            return Err(ServiceError::ProfileNotLoaded);
         }
-        Ok(())
-    }
-
-    fn validate_policy_rules(&self) -> Result<(), ServiceError> {
-        for record in self.store.policy_rules()? {
-            if record.vault_id != self.vault_id
-                || self.store.principal_by_id(record.principal_id)?.is_none()
-            {
-                return Err(ServiceError::Corrupt);
-            }
-            let rule = scope_policy::policy_rule(&record)?;
-            self.validate_resource(rule.resource)?;
-        }
-        Ok(())
-    }
-
-    fn secret_by_name(&self, name: &str) -> Result<SecretRecord, ServiceError> {
         let normalized = normalize_name(name)?;
         let lookup = lookup_digest(
             &self.master_key,
@@ -1020,7 +1117,7 @@ impl VaultSession {
             normalized.as_bytes(),
         );
         self.store
-            .secret_by_lookup(self.root_scope_id, &lookup)?
+            .secret_by_lookup(profile_record.scope_id, &lookup)?
             .ok_or(ServiceError::NotFound)
     }
 

@@ -1,6 +1,7 @@
 //! Interactive terminal dashboard for scopes, profiles, secret metadata, and
-//! daemon status. See docs/plans/phase-6.md and ADR 0012: this module never
-//! requests or renders a decrypted secret value.
+//! daemon status. See ADR 0016: this is the only client allowed to render a
+//! decrypted secret value, gated by an admin lease required on entry and
+//! re-checked at the moment of every `Reveal`.
 
 mod app;
 mod terminal;
@@ -31,6 +32,7 @@ pub fn run() -> io::Result<()> {
     let mut guard = TerminalGuard::enter()?;
     let mut app = App::new(RealClient);
     app.refresh_dashboard();
+    app.require_admin_on_entry();
     run_event_loop(&mut guard, &mut app)
 }
 

@@ -1,11 +1,7 @@
 use std::{collections::BTreeMap, fs};
 
 use envault_broker::{HttpConstraint, HttpMethod, HttpRequest};
-use envault_core::{
-    ApprovalId, GeneratorFormat, GeneratorLength, GrantId, PrincipalKind, PrincipalView, ScopeKind,
-    SecretStatus,
-};
-use envault_policy::{Action, Decision, Effect, Grant, ResourceSelector};
+use envault_core::{GeneratorFormat, GeneratorLength, ScopeKind, SecretStatus};
 
 use super::*;
 
@@ -79,25 +75,20 @@ fn profile_rename_preserves_identity_and_startup_invariant() {
         updated
     );
     assert_eq!(updated.generation, 3);
-    session.activate_profile("engineering").expect("activate");
+    session.load_profile("engineering").expect("load");
     assert!(matches!(
         session.delete_profile("base"),
         Err(ServiceError::Conflict)
     ));
-    let profiles = session.profiles().expect("profiles");
-    assert_eq!(
-        profiles
-            .iter()
-            .find(|profile| profile.name == "base")
-            .expect("base")
-            .generation,
-        2
-    );
+    assert!(matches!(
+        session.unload_profile("base"),
+        Err(ServiceError::StartupProfileRequired)
+    ));
     assert!(matches!(
         session.delete_profile("engineering"),
         Err(ServiceError::StartupProfileRequired)
     ));
-    session.activate_profile("base").expect("activate base");
+    session.unload_profile("engineering").expect("unload");
     session.delete_profile("engineering").expect("delete");
     assert_eq!(session.profiles().expect("profiles").len(), 1);
 }
@@ -107,39 +98,47 @@ fn secret_versions_are_immutable_and_rename_preserves_identity() {
     let (_directory, _path, _password, mut session) = initialized();
     let created = session
         .create_secret(
+            "base",
             "OPENAI_API_KEY",
             Some("OpenAI credential"),
             SensitiveInput::copy_from_slice(b"phase-one-plaintext-sentinel"),
         )
         .expect("create secret");
     let renamed = session
-        .rename_secret("openai_api_key", "OPENAI_PRIMARY_KEY")
+        .rename_secret("base", "openai_api_key", "OPENAI_PRIMARY_KEY")
         .expect("rename secret");
     assert_eq!(renamed.id, created.id);
     assert_eq!(renamed.current_version, 1);
     let updated = session
-        .update_secret("openai_primary_key", Some("Primary OpenAI credential"))
+        .update_secret(
+            "base",
+            "openai_primary_key",
+            Some("Primary OpenAI credential"),
+        )
         .expect("update secret");
     assert_eq!(updated.id, created.id);
     assert_eq!(updated.current_version, 1);
     assert_eq!(
-        session.secret("openai_primary_key").expect("show secret"),
+        session
+            .secret("base", "openai_primary_key")
+            .expect("show secret"),
         updated
     );
     let second = session
         .set_secret_value(
+            "base",
             "openai_primary_key",
             SensitiveInput::copy_from_slice(b"phase-one-second-sentinel"),
         )
         .expect("set value");
     assert_eq!(second.version, 2);
     let versions = session
-        .secret_versions("openai_primary_key")
+        .secret_versions("base", "openai_primary_key")
         .expect("versions");
     assert_eq!(versions.len(), 2);
     assert_ne!(versions[0].id, versions[1].id);
     let record = session
-        .secret_by_name("openai_primary_key")
+        .secret_by_ref("base", "openai_primary_key", false)
         .expect("secret");
     let stored_versions = session
         .store
@@ -166,6 +165,7 @@ fn generators_return_only_redacted_metadata() {
     let (_directory, _path, _password, mut session) = initialized();
     let secret = session
         .create_generated_secret(
+            "base",
             "SESSION_TOKEN",
             None,
             GeneratorSpec {
@@ -176,7 +176,9 @@ fn generators_return_only_redacted_metadata() {
         )
         .expect("generated secret");
     assert_eq!(secret.current_version, 1);
-    let versions = session.secret_versions("session_token").expect("versions");
+    let versions = session
+        .secret_versions("base", "session_token")
+        .expect("versions");
     assert_eq!(versions[0].generated_length, Some(64));
     assert_eq!(versions[0].entropy_bits, Some(384));
     assert_eq!(versions[0].generator, Some(GeneratorFormat::Base64Url));
@@ -217,6 +219,7 @@ fn backup_round_trip_preserves_encrypted_semantics() {
     let (directory, _path, password, mut session) = initialized();
     session
         .create_secret(
+            "base",
             "DATABASE_URL",
             None,
             SensitiveInput::copy_from_slice(b"postgres://forensic-sentinel"),
@@ -243,6 +246,7 @@ fn forensic_scan_finds_no_plaintext_in_persistent_artifacts() {
     ];
     session
         .create_secret(
+            "base",
             sentinels[0],
             Some(sentinels[2]),
             SensitiveInput::copy_from_slice(sentinels[1].as_bytes()),
@@ -349,6 +353,7 @@ fn cryptographic_integrity_check_detects_secret_value_tamper() {
     let (_directory, path, _password, mut session) = initialized();
     session
         .create_secret(
+            "base",
             "SIGNING_KEY",
             None,
             SensitiveInput::copy_from_slice(b"integrity-sentinel"),
@@ -381,6 +386,7 @@ fn scope_override_tombstone_and_profile_binding_are_deterministic() {
     let (_directory, _path, _password, mut session) = initialized();
     session
         .create_secret(
+            "base",
             "SHARED_TOKEN",
             Some("root value"),
             SensitiveInput::copy_from_slice(b"root-secret"),
@@ -492,272 +498,21 @@ fn scope_depth_is_bounded_at_sixty_four_nodes() {
     ));
 }
 
-fn create_policy_test_fixture(session: &mut VaultSession) -> (SecretView, PrincipalView) {
-    let secret = session
-        .create_secret(
-            "BROKER_TOKEN",
-            None,
-            SensitiveInput::copy_from_slice(b"policy-secret-sentinel"),
-        )
-        .expect("secret");
-    let principal = session
-        .create_principal(PrincipalKind::Agent, "agent:codex")
-        .expect("principal");
-    assert!(matches!(
-        session.create_policy_rule(
-            principal.id,
-            Effect::Allow,
-            Action::Reveal,
-            ResourceSelector::Vault(session.vault_id()),
-        ),
-        Err(ServiceError::Policy(
-            envault_policy::PolicyError::PrivilegedAgentRule
-        ))
-    ));
-    session
-        .create_policy_rule(
-            principal.id,
-            Effect::Allow,
-            Action::HttpRequest,
-            ResourceSelector::Vault(session.vault_id()),
-        )
-        .expect("allow rule");
-    session
-        .create_policy_rule(
-            principal.id,
-            Effect::Deny,
-            Action::HttpRequest,
-            ResourceSelector::Secret(secret.id),
-        )
-        .expect("deny rule");
-    (secret, principal)
-}
-
-fn assert_profile_scope_is_protected(session: &mut VaultSession, principal: &PrincipalView) {
-    let protected_profile = session
-        .create_profile("Protected", None)
-        .expect("protected profile");
-    session
-        .create_policy_rule(
-            principal.id,
-            Effect::Deny,
-            Action::Discover,
-            ResourceSelector::ScopeTree(protected_profile.scope_id),
-        )
-        .expect("scope rule");
-    assert!(matches!(
-        session.delete_profile("protected"),
-        Err(ServiceError::Conflict)
-    ));
-}
-
-fn assert_audit_is_redacted(path: &Path) {
-    let persisted = fs::read(path).expect("database");
-    for forbidden in ["BROKER_TOKEN", "policy-secret-sentinel", "agent:codex"] {
-        assert!(
-            !persisted
-                .windows(forbidden.len())
-                .any(|window| window == forbidden.as_bytes())
-        );
-    }
-}
-
-fn assert_audit_deletion_is_detected(session: &VaultSession, path: &Path) {
-    let connection = rusqlite::Connection::open(path).expect("open database");
-    connection
-        .execute(
-            "DELETE FROM audit_event WHERE sequence = (SELECT MAX(sequence) FROM audit_event)",
-            [],
-        )
-        .expect("truncate audit");
-    drop(connection);
-    assert!(session.verify_audit_chain().is_err());
-    let connection = rusqlite::Connection::open(path).expect("open database");
-    connection
-        .execute_batch("DELETE FROM audit_event; DELETE FROM audit_state;")
-        .expect("erase audit");
-    drop(connection);
-    assert!(session.verify_audit_chain().is_err());
-}
-
-#[test]
-fn failed_audit_append_does_not_consume_grant() {
-    let (_directory, path, _password, mut session) = initialized();
-    let secret = session
-        .create_secret(
-            "ATOMIC_GRANT",
-            None,
-            SensitiveInput::copy_from_slice(b"atomic-secret"),
-        )
-        .expect("secret");
-    let principal = session
-        .create_principal(PrincipalKind::Agent, "agent:atomic")
-        .expect("principal");
-    let mut grant = Grant {
-        id: GrantId(Uuid::new_v4()),
-        principal_id: principal.id,
-        action: Action::UseSecret,
-        resource: ResourceSelector::Secret(secret.id),
-        issued_at: 100,
-        expires_at: 200,
-        max_uses: 1,
-        uses: 0,
-        revoked: false,
-        nonce: [3; 32],
-        approval_id: ApprovalId(Uuid::new_v4()),
-    };
-    let connection = rusqlite::Connection::open(&path).expect("open database");
-    connection
-        .execute("UPDATE audit_state SET state_mac = zeroblob(32)", [])
-        .expect("corrupt audit state");
-    drop(connection);
-    assert!(
-        session
-            .explain_policy(
-                principal.id,
-                Action::UseSecret,
-                ResourceSelector::Secret(secret.id),
-                Some(&mut grant),
-                150,
-                Uuid::new_v4(),
-            )
-            .is_err()
-    );
-    assert_eq!(grant.uses, 0);
-}
-
-#[test]
-fn policy_deny_precedence_bounded_grant_and_audit_chain_hold() {
-    let (_directory, path, _password, mut session) = initialized();
-    let (secret, principal) = create_policy_test_fixture(&mut session);
-    assert_profile_scope_is_protected(&mut session, &principal);
-    let mut grant = Grant {
-        id: GrantId(Uuid::new_v4()),
-        principal_id: principal.id,
-        action: Action::HttpRequest,
-        resource: ResourceSelector::Secret(secret.id),
-        issued_at: 100,
-        expires_at: 200,
-        max_uses: 1,
-        uses: 0,
-        revoked: false,
-        nonce: [9; 32],
-        approval_id: ApprovalId(Uuid::new_v4()),
-    };
-    let denied = session
-        .explain_policy(
-            principal.id,
-            Action::HttpRequest,
-            ResourceSelector::Secret(secret.id),
-            Some(&mut grant),
-            150,
-            Uuid::new_v4(),
-        )
-        .expect("deny");
-    assert_eq!(denied.decision, Decision::DenyExplicit);
-    assert_eq!(grant.uses, 0);
-    session.verify_audit_chain().expect("audit chain");
-    let audit = session.audit_events().expect("audit");
-    assert_eq!(audit.len(), 1);
-    assert_audit_is_redacted(&path);
-
-    session
-        .set_principal_disabled(principal.id, true)
-        .expect("disable");
-    let disabled = session
-        .explain_policy(
-            principal.id,
-            Action::HttpRequest,
-            ResourceSelector::Secret(secret.id),
-            Some(&mut grant),
-            151,
-            Uuid::new_v4(),
-        )
-        .expect("disabled");
-    assert_eq!(disabled.decision, Decision::DenyDefault);
-    assert_eq!(grant.uses, 0);
-    session.verify_audit_chain().expect("audit chain");
-    assert_audit_deletion_is_detected(&session, &path);
-}
-
-#[test]
-fn agent_discovery_consumes_one_use_and_filters_explicit_denies() {
-    let (_directory, _path, _password, mut session) = initialized();
-    let visible = session
-        .create_secret(
-            "VISIBLE_TOKEN",
-            Some("Agent-visible metadata"),
-            SensitiveInput::copy_from_slice(b"visible-secret-value"),
-        )
-        .expect("visible secret");
-    let hidden = session
-        .create_secret(
-            "HIDDEN_TOKEN",
-            Some("Denied metadata"),
-            SensitiveInput::copy_from_slice(b"hidden-secret-value"),
-        )
-        .expect("hidden secret");
-    let principal = session
-        .create_principal(PrincipalKind::Agent, "agent:discovery")
-        .expect("principal");
-    session
-        .create_policy_rule(
-            principal.id,
-            Effect::Deny,
-            Action::Discover,
-            ResourceSelector::Secret(hidden.id),
-        )
-        .expect("deny hidden secret");
-    let mut grant = Grant {
-        id: GrantId(Uuid::new_v4()),
-        principal_id: principal.id,
-        action: Action::Discover,
-        resource: ResourceSelector::Vault(session.vault_id()),
-        issued_at: 100,
-        expires_at: 200,
-        max_uses: 1,
-        uses: 0,
-        revoked: false,
-        nonce: [4; 32],
-        approval_id: ApprovalId(Uuid::new_v4()),
-    };
-    let discovered = session
-        .discover_secrets(&mut grant, 150, Uuid::new_v4())
-        .expect("discover");
-    assert_eq!(discovered, vec![visible]);
-    assert_eq!(grant.uses, 1);
-    assert_eq!(session.audit_events().expect("audit").len(), 1);
-}
-
 #[test]
 fn http_preparation_authorizes_exact_secret_without_exposing_credential() {
     let (_directory, _path, _password, mut session) = initialized();
-    let secret = session
+    session
         .create_secret(
+            "base",
             "HTTP_TOKEN",
             None,
             SensitiveInput::copy_from_slice(b"broker-token-1234"),
         )
         .expect("secret");
-    let principal = session
-        .create_principal(PrincipalKind::Agent, "agent:http")
-        .expect("principal");
-    let mut grant = Grant {
-        id: GrantId(Uuid::new_v4()),
-        principal_id: principal.id,
-        action: Action::HttpRequest,
-        resource: ResourceSelector::Secret(secret.id),
-        issued_at: 100,
-        expires_at: 200,
-        max_uses: 1,
-        uses: 0,
-        revoked: false,
-        nonce: [5; 32],
-        approval_id: ApprovalId(Uuid::new_v4()),
-    };
-    let prepared = session
-        .prepare_agent_http_request(
-            &mut grant,
+    session
+        .set_secret_http_access(
+            "base",
+            "HTTP_TOKEN",
             HttpConstraint {
                 host: "api.example.com".into(),
                 port: 443,
@@ -766,19 +521,21 @@ fn http_preparation_authorizes_exact_secret_without_exposing_credential() {
                 max_request_bytes: 1024,
                 max_response_bytes: 4096,
             },
-            secret.id,
+        )
+        .expect("configure http access");
+    let prepared = session
+        .prepare_http_request(
+            "base",
+            "HTTP_TOKEN",
             HttpRequest {
                 url: "https://api.example.com/v1/status".into(),
                 method: HttpMethod::Get,
                 body: Vec::new(),
                 content_type: None,
             },
-            150,
-            Uuid::new_v4(),
         )
         .expect("prepare request");
     let debug = format!("{prepared:?}");
     assert_eq!(debug, "AgentHttpRequest([REDACTED])");
     assert!(!debug.contains("broker-token-1234"));
-    assert_eq!(grant.uses, 1);
 }

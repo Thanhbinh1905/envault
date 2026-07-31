@@ -37,6 +37,7 @@ pub(crate) struct FakeClient {
     pub profiles: RefCell<VecDeque<Result<Vec<ProfileView>, ClientError>>>,
     pub secrets: RefCell<VecDeque<Result<Vec<SecretView>, ClientError>>>,
     pub versions: RefCell<VecDeque<Result<Vec<SecretVersionView>, ClientError>>>,
+    pub reveal: RefCell<VecDeque<Result<SensitiveBytes, ClientError>>>,
     pub admin_unlock: RefCell<VecDeque<Result<AdminLeaseStatus, ClientError>>>,
     pub preview_package: RefCell<VecDeque<Result<PortabilityPreview, ClientError>>>,
     pub commit_package: RefCell<VecDeque<Result<PortabilityImportSummary, ClientError>>>,
@@ -63,6 +64,14 @@ impl DaemonClient for FakeClient {
 
     fn list_secret_versions(&self, _name: &str) -> Result<Vec<SecretVersionView>, ClientError> {
         pop(&self.versions)
+    }
+
+    fn reveal_secret_value(
+        &self,
+        _name: &str,
+        _version: Option<u64>,
+    ) -> Result<SensitiveBytes, ClientError> {
+        pop(&self.reveal)
     }
 
     fn admin_unlock(
@@ -205,9 +214,8 @@ pub(crate) fn sample_status(admin_lease_active: bool) -> DaemonStatus {
     DaemonStatus {
         service: ServiceState::Unlocked,
         pid: 4242,
-        active_profile: Some("base".to_string()),
+        loaded_profiles: vec!["base".to_string()],
         admin_lease_active,
-        agent_session_count: 0,
     }
 }
 
