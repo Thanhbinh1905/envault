@@ -45,7 +45,6 @@ fn verify_packages() -> Result<()> {
         "envault-core",
         "envault-windows-ffi",
         "envault-platform",
-        "envault-policy",
         "envault-broker",
         "envault-protocol",
         "envault-crypto",
