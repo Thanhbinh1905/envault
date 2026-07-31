@@ -24,3 +24,6 @@
 /.claude/
 /.codegraph/
 /skills-lock.json
+
+# Local-only build guide (personal notes, not part of the shipped project)
+/BUILD_LOCAL.md
