@@ -1116,7 +1116,10 @@ fn run_workspace_rejects_duplicate_secret_name_across_profiles() {
         &["--output", "json", "admin", "unlock", "--password-stdin"],
         Some(PASSWORD),
     ));
-    assert_success(&fixture.run(&["--output", "json", "workspace", "create", "team"], None));
+    assert_success(&fixture.run(
+        &["--output", "json", "workspace", "create", "team"],
+        None,
+    ));
     assert_success(&fixture.run(
         &[
             "--output",
