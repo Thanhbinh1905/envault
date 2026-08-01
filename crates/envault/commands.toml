@@ -257,6 +257,22 @@ outputs = ["human", "json", "toon"]
 errors = ["admin_auth_required", "package_error", "package_authentication_failed", "stale_import_plan", "conflict", "io_error"]
 
 [[command]]
+path = "config export"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "invalid_input", "package_error", "package_authentication_failed", "conflict", "io_error"]
+
+[[command]]
+path = "config import"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "invalid_input", "package_error", "package_authentication_failed", "stale_import_plan", "conflict", "io_error"]
+
+[[command]]
 path = "workspace create"
 auth = "admin"
 daemon = "required"
@@ -282,6 +298,30 @@ errors = ["envault_locked", "not_found"]
 
 [[command]]
 path = "workspace load"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found"]
+
+[[command]]
+path = "workspace bind"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found"]
+
+[[command]]
+path = "workspace unbind"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found"]
+
+[[command]]
+path = "workspace delete"
 auth = "admin"
 daemon = "required"
 agent = false

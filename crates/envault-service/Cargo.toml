@@ -13,12 +13,13 @@ age.workspace = true
 base64.workspace = true
 blake3.workspace = true
 ciborium.workspace = true
-envault-broker = { version = "=0.1.1", path = "../envault-broker" }
-envault-core = { version = "=0.1.1", path = "../envault-core" }
-envault-crypto = { version = "=0.1.1", path = "../envault-crypto" }
-envault-platform = { version = "=0.1.1", path = "../envault-platform" }
-envault-store = { version = "=0.1.1", path = "../envault-store" }
+envault-broker = { version = "=0.2.0", path = "../envault-broker" }
+envault-core = { version = "=0.2.0", path = "../envault-core" }
+envault-crypto = { version = "=0.2.0", path = "../envault-crypto" }
+envault-platform = { version = "=0.2.0", path = "../envault-platform" }
+envault-store = { version = "=0.2.0", path = "../envault-store" }
 serde.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 zeroize.workspace = true

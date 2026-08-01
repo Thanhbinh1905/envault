@@ -141,11 +141,15 @@ Individual credentials that live inside a profile.
 
 | Command | Purpose | Auth | Key flags |
 | --- | --- | --- | --- |
-| `portability export` | Export the whole workspace to an encrypted `.envault-workspace` package | admin lease | `-O, --output-file <path>` (required); `-t/-s` transfer password; `-a, --age-recipient` |
+| `portability export` | Export the whole vault to an encrypted `.envault-workspace` package | admin lease | `-O, --output-file <path>` (required); `-t/-s` transfer password; `-a, --age-recipient` |
 | `portability import <file>` | Import a `.envault-workspace` package (preview-first) | admin lease | `-t/-s` transfer password; `-S, --strategy`; `-c, --commit` + `-H, --plan-hash` |
+| `config export` | Export the vault (or a scoped slice of it) as plaintext YAML, plaintext `.env`, or an encrypted package | admin lease | `-F, --format <yaml\|env\|encrypted>`; `-k, --kind <vault\|profile\|workspace>`; `-n, --name <name>` (repeatable); `-d, --output-dir <dir>` (default `.`); `-f, --file-name <name>` |
+| `config import <file>` | Import a `config export` file (preview-first, commit with the returned plan hash) | admin lease | `-F, --format <yaml\|env\|encrypted>`; `-S, --strategy`; `-c, --commit` + `-H, --plan-hash` |
 | `workspace create <name>` | Create a workspace to group profiles | admin lease | - |
 | `workspace list` / `workspace show <name>` | List workspaces / show its member profiles | unlocked | - |
 | `workspace load <name>` | Load every profile in a workspace | admin lease | - |
+| `workspace bind <workspace> <profile>` / `unbind <workspace> <profile>` | Add or remove a profile's membership in a workspace | admin lease | - |
+| `workspace delete <name>` | Delete a workspace (must have no remaining members) | admin lease | - |
 | `request http <url>` | Make an outbound HTTP request using a secret as a header/query value, without exposing it | unlocked | `-s, --secret <profile.name>`; `-m, --method`; `-b, --body-file`; `-f, --full` |
 | `convenience-unlock enable` | Store the master password in the OS keyring so `start` doesn't need to prompt | password | `-p, --password-stdin`; `-a, --acknowledge-os-keystore` (required) |
 | `convenience-unlock disable` / `status` | Remove the stored password / check whether it's enabled | none | - |

@@ -42,4 +42,8 @@ Import and portability code must preserve stable identifiers and rebuild determi
 Static allow/deny policy rules were removed entirely.
 They were pure ceremony duplicating the access decision already made by loading a profile and, for HTTP, by the `secret_http_access` record described in ADR 0004's addendum: a rule that always mirrored an existing grant added no independent protection.
 Agent grants and the audit hash chain were removed alongside them, since both existed to support policy explanation and revocation that no longer has anything to point at.
-The scope tree, its override and tombstone semantics, and profile binding described above are unchanged and now also carry the new Workspace grouping scope (ADR 0015), which needed no changes to the evaluator.
+
+## Addendum (2026-08-01): workspace membership moved off the scope tree entirely
+
+Workspace grouping is no longer a scope at all (ADR 0015): `ScopeKind::Workspace` is gone, and workspace membership now lives in a dedicated `workspace`/`workspace_membership` join, independent of `scope`.
+The evaluator above - scope-chain traversal, override, and tombstone resolution - never runs over workspace membership; it continues to operate solely on the `Root | Profile | Project` scope tree, unchanged by workspace binds or unbinds.

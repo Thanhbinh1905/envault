@@ -4,9 +4,10 @@ use std::io::Write;
 
 pub use envault_broker::{HttpConstraint, HttpContentType, HttpMethod, HttpRequest, HttpResponse};
 use envault_core::{
-    EnvImportPreview, GeneratorSpec, ImportConflictStrategy, PackageKind, PlaintextExportSummary,
-    PortabilityExportSummary, PortabilityImportSummary, PortabilityPreview, ProfileView,
-    ResolvedSecretView, ScopeView, SecretVersionView, SecretView,
+    ConfigFormat, ConfigPreview, ConfigSelector, EnvImportPreview, GeneratorSpec,
+    ImportConflictStrategy, PackageKind, PlaintextExportSummary, PortabilityExportSummary,
+    PortabilityImportSummary, PortabilityPreview, ProfileView, ResolvedSecretView,
+    SecretVersionView, SecretView, WorkspaceView,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -108,6 +109,17 @@ pub enum Operation {
         name: String,
     },
     LoadWorkspace {
+        name: String,
+    },
+    BindProfileToWorkspace {
+        workspace: String,
+        profile: String,
+    },
+    UnbindProfileFromWorkspace {
+        workspace: String,
+        profile: String,
+    },
+    DeleteWorkspace {
         name: String,
     },
     UpdateProfile {
@@ -262,6 +274,26 @@ pub enum Operation {
         output_path: String,
         allow_plaintext: bool,
     },
+    /// Plaintext `config export --format yaml`. `--format env` and
+    /// `--format encrypted` are dispatched client-side to the existing
+    /// `ExportPlaintextEnv`/`ExportPackage` operations instead - see
+    /// `docs/adr` on the config CLI surface.
+    ExportConfig {
+        selector: ConfigSelector,
+        format: ConfigFormat,
+        output_path: String,
+    },
+    PreviewConfigImport {
+        format: ConfigFormat,
+        input_path: String,
+        strategy: ImportConflictStrategy,
+    },
+    CommitConfigImport {
+        format: ConfigFormat,
+        input_path: String,
+        strategy: ImportConflictStrategy,
+        expected_plan_hash: String,
+    },
 }
 
 impl Operation {
@@ -274,6 +306,9 @@ impl Operation {
                 | Self::PreviewEnvImport { .. }
                 | Self::CommitEnvImport { .. }
                 | Self::ExportPlaintextEnv { .. }
+                | Self::ExportConfig { .. }
+                | Self::PreviewConfigImport { .. }
+                | Self::CommitConfigImport { .. }
         )
     }
 }
@@ -313,8 +348,8 @@ pub enum Reply {
     AdminStatus(AdminLeaseStatus),
     Profile(ProfileView),
     Profiles(Vec<ProfileView>),
-    Workspace(ScopeView),
-    Workspaces(Vec<ScopeView>),
+    Workspace(WorkspaceView),
+    Workspaces(Vec<WorkspaceView>),
     WorkspaceProfiles(Vec<ProfileView>),
     Secret(SecretView),
     Secrets(Vec<SecretView>),
@@ -327,6 +362,7 @@ pub enum Reply {
     PortabilityImport(PortabilityImportSummary),
     EnvImportPreview(EnvImportPreview),
     PlaintextExport(PlaintextExportSummary),
+    ConfigPlan(ConfigPreview),
     RunEnv(Vec<EnvVar>),
     ArgvSecret(SensitiveBytes),
     RevealToken(SensitiveBytes),

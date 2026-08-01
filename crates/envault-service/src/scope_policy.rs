@@ -1,10 +1,13 @@
 use envault_core::{
-    ProfileSession, ResolvedSecretView, ScopeId, ScopeKind, ScopeResolutionEntry, ScopeView,
-    SecretId, SecretStatus, resolve_scope_entries, validate_scope_chain,
+    ProfileSession, ProfileView, ResolvedSecretView, ScopeId, ScopeKind, ScopeResolutionEntry,
+    ScopeView, SecretId, SecretStatus, WorkspaceId, WorkspaceView, resolve_scope_entries,
+    validate_scope_chain,
 };
 use envault_crypto::lookup_digest;
-use envault_store::{ScopeRecord, SecretRecord};
+use envault_store::{ScopeRecord, SecretRecord, WorkspaceRecord};
 use uuid::Uuid;
+
+pub(crate) const WORKSPACE_LOOKUP_DOMAIN: &str = "envault workspace lookup v1";
 
 use super::{
     EntityKind, GeneratorSpec, SCOPE_LOOKUP_DOMAIN, SECRET_LOOKUP_DOMAIN, SensitiveInput,
@@ -71,40 +74,126 @@ impl VaultSession {
         Ok(scopes)
     }
 
-    /// Creates a Workspace scope directly under root - a named grouping
-    /// layer for multiple profiles, not an authorization primitive.
-    pub fn create_workspace(&mut self, name: &str) -> Result<ScopeView, ServiceError> {
-        self.create_scope(self.root_scope_id, ScopeKind::Workspace, name)
-    }
-
-    pub fn workspaces(&self) -> Result<Vec<ScopeView>, ServiceError> {
-        Ok(self
-            .scopes()?
-            .into_iter()
-            .filter(|scope| scope.kind == ScopeKind::Workspace)
-            .collect())
-    }
-
-    pub fn workspace_by_name(&self, name: &str) -> Result<ScopeView, ServiceError> {
-        let root = self.store.root_scope()?;
-        let root_path =
-            self.decrypt_entity_text(EntityKind::Scope, root.id.0, "path", &root.encrypted_path)?;
-        let normalized = normalize_scope_label(name)?;
-        let path = format!("{root_path}/{normalized}");
-        let lookup = lookup_digest(&self.master_key, SCOPE_LOOKUP_DOMAIN, path.as_bytes());
-        let record = self
+    /// Creates a workspace: a dedicated `workspace` table row, independent of
+    /// the scope tree. Membership (which profiles load together under it) is
+    /// tracked separately in `workspace_membership` - see
+    /// `bind_profile_to_workspace`.
+    pub fn create_workspace(&mut self, name: &str) -> Result<WorkspaceView, ServiceError> {
+        let normalized = normalize_name(name)?;
+        let lookup = lookup_digest(
+            &self.master_key,
+            WORKSPACE_LOOKUP_DOMAIN,
+            normalized.as_bytes(),
+        );
+        if self
             .store
-            .scope_by_path_lookup(self.vault_id, &lookup)?
-            .ok_or(ServiceError::NotFound)?;
-        if scope_kind(record.kind)? != ScopeKind::Workspace {
-            return Err(ServiceError::NotFound);
+            .workspace_by_lookup(self.vault_id, &lookup)?
+            .is_some()
+        {
+            return Err(ServiceError::Conflict);
         }
-        self.scope_view(&record)
+        let id = WorkspaceId(Uuid::new_v4());
+        let record = WorkspaceRecord {
+            id,
+            vault_id: self.vault_id,
+            encrypted_name: self.encrypt_entity_text(
+                EntityKind::Workspace,
+                id.0,
+                "name",
+                name.trim(),
+            )?,
+            name_lookup: lookup.to_vec(),
+        };
+        self.store.create_workspace(&record)?;
+        self.workspace_view(&record)
     }
 
-    /// All scope ids in the subtree rooted at `scope_id` (inclusive) -
-    /// every profile/secret grouped under a workspace, for `workspace load`
-    /// and workspace-scoped grants (`ResourceSelector::ScopeTree`).
+    pub fn workspaces(&self) -> Result<Vec<WorkspaceView>, ServiceError> {
+        let mut workspaces = self
+            .store
+            .workspaces()?
+            .iter()
+            .map(|record| self.workspace_view(record))
+            .collect::<Result<Vec<_>, _>>()?;
+        workspaces.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        Ok(workspaces)
+    }
+
+    pub fn workspace_by_name(&self, name: &str) -> Result<WorkspaceView, ServiceError> {
+        let record = self.workspace_record_by_name(name)?;
+        self.workspace_view(&record)
+    }
+
+    /// Binds `profile` into `workspace`'s membership set. A profile is
+    /// independent of any workspace tree - it can belong to several
+    /// workspaces at once, purely as a "load these together" grouping;
+    /// this never touches the profile's own scope/parenting.
+    pub fn bind_profile_to_workspace(
+        &mut self,
+        workspace: &str,
+        profile: &str,
+    ) -> Result<(), ServiceError> {
+        let workspace_record = self.workspace_record_by_name(workspace)?;
+        let profile_record = self.profile_by_name(profile)?;
+        self.store
+            .add_workspace_membership(workspace_record.id, profile_record.id)?;
+        Ok(())
+    }
+
+    pub fn unbind_profile_from_workspace(
+        &mut self,
+        workspace: &str,
+        profile: &str,
+    ) -> Result<(), ServiceError> {
+        let workspace_record = self.workspace_record_by_name(workspace)?;
+        let profile_record = self.profile_by_name(profile)?;
+        self.store
+            .remove_workspace_membership(workspace_record.id, profile_record.id)?;
+        Ok(())
+    }
+
+    /// Every profile currently bound to `workspace` - a plain membership
+    /// join, unrelated to the scope tree.
+    pub fn profiles_in_workspace(&self, workspace: &str) -> Result<Vec<ProfileView>, ServiceError> {
+        let workspace_record = self.workspace_record_by_name(workspace)?;
+        self.store
+            .profiles_in_workspace(workspace_record.id)?
+            .iter()
+            .map(|record| self.profile_view(record))
+            .collect()
+    }
+
+    pub fn delete_workspace(&mut self, name: &str) -> Result<(), ServiceError> {
+        let record = self.workspace_record_by_name(name)?;
+        self.store.delete_workspace(record.id)?;
+        Ok(())
+    }
+
+    fn workspace_record_by_name(&self, name: &str) -> Result<WorkspaceRecord, ServiceError> {
+        let normalized = normalize_name(name)?;
+        let lookup = lookup_digest(
+            &self.master_key,
+            WORKSPACE_LOOKUP_DOMAIN,
+            normalized.as_bytes(),
+        );
+        self.store
+            .workspace_by_lookup(self.vault_id, &lookup)?
+            .ok_or(ServiceError::NotFound)
+    }
+
+    fn workspace_view(&self, record: &WorkspaceRecord) -> Result<WorkspaceView, ServiceError> {
+        Ok(WorkspaceView {
+            id: record.id,
+            name: self.decrypt_entity_text(
+                EntityKind::Workspace,
+                record.id.0,
+                "name",
+                &record.encrypted_name,
+            )?,
+        })
+    }
+
+    /// All scope ids in the subtree rooted at `scope_id` (inclusive).
     pub fn subtree_scope_ids(&self, scope_id: ScopeId) -> Result<Vec<ScopeId>, ServiceError> {
         let all = self.store.scopes()?;
         let mut result = vec![scope_id];
@@ -308,11 +397,14 @@ impl VaultSession {
     }
 }
 
+// Kind code 2 previously meant `ScopeKind::Workspace` and is retired: no
+// scope row is ever written with it again, but `scope_kind` below still
+// rejects it explicitly (rather than silently accepting it as an unknown
+// value) so a stray legacy row fails closed instead of being misread.
 pub(super) const fn scope_kind_code(kind: ScopeKind) -> u8 {
     match kind {
         ScopeKind::Root => 0,
         ScopeKind::Profile => 1,
-        ScopeKind::Workspace => 2,
         ScopeKind::Project => 3,
     }
 }
@@ -321,7 +413,6 @@ fn scope_kind(code: u8) -> Result<ScopeKind, ServiceError> {
     match code {
         0 => Ok(ScopeKind::Root),
         1 => Ok(ScopeKind::Profile),
-        2 => Ok(ScopeKind::Workspace),
         3 => Ok(ScopeKind::Project),
         _ => Err(ServiceError::Corrupt),
     }

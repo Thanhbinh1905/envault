@@ -160,6 +160,8 @@ pub enum ServiceError {
     StaleImportPlan,
     #[error("environment file is invalid at line {line}")]
     InvalidEnvFile { line: u64 },
+    #[error("config file is invalid, unsupported, or too large")]
+    InvalidConfigFile,
     #[error("plaintext export requires explicit acknowledgement")]
     PlaintextAcknowledgementRequired,
     #[error("plaintext export contains a name or value that cannot be represented safely")]
@@ -357,19 +359,6 @@ impl VaultSession {
         self.create_profile_under(self.root_scope_id, name, description)
     }
 
-    /// Creates a profile whose scope is a child of `workspace`'s scope
-    /// instead of the vault root, so it is grouped under that workspace
-    /// (`profile_subtree_scope_ids`/`workspace load` can find it).
-    pub fn create_profile_in_workspace(
-        &mut self,
-        workspace: &str,
-        name: &str,
-        description: Option<&str>,
-    ) -> Result<ProfileView, ServiceError> {
-        let workspace_scope = self.workspace_by_name(workspace)?;
-        self.create_profile_under(workspace_scope.id, name, description)
-    }
-
     fn create_profile_under(
         &mut self,
         parent_scope_id: ScopeId,
@@ -551,19 +540,7 @@ impl VaultSession {
         self.profile_view(&record)
     }
 
-    /// Every profile grouped under `workspace` (its own profiles plus any
-    /// nested further down the scope subtree).
-    pub fn profiles_in_workspace(&self, workspace: &str) -> Result<Vec<ProfileView>, ServiceError> {
-        let workspace_scope = self.workspace_by_name(workspace)?;
-        let subtree = self.subtree_scope_ids(workspace_scope.id)?;
-        Ok(self
-            .profiles()?
-            .into_iter()
-            .filter(|profile| subtree.contains(&profile.scope_id))
-            .collect())
-    }
-
-    /// Loads every profile grouped under `workspace` in one shot.
+    /// Loads every profile bound to `workspace` in one shot.
     pub fn load_workspace(&mut self, workspace: &str) -> Result<Vec<ProfileView>, ServiceError> {
         let names = self
             .profiles_in_workspace(workspace)?
@@ -1028,6 +1005,7 @@ impl VaultSession {
                 || (scope.id != self.root_scope_id && scope.parent_id.is_none())
                 || (scope.id == self.root_scope_id && scope.kind != 0)
                 || (scope.id != self.root_scope_id && scope.kind == 0)
+                || scope.kind == 2
                 || scope.kind > scope_policy::scope_kind_code(ScopeKind::Project)
             {
                 return Err(ServiceError::Corrupt);
