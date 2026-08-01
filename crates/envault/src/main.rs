@@ -7,7 +7,7 @@ use std::{
     process::ExitCode,
 };
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use envault::client::{self, ClientError};
 use envault_core::{
     EnvImportPreview, GeneratorFormat, GeneratorLength, GeneratorSpec, ImportConflictStrategy,
@@ -32,7 +32,7 @@ mod convenience_unlock;
     about = "Local-first encrypted secret vault"
 )]
 struct Cli {
-    #[arg(long, global = true, value_enum, default_value_t = Output::Human)]
+    #[arg(short, long, global = true, value_enum, default_value_t = Output::Human)]
     output: Output,
     #[command(subcommand)]
     command: Option<Command>,
@@ -85,9 +85,16 @@ enum Command {
         command: SessionCommand,
     },
     Run(RunArgs),
+    /// Not part of the public command surface (absent from `--help` and
+    /// `commands.toml`) - built only via the `internal-completions` feature,
+    /// which the release workflow enables solely to render shell completion
+    /// scripts once at build time for bundling into the release archive.
+    #[cfg(feature = "internal-completions")]
+    #[command(hide = true)]
     Completions(CompletionsArgs),
 }
 
+#[cfg(feature = "internal-completions")]
 #[derive(Debug, clap::Args)]
 struct CompletionsArgs {
     shell: clap_complete::Shell,
@@ -96,15 +103,17 @@ struct CompletionsArgs {
 #[derive(Debug, clap::Args)]
 struct RunArgs {
     #[arg(
+        short,
         long,
         conflicts_with = "workspace",
-        help = "Profile to resolve secrets from"
+        help = "Profile to resolve secrets from; repeat to merge several profiles (each must already be loaded)"
     )]
-    profile: Option<String>,
+    profile: Vec<String>,
     #[arg(
+        short,
         long,
         conflicts_with = "profile",
-        help = "Workspace whose member profiles to resolve secrets from"
+        help = "Workspace whose member profiles to resolve secrets from (each must already be loaded)"
     )]
     workspace: Option<String>,
     #[arg(
@@ -128,13 +137,13 @@ enum SessionCommand {
 
 #[derive(Debug, clap::Args)]
 struct SessionContextArgs {
-    #[arg(long, hide = true)]
+    #[arg(short = 'e', long, hide = true)]
     envault_session_hook: bool,
 }
 
 #[derive(Debug, clap::Args)]
 struct SessionSetupArgs {
-    #[arg(long, default_value = ".claude/settings.json")]
+    #[arg(short, long, default_value = ".claude/settings.json")]
     settings_file: PathBuf,
 }
 
@@ -150,6 +159,7 @@ struct ConvenienceUnlockEnableArgs {
     #[command(flatten)]
     password: PasswordArgs,
     #[arg(
+        short,
         long,
         required = true,
         help = "Acknowledge that the master password will be stored in this operating system's native credential store"
@@ -159,7 +169,7 @@ struct ConvenienceUnlockEnableArgs {
 
 #[derive(Clone, Copy, Debug, clap::Args)]
 struct PasswordArgs {
-    #[arg(long, help = "Read the master password from standard input")]
+    #[arg(short, long, help = "Read the master password from standard input")]
     password_stdin: bool,
 }
 
@@ -168,12 +178,14 @@ struct AdminUnlockArgs {
     #[command(flatten)]
     password: PasswordArgs,
     #[arg(
+        short,
         long,
         default_value_t = envault_core::DEFAULT_ADMIN_LEASE_MINUTES,
         conflicts_with = "no_expiration"
     )]
     minutes: u8,
     #[arg(
+        short,
         long,
         help = "Lease never expires until `admin lock`/daemon stop or restart"
     )]
@@ -197,7 +209,7 @@ enum ProfileCommand {
     Create(ProfileCreateArgs),
     Show(NameArgs),
     List,
-    Update(NameDescriptionArgs),
+    Update(ProfileUpdateArgs),
     Rename(RenameArgs),
     Delete(NameArgs),
     Load(ProfileLoadArgs),
@@ -251,16 +263,29 @@ struct NameArgs {
 #[derive(Debug, clap::Args)]
 struct NameDescriptionArgs {
     name: String,
-    #[arg(long)]
+    #[arg(short, long)]
     description: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct ProfileUpdateArgs {
+    name: String,
+    #[arg(short, long)]
+    description: Option<String>,
+    #[arg(
+        short,
+        long,
+        help = "Auto-load this profile every time the vault next unlocks (independent of whether it is loaded in the current session)"
+    )]
+    activate_on_start: Option<bool>,
 }
 
 #[derive(Debug, clap::Args)]
 struct ProfileCreateArgs {
     name: String,
-    #[arg(long)]
+    #[arg(short, long)]
     description: Option<String>,
-    #[arg(long, help = "Group this profile under an existing workspace")]
+    #[arg(short, long, help = "Group this profile under an existing workspace")]
     workspace: Option<String>,
 }
 
@@ -274,37 +299,43 @@ struct RenameArgs {
 struct ProfileLoadArgs {
     name: String,
     #[arg(
+        short,
         long,
         help = "Also configure HTTP access for one secret in this profile (bare name, no profile prefix)"
     )]
     secret: Option<String>,
-    #[arg(long, help = "Required with --secret: the exact allowed host")]
+    #[arg(
+        short = 'H',
+        long,
+        help = "Required with --secret: the exact allowed host"
+    )]
     host: Option<String>,
-    #[arg(long, default_value_t = 443)]
+    #[arg(short, long, default_value_t = 443)]
     port: u16,
     #[arg(
+        short,
         long,
         value_enum,
         value_delimiter = ',',
         help = "Required with --secret: allowed HTTP methods"
     )]
     method: Vec<HttpMethodArg>,
-    #[arg(long, default_value = "/")]
+    #[arg(short = 'P', long, default_value = "/")]
     path_prefix: String,
-    #[arg(long, default_value_t = 64 * 1024)]
+    #[arg(short = 'r', long, default_value_t = 64 * 1024)]
     max_request_bytes: usize,
-    #[arg(long, default_value_t = 256 * 1024)]
+    #[arg(short = 'R', long, default_value_t = 256 * 1024)]
     max_response_bytes: usize,
 }
 
 #[derive(Debug, clap::Args)]
 struct SecretCreateArgs {
     name: String,
-    #[arg(long)]
+    #[arg(short, long)]
     description: Option<String>,
-    #[arg(long, conflicts_with = "generate")]
+    #[arg(short, long, conflicts_with = "generate")]
     stdin: bool,
-    #[arg(long, value_enum, conflicts_with = "stdin")]
+    #[arg(short, long, value_enum, conflicts_with = "stdin")]
     generate: Option<GeneratorFormatArg>,
     #[command(flatten)]
     length: GeneratorLengthArgs,
@@ -312,15 +343,17 @@ struct SecretCreateArgs {
 
 #[derive(Clone, Debug, clap::Args)]
 struct SecretListArgs {
-    #[arg(long, help = "Deprecated: use `--fields description` instead")]
+    #[arg(short, long, help = "Deprecated: use `--fields description` instead")]
     describe: bool,
     #[arg(
+        short,
         long,
         value_delimiter = ',',
         help = "Additional columns beyond the default schema (supported: description)"
     )]
     fields: Vec<String>,
     #[arg(
+        short,
         long,
         help = "Show the effective secret set for this profile (own secrets overlaid on base)"
     )]
@@ -330,14 +363,14 @@ struct SecretListArgs {
 #[derive(Debug, clap::Args)]
 struct SecretValueSetArgs {
     name: String,
-    #[arg(long, required = true)]
+    #[arg(short, long, required = true)]
     stdin: bool,
 }
 
 #[derive(Debug, clap::Args)]
 struct SecretValueGenerateArgs {
     name: String,
-    #[arg(long, value_enum)]
+    #[arg(short, long, value_enum)]
     format: GeneratorFormatArg,
     #[command(flatten)]
     length: GeneratorLengthArgs,
@@ -345,11 +378,11 @@ struct SecretValueGenerateArgs {
 
 #[derive(Clone, Copy, Debug, Default, clap::Args)]
 struct GeneratorLengthArgs {
-    #[arg(long, conflicts_with = "bytes")]
+    #[arg(short, long, conflicts_with = "bytes")]
     chars: Option<usize>,
-    #[arg(long, conflicts_with = "chars")]
+    #[arg(short, long, conflicts_with = "chars")]
     bytes: Option<usize>,
-    #[arg(long)]
+    #[arg(short, long)]
     allow_weak: bool,
 }
 
@@ -363,30 +396,37 @@ enum GeneratorFormatArg {
 #[derive(Debug, clap::Args)]
 struct HttpRequestArgs {
     url: String,
-    #[arg(long, value_enum, default_value_t = HttpMethodArg::Get)]
+    #[arg(short, long, value_enum, default_value_t = HttpMethodArg::Get)]
     method: HttpMethodArg,
     #[arg(
+        short,
         long,
         help = "Secret reference as <profile>.<name>, or bare <name> for base"
     )]
     secret: String,
-    #[arg(long)]
+    #[arg(short, long)]
     body_file: Option<PathBuf>,
-    #[arg(long, value_enum)]
+    #[arg(short, long, value_enum)]
     content_type: Option<HttpContentTypeArg>,
-    #[arg(long, help = "Print the complete response body without truncation")]
+    #[arg(
+        short,
+        long,
+        help = "Print the complete response body without truncation"
+    )]
     full: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::Args)]
 struct TransferPasswordArgs {
     #[arg(
+        short = 't',
         long,
         conflicts_with = "transfer_password_stdin",
         help = "Prompt for a transfer password on a masked terminal"
     )]
     transfer_password: bool,
     #[arg(
+        short = 's',
         long,
         conflicts_with = "transfer_password",
         help = "Read the transfer password from standard input"
@@ -398,11 +438,17 @@ struct TransferPasswordArgs {
 struct ProfileExportArgs {
     #[arg(value_name = "PROFILE", help = "Profile to export")]
     name: String,
-    #[arg(long, value_name = "FILE", help = "New .envault-profile package path")]
+    #[arg(
+        short = 'O',
+        long,
+        value_name = "FILE",
+        help = "New .envault-profile package path"
+    )]
     output_file: PathBuf,
     #[command(flatten)]
     password: TransferPasswordArgs,
     #[arg(
+        short = 'a',
         long = "age-recipient",
         value_name = "RECIPIENT",
         help = "Add an age recipient key slot; repeat for multiple recipients"
@@ -413,6 +459,7 @@ struct ProfileExportArgs {
 #[derive(Debug, clap::Args)]
 struct WorkspaceExportArgs {
     #[arg(
+        short = 'O',
         long,
         value_name = "FILE",
         help = "New .envault-workspace package path"
@@ -421,6 +468,7 @@ struct WorkspaceExportArgs {
     #[command(flatten)]
     password: TransferPasswordArgs,
     #[arg(
+        short = 'a',
         long = "age-recipient",
         value_name = "RECIPIENT",
         help = "Add an age recipient key slot; repeat for multiple recipients"
@@ -435,12 +483,14 @@ struct ProfilePackageImportArgs {
     #[command(flatten)]
     password: TransferPasswordArgs,
     #[arg(
+        short = 'i',
         long,
         value_name = "FILE",
         help = "Private age identity file used to unwrap a package key slot"
     )]
     age_identity: Option<PathBuf>,
     #[arg(
+        short = 'S',
         long,
         value_enum,
         default_value_t = ProfileConflictStrategyArg::Abort,
@@ -448,6 +498,7 @@ struct ProfilePackageImportArgs {
     )]
     strategy: ProfileConflictStrategyArg,
     #[arg(
+        short = 'r',
         long,
         value_name = "PROFILE",
         required_if_eq("strategy", "rename"),
@@ -455,12 +506,14 @@ struct ProfilePackageImportArgs {
     )]
     rename_to: Option<String>,
     #[arg(
+        short = 'c',
         long,
         requires = "plan_hash",
         help = "Atomically apply a previously previewed import plan"
     )]
     commit: bool,
     #[arg(
+        short = 'H',
         long,
         value_name = "HASH",
         requires = "commit",
@@ -477,12 +530,14 @@ struct WorkspacePackageImportArgs {
     #[command(flatten)]
     password: TransferPasswordArgs,
     #[arg(
+        short = 'i',
         long,
         value_name = "FILE",
         help = "Private age identity file used to unwrap a package key slot"
     )]
     age_identity: Option<PathBuf>,
     #[arg(
+        short = 'S',
         long,
         value_enum,
         default_value_t = WorkspaceConflictStrategyArg::Abort,
@@ -490,12 +545,14 @@ struct WorkspacePackageImportArgs {
     )]
     strategy: WorkspaceConflictStrategyArg,
     #[arg(
+        short = 'c',
         long,
         requires = "plan_hash",
         help = "Atomically apply a previously previewed import plan"
     )]
     commit: bool,
     #[arg(
+        short = 'H',
         long,
         value_name = "HASH",
         requires = "commit",
@@ -523,6 +580,7 @@ struct EnvImportArgs {
     #[arg(value_name = "FILE", help = "Plaintext .env file to scan and import")]
     input_file: PathBuf,
     #[arg(
+        short = 'S',
         long,
         value_enum,
         default_value_t = EnvConflictStrategyArg::Abort,
@@ -530,12 +588,14 @@ struct EnvImportArgs {
     )]
     strategy: EnvConflictStrategyArg,
     #[arg(
+        short = 'c',
         long,
         requires = "plan_hash",
         help = "Atomically apply a previously previewed import plan"
     )]
     commit: bool,
     #[arg(
+        short = 'H',
         long,
         value_name = "HASH",
         requires = "commit",
@@ -549,9 +609,15 @@ struct EnvImportArgs {
 struct PlaintextExportArgs {
     #[arg(value_name = "PROFILE", help = "Profile to export")]
     name: String,
-    #[arg(long, value_name = "FILE", help = "New plaintext .env destination")]
+    #[arg(
+        short = 'O',
+        long,
+        value_name = "FILE",
+        help = "New plaintext .env destination"
+    )]
     output_file: PathBuf,
     #[arg(
+        short,
         long,
         required = true,
         help = "Acknowledge that the destination contains plaintext secrets"
@@ -612,7 +678,10 @@ struct StatusView {
 
 fn main() -> ExitCode {
     let _ = envault_platform::harden_sensitive_process();
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => return report_parse_error(&error),
+    };
     let no_args = cli.command.is_none();
     let command = cli.command.unwrap_or(Command::Status);
     if no_args {
@@ -635,15 +704,80 @@ fn main() -> ExitCode {
         Command::ConvenienceUnlock { command } => convenience_unlock_command(cli.output, command),
         Command::Session { command } => session_command(cli.output, command),
         Command::Run(arguments) => run_command(cli.output, arguments),
+        #[cfg(feature = "internal-completions")]
         Command::Completions(arguments) => completions(arguments.shell),
     }
 }
 
+#[cfg(feature = "internal-completions")]
 fn completions(shell: clap_complete::Shell) -> ExitCode {
+    use clap::CommandFactory;
     let mut command = Cli::command();
     let name = command.get_name().to_string();
     clap_complete::generate(shell, &mut command, name, &mut io::stdout());
     ExitCode::SUCCESS
+}
+
+/// clap's parse failures cover both real usage errors and the `-h`/`--help`
+/// and `-V`/`--version` "errors" it uses internally to short-circuit normal
+/// parsing. Only help output goes through `dim_help_descriptions` - clap
+/// already renders everything else (usage errors, `--version`) exactly as
+/// it should.
+fn report_parse_error(error: &clap::Error) -> ExitCode {
+    use clap::error::ErrorKind;
+    match error.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            print!("{}", dim_help_descriptions(&error.to_string()));
+            ExitCode::SUCCESS
+        }
+        _ => error.exit(),
+    }
+}
+
+/// Dims each row's description column (a command/flag's help text, or a
+/// `[default: ...]`/`[possible values: ...]` annotation) so the flag or
+/// subcommand name itself stands out. Only applied when stdout is a
+/// terminal that isn't opted out via `NO_COLOR`, so piped/redirected help
+/// output stays plain text.
+fn dim_help_descriptions(help: &str) -> String {
+    const DIM: &str = "\x1b[2m";
+    const RESET: &str = "\x1b[0m";
+    if !io::stdout().is_terminal() || std::env::var_os("NO_COLOR").is_some() {
+        return help.to_string();
+    }
+    let mut out = String::with_capacity(help.len() + 128);
+    for chunk in help.split_inclusive('\n') {
+        let (line, newline) = match chunk.strip_suffix('\n') {
+            Some(rest) => (rest, "\n"),
+            None => (chunk, ""),
+        };
+        match description_column_start(line) {
+            Some(boundary) => {
+                out.push_str(&line[..boundary]);
+                out.push_str(DIM);
+                out.push_str(&line[boundary..]);
+                out.push_str(RESET);
+            }
+            None => out.push_str(line),
+        }
+        out.push_str(newline);
+    }
+    out
+}
+
+/// A help row (a subcommand, flag, or positional argument entry) is rendered
+/// as `  <name/usage>  <description>`, two-space indented, with the
+/// description column separated by a run of two or more spaces. Returns the
+/// byte offset where that separating run starts, so the caller can dim from
+/// there to the end of the line. Section headers (`Options:`, `Usage: ...`)
+/// and blank lines start at column zero or are all whitespace, so neither
+/// matches and both are left untouched.
+fn description_column_start(line: &str) -> Option<usize> {
+    if !line.starts_with("  ") || line.trim().is_empty() {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    (2..bytes.len() - 1).find(|&index| bytes[index] == b' ' && bytes[index + 1] == b' ')
 }
 
 fn initialize_vault(output: Output, arguments: PasswordArgs) -> ExitCode {
@@ -1065,6 +1199,7 @@ fn profile_command(output: Output, command: ProfileCommand) -> ExitCode {
         ProfileCommand::Update(arguments) => Operation::UpdateProfile {
             name: arguments.name,
             description: arguments.description,
+            activate_on_start: arguments.activate_on_start,
         },
         ProfileCommand::Rename(arguments) => Operation::RenameProfile {
             old_name: arguments.old_name,
@@ -1654,52 +1789,233 @@ fn http_request(output: Output, arguments: HttpRequestArgs) -> ExitCode {
     }
 }
 
-/// Resolves secrets for a profile or workspace and injects them as env vars
-/// into a spawned child process. Plaintext is never printed here - it only
-/// ever reaches the child process's own environment.
-fn run_command(output: Output, arguments: RunArgs) -> ExitCode {
-    let profiles = if let Some(profile) = arguments.profile {
-        vec![profile]
-    } else if let Some(workspace) = arguments.workspace {
-        match client::request(Operation::ShowWorkspace { name: workspace }) {
-            Ok(Reply::WorkspaceProfiles(profiles)) => {
-                profiles.into_iter().map(|profile| profile.name).collect()
+/// Finds every `{{profile.NAME}}` placeholder across `tokens`, returning the
+/// distinct `(profile, name)` pairs referenced. Does not mutate `tokens`.
+fn find_placeholders(tokens: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut refs: Vec<(String, String)> = Vec::new();
+    for token in tokens {
+        let mut rest = token.as_str();
+        while let Some(start) = rest.find("{{") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find("}}") else {
+                return Err(format!("unterminated `{{{{` placeholder in `{token}`"));
+            };
+            let inner = &after[..end];
+            let invalid = || format!("placeholder `{{{{{inner}}}}}` must be `<profile>.<name>`");
+            let dot = inner.find('.').ok_or_else(invalid)?;
+            let (profile, name) = (&inner[..dot], &inner[dot + 1..]);
+            if profile.is_empty() || name.is_empty() {
+                return Err(invalid());
             }
-            Ok(_) => return print_error(output, &unexpected_response()),
-            Err(error) => return print_error(output, &client_error(error)),
+            let reference = (profile.to_string(), name.to_string());
+            if !refs.contains(&reference) {
+                refs.push(reference);
+            }
+            rest = &after[end + 2..];
         }
-    } else {
-        return print_error(
-            output,
-            &input_error(
-                "run_target_required",
-                "pass either --profile or --workspace",
-            ),
-        );
+    }
+    Ok(refs)
+}
+
+/// Replaces every occurrence of the `{{profile.name}}` placeholder across
+/// `tokens` with `replacement` (a `/dev/fd/<n>` path, never the plaintext).
+fn substitute_placeholder(tokens: &mut [String], profile: &str, name: &str, replacement: &str) {
+    let needle = format!("{{{{{profile}.{name}}}}}");
+    for token in tokens.iter_mut() {
+        if token.contains(&needle) {
+            *token = token.replace(&needle, replacement);
+        }
+    }
+}
+
+/// Opens an anonymous pipe, spawns a thread that writes `bytes` into it and
+/// closes the write end, and returns a `/dev/fd/<n>` path for the read end
+/// plus the read end itself (kept open until after the child is spawned, so
+/// the same fd number stays valid in the child via fork inheritance).
+/// Plaintext never touches disk or argv - only this pipe.
+#[cfg(unix)]
+fn spawn_argv_secret_pipe(
+    bytes: Zeroizing<Vec<u8>>,
+) -> nix::Result<(String, std::os::fd::OwnedFd)> {
+    use std::os::fd::AsRawFd;
+    let (read_fd, write_fd) = nix::unistd::pipe()?;
+    // Without this, the write end (never CLOEXEC by default) would also be
+    // inherited by the very child we spawn, and by any other child process
+    // started while it's open, leaving an extra open writer that keeps the
+    // pipe from ever reaching EOF for the reader.
+    nix::fcntl::fcntl(
+        &write_fd,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    )?;
+    let path = format!("/dev/fd/{}", read_fd.as_raw_fd());
+    std::thread::spawn(move || {
+        let mut remaining = bytes.as_slice();
+        while !remaining.is_empty() {
+            match nix::unistd::write(&write_fd, remaining) {
+                Ok(0) | Err(_) => break,
+                Ok(written) => remaining = &remaining[written..],
+            }
+        }
+        drop(write_fd);
+    });
+    Ok((path, read_fd))
+}
+
+/// Resolves `--profile`/`--workspace` into the flat profile list `RunEnv`
+/// expects. Both are optional inputs; an empty result is valid when the
+/// command relies solely on `{{profile.NAME}}` placeholders instead.
+fn resolve_run_profiles(
+    output: Output,
+    profile: Vec<String>,
+    workspace: Option<String>,
+) -> Result<Vec<String>, ExitCode> {
+    if !profile.is_empty() {
+        return Ok(profile);
+    }
+    let Some(workspace) = workspace else {
+        return Ok(Vec::new());
     };
+    match client::request(Operation::ShowWorkspace { name: workspace }) {
+        Ok(Reply::WorkspaceProfiles(members)) => {
+            Ok(members.into_iter().map(|profile| profile.name).collect())
+        }
+        Ok(_) => Err(print_error(output, &unexpected_response())),
+        Err(error) => Err(print_error(output, &client_error(error))),
+    }
+}
+
+/// Resolves every secret across `profiles` into `(NAME, value)` pairs ready
+/// for `Command::env`. Empty `profiles` yields an empty result without a
+/// round trip.
+fn resolve_env_vars(
+    output: Output,
+    profiles: Vec<String>,
+) -> Result<Vec<(String, Zeroizing<String>)>, ExitCode> {
+    if profiles.is_empty() {
+        return Ok(Vec::new());
+    }
     let vars = match client::request(Operation::RunEnv { profiles }) {
         Ok(Reply::RunEnv(vars)) => vars,
-        Ok(_) => return print_error(output, &unexpected_response()),
-        Err(error) => return print_error(output, &client_error(error)),
+        Ok(_) => return Err(print_error(output, &unexpected_response())),
+        Err(error) => return Err(print_error(output, &client_error(error))),
     };
     let mut env_vars = Vec::with_capacity(vars.len());
     for EnvVar { name, value } in vars {
         let text = match std::str::from_utf8(value.as_slice()) {
             Ok(text) => Zeroizing::new(text.to_string()),
             Err(_) => {
-                return print_error(
+                return Err(print_error(
                     output,
                     &input_error(
                         "secret_not_utf8",
                         "envault run only supports UTF-8 secret values",
                     ),
-                );
+                ));
             }
         };
         env_vars.push((name.to_uppercase(), text));
     }
-    let (program, args) = arguments
-        .command
+    Ok(env_vars)
+}
+
+#[cfg(unix)]
+type PlaceholderGuards = Vec<std::os::fd::OwnedFd>;
+#[cfg(not(unix))]
+type PlaceholderGuards = ();
+
+/// Resolves every `{{profile.NAME}}` placeholder found by `find_placeholders`
+/// and rewrites `command_tokens` in place to reference each one's `/dev/fd`
+/// path instead. The returned guards must stay alive (unused is fine) until
+/// after the child is spawned, so the fd numbers stay valid through fork.
+fn resolve_placeholders(
+    output: Output,
+    placeholders: &[(String, String)],
+    command_tokens: &mut [String],
+) -> Result<PlaceholderGuards, ExitCode> {
+    #[cfg(not(unix))]
+    {
+        if !placeholders.is_empty() {
+            return Err(print_error(
+                output,
+                &input_error(
+                    "argv_placeholder_unsupported",
+                    "{{profile.NAME}} placeholders in command args are not yet supported on this platform",
+                ),
+            ));
+        }
+    }
+    #[cfg(unix)]
+    let mut guards = Vec::with_capacity(placeholders.len());
+    for (profile, name) in placeholders {
+        let value = match client::request(Operation::ResolveArgvSecret {
+            profile: profile.clone(),
+            name: name.clone(),
+        }) {
+            Ok(Reply::ArgvSecret(value)) => value,
+            Ok(_) => return Err(print_error(output, &unexpected_response())),
+            Err(error) => return Err(print_error(output, &client_error(error))),
+        };
+        #[cfg(unix)]
+        {
+            let bytes = Zeroizing::new(value.as_slice().to_vec());
+            let (path, read_fd) = match spawn_argv_secret_pipe(bytes) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Err(print_error(
+                        output,
+                        &input_error(
+                            "argv_pipe_failed",
+                            &format!("failed to create pipe for {profile}.{name}: {error}"),
+                        ),
+                    ));
+                }
+            };
+            substitute_placeholder(command_tokens, profile, name, &path);
+            guards.push(read_fd);
+        }
+    }
+    #[cfg(unix)]
+    return Ok(guards);
+    #[cfg(not(unix))]
+    Ok(())
+}
+
+/// Resolves secrets for a profile or workspace and injects them as env vars
+/// into a spawned child process, and/or resolves `{{profile.NAME}}`
+/// placeholders in the command's own args into `/dev/fd/<n>` paths backed
+/// by an anonymous pipe. Plaintext is never printed here - it only ever
+/// reaches the child process's own environment or an inherited pipe fd.
+fn run_command(output: Output, arguments: RunArgs) -> ExitCode {
+    let mut command_tokens = arguments.command;
+    let placeholders = match find_placeholders(&command_tokens) {
+        Ok(placeholders) => placeholders,
+        Err(message) => return print_error(output, &input_error("invalid_placeholder", &message)),
+    };
+    let profiles = match resolve_run_profiles(output, arguments.profile, arguments.workspace) {
+        Ok(profiles) => profiles,
+        Err(exit_code) => return exit_code,
+    };
+    if profiles.is_empty() && placeholders.is_empty() {
+        return print_error(
+            output,
+            &input_error(
+                "run_target_required",
+                "pass --profile, --workspace, or a {{profile.NAME}} placeholder in the command",
+            ),
+        );
+    }
+
+    let env_vars = match resolve_env_vars(output, profiles) {
+        Ok(env_vars) => env_vars,
+        Err(exit_code) => return exit_code,
+    };
+    let placeholder_guards = match resolve_placeholders(output, &placeholders, &mut command_tokens)
+    {
+        Ok(guards) => guards,
+        Err(exit_code) => return exit_code,
+    };
+
+    let (program, args) = command_tokens
         .split_first()
         .expect("clap requires at least one command token");
     let mut command = std::process::Command::new(program);
@@ -1709,6 +2025,7 @@ fn run_command(output: Output, arguments: RunArgs) -> ExitCode {
     }
     let status = command.status();
     drop(env_vars);
+    drop(placeholder_guards);
     match status {
         Ok(status) => {
             let code = u8::try_from(status.code().unwrap_or(1).clamp(0, 255)).unwrap_or(1);
@@ -2238,16 +2555,17 @@ fn print_profiles(output: Output, profiles: &[ProfileView], help: &[&str]) -> Ex
         }
         Output::Toon => {
             println!(
-                "profiles[{}]{{id,scope_id,name,description,activate_on_start,generation}}:",
+                "profiles[{}]{{id,scope_id,name,description,loaded,activate_on_start,generation}}:",
                 profiles.len()
             );
             for profile in profiles {
                 println!(
-                    "  {},{},{},{},{},{}",
+                    "  {},{},{},{},{},{},{}",
                     profile.id.0,
                     profile.scope_id.0,
                     toon_string(&profile.name),
                     optional_toon(profile.description.as_deref()),
+                    profile.loaded,
                     profile.activate_on_start,
                     profile.generation
                 );
@@ -2258,12 +2576,20 @@ fn print_profiles(output: Output, profiles: &[ProfileView], help: &[&str]) -> Ex
             if profiles.is_empty() {
                 println!("profiles: 0 profiles found");
             } else {
-                let mut table = human_table(vec!["name", "id", "scope", "loaded", "description"]);
+                let mut table = human_table(vec![
+                    "name",
+                    "id",
+                    "scope",
+                    "loaded",
+                    "activate_on_start",
+                    "description",
+                ]);
                 for profile in profiles {
                     table.add_row(vec![
                         profile.name.clone(),
                         short_id(profile.id.0),
                         short_id(profile.scope_id.0),
+                        profile.loaded.to_string(),
                         profile.activate_on_start.to_string(),
                         profile.description.clone().unwrap_or_default(),
                     ]);
@@ -2872,6 +3198,8 @@ fn toon_string(value: &str) -> String {
 mod tests {
     use std::collections::BTreeSet;
 
+    use clap::CommandFactory;
+
     use super::*;
 
     #[derive(serde::Deserialize)]
@@ -2895,6 +3223,7 @@ mod tests {
         let command = Cli::command();
         let names = command
             .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
             .map(|subcommand| subcommand.get_name().to_owned())
             .collect::<Vec<_>>();
         assert_eq!(
@@ -2913,8 +3242,7 @@ mod tests {
                 "workspace",
                 "convenience-unlock",
                 "session",
-                "run",
-                "completions"
+                "run"
             ]
         );
     }
@@ -3148,6 +3476,9 @@ mod tests {
 
     fn collect_leaf_paths(command: &clap::Command, prefix: &str, paths: &mut BTreeSet<String>) {
         for child in command.get_subcommands() {
+            if child.is_hide_set() {
+                continue;
+            }
             let path = if prefix.is_empty() {
                 child.get_name().to_owned()
             } else {

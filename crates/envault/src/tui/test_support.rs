@@ -239,6 +239,7 @@ pub(crate) fn sample_profile(name: &str, description: Option<String>) -> Profile
         name: name.to_string(),
         description,
         activate_on_start: false,
+        loaded: false,
         generation: 1,
     }
 }

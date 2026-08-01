@@ -1,7 +1,7 @@
 # Installation
 
-EnVault release `v0.0.1` is prepared on this branch.
-After this branch merges into `main`, pushing tag `v0.0.1` publishes the GitHub Release artifacts through the tag-triggered release workflow.
+EnVault release `v0.1.0` is prepared on this branch.
+After this branch merges into `main`, pushing tag `v0.1.0` publishes the GitHub Release artifacts through the tag-triggered release workflow.
 Until that tag is published, install from source or wait for the release artifacts.
 The Rust crates are not published to crates.io yet.
 
@@ -13,7 +13,7 @@ The daemon and CLI use the operating system's local IPC and keyring facilities.
 
 ## Install a GitHub Release
 
-After the `v0.0.1` GitHub Release is published, the supported quick installer detects the platform, downloads the matching latest release, verifies `SHA256SUMS`, and installs into `$HOME/.local/bin`:
+After the `v0.1.0` GitHub Release is published, the supported quick installer detects the platform, downloads the matching latest release, verifies `SHA256SUMS`, and installs into `$HOME/.local/bin`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Thanhbinh1905/envault/main/install.sh | sh
@@ -82,24 +82,6 @@ The `envault-tui` binary is an optional interactive client and does not replace 
 
 On Unix, `envault start` can spawn the daemon after the human bootstrap prompt.
 On Windows, start `envaultd.exe` from a supervised process or terminal before using client commands because automatic client-side daemon spawning is not available yet.
-
-## Shell completions
-
-The quick installer (`install.sh`) detects `bash`, `zsh`, and `fish` on the machine and installs a completion script for each into the shell's standard completion directory, adding an `fpath` entry to `~/.zshrc` for zsh if one is not already present.
-Restart the shell, or source the generated file directly, to pick up completions immediately.
-
-For a manual install, a build without `install.sh`, or `elvish`/`powershell`, generate the script directly:
-
-```sh
-# bash
-envault completions bash | sudo tee /etc/bash_completion.d/envault >/dev/null
-
-# zsh (any directory on $fpath)
-envault completions zsh > "${fpath[1]}/_envault"
-
-# fish
-envault completions fish > ~/.config/fish/completions/envault.fish
-```
 
 ## Agent integration
 

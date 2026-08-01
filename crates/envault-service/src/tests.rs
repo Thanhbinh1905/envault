@@ -49,6 +49,7 @@ fn initialization_is_atomic_and_wrong_password_fails() {
             name: "base".into(),
             description: None,
             activate_on_start: true,
+            loaded: true,
             generation: 1,
         }]
     );
@@ -67,7 +68,7 @@ fn profile_rename_preserves_identity_and_startup_invariant() {
     assert_eq!(renamed.name, "Engineering");
     assert_eq!(renamed.generation, 2);
     let updated = session
-        .update_profile("engineering", Some("Rotated developer credentials"))
+        .update_profile("engineering", Some("Rotated developer credentials"), None)
         .expect("update profile");
     assert_eq!(updated.id, created.id);
     assert_eq!(
@@ -75,7 +76,9 @@ fn profile_rename_preserves_identity_and_startup_invariant() {
         updated
     );
     assert_eq!(updated.generation, 3);
-    session.load_profile("engineering").expect("load");
+    let loaded = session.load_profile("engineering").expect("load");
+    assert!(loaded.loaded);
+    assert!(!loaded.activate_on_start);
     assert!(matches!(
         session.delete_profile("base"),
         Err(ServiceError::Conflict)
@@ -84,13 +87,85 @@ fn profile_rename_preserves_identity_and_startup_invariant() {
         session.unload_profile("base"),
         Err(ServiceError::StartupProfileRequired)
     ));
+
+    // Loading a profile is session-only and does not protect it from
+    // deletion - only the persisted `activate_on_start` preference does,
+    // set independently via `update_profile`.
+    session
+        .update_profile("engineering", None, Some(true))
+        .expect("set activate_on_start");
     assert!(matches!(
         session.delete_profile("engineering"),
         Err(ServiceError::StartupProfileRequired)
     ));
-    session.unload_profile("engineering").expect("unload");
+    session
+        .update_profile("engineering", None, Some(false))
+        .expect("clear activate_on_start");
+
+    let unloaded = session.unload_profile("engineering").expect("unload");
+    assert!(!unloaded.loaded);
     session.delete_profile("engineering").expect("delete");
     assert_eq!(session.profiles().expect("profiles").len(), 1);
+}
+
+#[test]
+fn loaded_set_is_session_only_and_reseeded_from_activate_on_start_on_unlock() {
+    let (_directory, path, password, mut session) = initialized();
+    session
+        .create_profile("Personal", Some("Personal profile"))
+        .expect("create profile");
+
+    // Not yet loaded this session, regardless of `activate_on_start`.
+    assert!(!session.profile("personal").expect("show").loaded);
+    assert!(matches!(
+        session.secrets_in_profile("personal"),
+        Err(ServiceError::ProfileNotLoaded)
+    ));
+
+    // Loading is session-only: it does not persist `activate_on_start`.
+    session.load_profile("personal").expect("load");
+    assert!(session.profile("personal").expect("show").loaded);
+    drop(session);
+    let mut session = VaultSession::unlock(&path, &password).expect("unlock");
+    assert!(!session.profile("personal").expect("show").loaded);
+
+    // Flagging `activate_on_start` does persist: the next unlock reseeds
+    // the loaded set from it without any explicit `load_profile` call.
+    session
+        .update_profile("personal", None, Some(true))
+        .expect("set activate_on_start");
+    drop(session);
+    let session = VaultSession::unlock(&path, &password).expect("unlock");
+    let personal = session.profile("personal").expect("show");
+    assert!(personal.activate_on_start);
+    assert!(personal.loaded);
+    session.secrets_in_profile("personal").expect("resolve");
+}
+
+#[test]
+fn update_profile_rejects_clearing_the_last_activate_on_start_profile() {
+    let (_directory, _path, _password, mut session) = initialized();
+    assert!(matches!(
+        session.update_profile("base", None, Some(false)),
+        Err(ServiceError::StartupProfileRequired)
+    ));
+
+    session
+        .create_profile("Personal", Some("Personal profile"))
+        .expect("create profile");
+    session
+        .update_profile("personal", None, Some(true))
+        .expect("set activate_on_start");
+    // `base` is the permanent underlay: it can never have
+    // `activate_on_start` cleared, even when another profile is active.
+    assert!(matches!(
+        session.update_profile("base", None, Some(false)),
+        Err(ServiceError::StartupProfileRequired)
+    ));
+
+    session
+        .update_profile("personal", None, Some(false))
+        .expect("clear activate_on_start on a non-root profile");
 }
 
 #[test]

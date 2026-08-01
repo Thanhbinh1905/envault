@@ -24,9 +24,10 @@ It adds no new database table.
 
 ## Loaded set
 
-The set of profiles a session can actually read secrets from, tracked by the existing `activate_on_start` flag on each profile (now zero-or-more rather than exactly-one).
-`envault profile load`/`unload` and `envault workspace load` toggle membership at runtime.
-Ambient reads (`secret describe`, `secret list --profile`, and similar) require the target profile to be in the loaded set; `envault run` does not, since naming a profile there is itself the explicit action.
+The set of profiles a session can actually read secrets from.
+It is runtime-only and resets on every unlock, seeded at that point from every profile with `activate_on_start` set (see Profile), then mutated ad hoc by `envault profile load`/`unload` and `envault workspace load` for the rest of the session.
+Loading or unloading a profile never writes back to its `activate_on_start` preference; the two are deliberately decoupled.
+Ambient reads (`secret describe`, `secret list --profile`, and similar) and `envault run` both require the target profile to already be in the loaded set - `run` never loads a profile as a side effect of naming it.
 The `base` profile is always loaded and cannot be unloaded.
 
 ## `secret_http_access`
@@ -37,9 +38,11 @@ Revoking access means removing the rule or unloading the profile, which affects 
 
 ## `envault run`
 
-Resolves the secrets visible to one profile (or every profile in a workspace) and injects them as environment variables directly into a spawned child process.
+Resolves the secrets visible to one or more profiles (`--profile`, repeatable to merge several) or every profile in a workspace (`--workspace`) and injects them as environment variables directly into a spawned child process.
+Every named profile must already be in the loaded set (see Loaded set); `run` never loads one as a side effect.
 This is the only path that lets plaintext leave the daemon into a CLI-driven process; the CLI itself never prints the value to stdout, stderr, or a log.
-With `--workspace`, if two member profiles resolve a secret with the same name, resolution fails with `duplicate_secret_across_profiles` instead of silently picking one; use `--profile` to disambiguate.
+With `--workspace`, if two member profiles resolve a secret with the same name, resolution fails with `duplicate_secret_across_profiles` instead of silently picking one; repeat `--profile` to disambiguate instead.
+A command argument may also reference `{{<profile>.<name>}}`; the value is substituted with a `/dev/fd/<n>` path backed by an anonymous pipe, never printed or placed in an environment variable.
 
 ## Reveal
 

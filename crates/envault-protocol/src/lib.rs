@@ -113,6 +113,7 @@ pub enum Operation {
     UpdateProfile {
         name: String,
         description: Option<String>,
+        activate_on_start: Option<bool>,
     },
     RenameProfile {
         old_name: String,
@@ -193,6 +194,15 @@ pub enum Operation {
     /// hands plaintext to a CLI client, never through stdout.
     RunEnv {
         profiles: Vec<String>,
+    },
+    /// Resolves a single secret's plaintext for a `{{profile.NAME}}`
+    /// placeholder in `envault run`'s command args. Never printed - the CLI
+    /// feeds it directly into an anonymous pipe inherited by the spawned
+    /// child, substituting the placeholder with a `/dev/fd/<n>` path.
+    /// Requires the profile to be in the loaded set, same as `RunEnv`.
+    ResolveArgvSecret {
+        profile: String,
+        name: String,
     },
     /// Mints a bearer token proving the caller just supplied the vault
     /// password, independent of and in addition to the coarser uid-scoped
@@ -318,6 +328,7 @@ pub enum Reply {
     EnvImportPreview(EnvImportPreview),
     PlaintextExport(PlaintextExportSummary),
     RunEnv(Vec<EnvVar>),
+    ArgvSecret(SensitiveBytes),
     RevealToken(SensitiveBytes),
     SecretPlaintext(SensitiveBytes),
     Acknowledged { no_op: bool },

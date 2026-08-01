@@ -113,16 +113,26 @@ jobs:
       - name: Build release binaries
         run: cargo build --locked --release -p envault --bins --target ${{ matrix.target }}
 
+      - name: Generate shell completions
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir -p completions
+          cargo run --locked --release -p envault --features internal-completions --target ${{ matrix.target }} --bin envault -- completions bash >completions/envault.bash
+          cargo run --locked --release -p envault --features internal-completions --target ${{ matrix.target }} --bin envault -- completions zsh >completions/_envault
+          cargo run --locked --release -p envault --features internal-completions --target ${{ matrix.target }} --bin envault -- completions fish >completions/envault.fish
+
       - name: Package Unix archive
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
           name="envault-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir -p "$name"
+          mkdir -p "$name/completions"
           cp "target/${{ matrix.target }}/release/envault" \
             "target/${{ matrix.target }}/release/envaultd" \
             "target/${{ matrix.target }}/release/envault-tui" "$name/"
           cp README.md LICENSE-MIT LICENSE-APACHE docs/INSTALLATION.md install.sh "$name/"
+          cp completions/envault.bash completions/_envault completions/envault.fish "$name/completions/"
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
 
