@@ -130,7 +130,7 @@ jobs:
           mkdir -p "$name/completions"
           cp "target/${{ matrix.target }}/release/envault" \
             "target/${{ matrix.target }}/release/envaultd" \
-            "target/${{ matrix.target }}/release/envault-tui" "$name/"
+            "target/${{ matrix.target }}/release/envaultui" "$name/"
           cp README.md LICENSE-MIT LICENSE-APACHE docs/INSTALLATION.md install.sh "$name/"
           cp completions/envault.bash completions/_envault completions/envault.fish "$name/completions/"
           tar -czf "$name.tar.gz" "$name"
@@ -142,7 +142,7 @@ jobs:
         run: |
           $name = "envault-$env:GITHUB_REF_NAME-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $name | Out-Null
-          Copy-Item "target\${{ matrix.target }}\release\envault.exe", "target\${{ matrix.target }}\release\envaultd.exe", "target\${{ matrix.target }}\release\envault-tui.exe" $name
+          Copy-Item "target\${{ matrix.target }}\release\envault.exe", "target\${{ matrix.target }}\release\envaultd.exe", "target\${{ matrix.target }}\release\envaultui.exe" $name
           Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE, docs\INSTALLATION.md, install.sh $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLowerInvariant()

@@ -26,7 +26,7 @@ pub fn run() -> io::Result<()> {
     let _ = envault_platform::harden_sensitive_process();
     if !io::stdout().is_terminal() {
         return Err(io::Error::other(
-            "envault-tui requires an interactive terminal on standard output",
+            "envaultui requires an interactive terminal on standard output",
         ));
     }
     terminal::install_panic_hook();

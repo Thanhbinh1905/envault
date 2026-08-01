@@ -119,10 +119,10 @@ info "Installing EnVault binaries"
 mkdir -p "$install_dir"
 install -m 0755 "$bundle/envault" "$install_dir/envault"
 install -m 0755 "$bundle/envaultd" "$install_dir/envaultd"
-install -m 0755 "$bundle/envault-tui" "$install_dir/envault-tui"
+install -m 0755 "$bundle/envaultui" "$install_dir/envaultui"
 ok "$install_dir/envault"
 ok "$install_dir/envaultd"
-ok "$install_dir/envault-tui"
+ok "$install_dir/envaultui"
 
 info "Shell completions"
 completions_installed=0
