@@ -18,9 +18,9 @@ A secret always belongs to exactly one profile and its name is unique within tha
 
 ## Workspace
 
-A grouping scope over one or more profiles, backed by the pre-existing `ScopeKind::Workspace` scope kind.
-`envault workspace create` makes the group, `envault profile create --workspace` binds a new profile under it, and `envault workspace load` loads every member profile at once.
-It adds no new database table.
+A many-to-many grouping of profiles that should load together, backed by its own `workspace` table and a `workspace_membership` join - entirely independent of the scope tree that secrets inherit through.
+A profile can belong to any number of workspaces at once; workspaces never hold secrets.
+`envault workspace create` makes the group, `envault workspace bind`/`unbind` add or remove a profile's membership, `envault profile create --workspace` is sugar for creating a profile and binding it in one step, and `envault workspace load` loads every member profile at once.
 
 ## Loaded set
 

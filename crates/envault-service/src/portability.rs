@@ -10,12 +10,14 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use envault_core::{
-    EntityKind, EnvImportEntryView, EnvImportPreview, ImportAction, ImportConflictStrategy,
-    ImportConflictView, MAX_ENV_FILE_BYTES, MAX_ENV_LINE_BYTES, MAX_NAME_BYTES,
-    MAX_PORTABILITY_ENTITIES, MAX_PORTABILITY_KEY_SLOTS, MAX_PORTABILITY_PACKAGE_BYTES,
-    MAX_SECRET_VALUE_BYTES, PackageKind, PlaintextExportSummary, PortabilityCounts,
-    PortabilityExportSummary, PortabilityImportSummary, PortabilityPreview, ProfileId, ScopeId,
-    ScopeKind, SecretId, SecretVersionId, VaultId, normalize_name,
+    ConfigMembershipEntryView, ConfigPreview, ConfigProfileEntryView, ConfigSecretEntryView,
+    ConfigSelector, ConfigWorkspaceEntryView, EntityKind, EnvImportEntryView, EnvImportPreview,
+    ImportAction, ImportConflictStrategy, ImportConflictView, MAX_CONFIG_FILE_BYTES,
+    MAX_ENV_FILE_BYTES, MAX_ENV_LINE_BYTES, MAX_NAME_BYTES, MAX_PORTABILITY_ENTITIES,
+    MAX_PORTABILITY_KEY_SLOTS, MAX_PORTABILITY_PACKAGE_BYTES, MAX_SECRET_VALUE_BYTES, PackageKind,
+    PlaintextExportSummary, PortabilityCounts, PortabilityExportSummary, PortabilityImportSummary,
+    PortabilityPreview, ProfileId, ProfileView, ScopeId, ScopeKind, SecretId, SecretVersionId,
+    VaultId, WorkspaceId, WorkspaceView, normalize_name,
 };
 use envault_crypto::{
     Ciphertext, KEY_BYTES, KdfParameters, SALT_BYTES, SecretBytes, SecretKey, decrypt, derive_key,
@@ -23,7 +25,7 @@ use envault_crypto::{
 };
 use envault_store::{
     ImportBatch, ImportReset, ProfileRecord, ScopeRecord, SecretRecord, SecretVersionAppend,
-    SecretVersionRecord,
+    SecretVersionRecord, WorkspaceRecord,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -80,6 +82,8 @@ struct PackagePayload {
     scopes: Vec<PortableScope>,
     profiles: Vec<PortableProfile>,
     secrets: Vec<PortableSecret>,
+    workspaces: Vec<PortableWorkspace>,
+    memberships: Vec<PortableWorkspaceMembership>,
 }
 
 impl Drop for PackagePayload {
@@ -92,6 +96,9 @@ impl Drop for PackagePayload {
             if let Some(description) = &mut profile.description {
                 description.zeroize();
             }
+        }
+        for workspace in &mut self.workspaces {
+            workspace.name.zeroize();
         }
         for secret in &mut self.secrets {
             secret.name.zeroize();
@@ -126,6 +133,18 @@ struct PortableProfile {
 }
 
 #[derive(Serialize, Deserialize)]
+struct PortableWorkspace {
+    id: WorkspaceId,
+    name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PortableWorkspaceMembership {
+    workspace_id: WorkspaceId,
+    profile_id: ProfileId,
+}
+
+#[derive(Serialize, Deserialize)]
 struct PortableSecret {
     id: SecretId,
     scope_id: ScopeId,
@@ -156,8 +175,19 @@ struct LoadedPackage {
     source_digest: [u8; 32],
 }
 
+/// Discriminates which import surface produced a plan hash, so a config plan
+/// hash can never collide with a package or env plan hash even if every
+/// other fingerprint field happened to coincide.
+#[derive(Serialize)]
+enum PlanKind {
+    Package,
+    Env,
+    Config,
+}
+
 #[derive(Serialize)]
 struct PlanFingerprint<'a> {
+    kind: PlanKind,
     source_digest: [u8; 32],
     package_id: Option<Uuid>,
     destination_vault_id: VaultId,
@@ -203,6 +233,114 @@ struct EnvPlan {
     profile: ProfileRecord,
     entries: Vec<(ParsedEnvEntry, Option<SecretRecord>, ImportAction)>,
     rejected: bool,
+}
+
+const CONFIG_DOCUMENT_VERSION: u32 = 1;
+
+/// The full-fidelity plaintext YAML schema for `config export`/`config
+/// import`. Flat - no scope-tree nesting, matching the decoupled
+/// workspace/profile model. `workspaces` is omitted entirely (not merely
+/// empty) for a profile-scoped export, via `skip_serializing_if`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ConfigDocument {
+    version: u32,
+    source_vault_id: Uuid,
+    profiles: Vec<ConfigDocProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    workspaces: Vec<ConfigDocWorkspace>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ConfigDocProfile {
+    id: Uuid,
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    activate_on_start: bool,
+    #[serde(default)]
+    secrets: Vec<ConfigDocSecret>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ConfigDocSecret {
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ConfigDocWorkspace {
+    id: Uuid,
+    name: String,
+    #[serde(default)]
+    members: Vec<String>,
+}
+
+impl Drop for ConfigDocument {
+    fn drop(&mut self) {
+        for profile in &mut self.profiles {
+            profile.name.zeroize();
+            if let Some(description) = &mut profile.description {
+                description.zeroize();
+            }
+            for secret in &mut profile.secrets {
+                secret.name.zeroize();
+                secret.value.zeroize();
+                if let Some(description) = &mut secret.description {
+                    description.zeroize();
+                }
+            }
+        }
+    }
+}
+
+/// One resolved secret-import decision for a `config import` plan - the
+/// per-secret analogue of `PackagePlanMode`, keyed to the owning profile by
+/// its normalized name since new profiles do not have a destination id
+/// until `plan_config_import` assigns one.
+#[derive(Clone)]
+struct ConfigSecretDecision {
+    profile_normalized: String,
+    entry: ConfigDocSecret,
+    existing: Option<SecretRecord>,
+    action: ImportAction,
+}
+
+struct ConfigProfilePlan {
+    profile_entries: Vec<ConfigProfileEntryView>,
+    secret_entries: Vec<ConfigSecretEntryView>,
+    secret_decisions: Vec<ConfigSecretDecision>,
+    profile_ids: BTreeMap<String, ProfileId>,
+    new_profiles: BTreeSet<String>,
+    rejected: bool,
+}
+
+struct ConfigWorkspacePlan {
+    workspace_entries: Vec<ConfigWorkspaceEntryView>,
+    membership_entries: Vec<ConfigMembershipEntryView>,
+    workspace_ids: BTreeMap<String, WorkspaceId>,
+    new_workspaces: BTreeSet<String>,
+    new_memberships: Vec<(WorkspaceId, ProfileId)>,
+}
+
+struct ConfigPlan {
+    preview: ConfigPreview,
+    rejected: bool,
+    document: ConfigDocument,
+    /// Normalized profile name -> destination `ProfileId`, for both
+    /// already-existing profiles and ones this plan will create.
+    profile_ids: BTreeMap<String, ProfileId>,
+    /// Normalized names of profiles this plan will create (as opposed to
+    /// ones that already exist and are merely gaining/skipping secrets).
+    new_profiles: BTreeSet<String>,
+    secret_decisions: Vec<ConfigSecretDecision>,
+    /// Normalized workspace name -> destination `WorkspaceId`.
+    workspace_ids: BTreeMap<String, WorkspaceId>,
+    new_workspaces: BTreeSet<String>,
+    /// Membership pairs to add - config import only ever adds membership,
+    /// never removes one the file doesn't mention.
+    new_memberships: Vec<(WorkspaceId, ProfileId)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -579,6 +717,753 @@ impl VaultSession {
         })
     }
 
+    /// Full-fidelity plaintext YAML export - a whole vault or a named slice
+    /// of it (see `ConfigSelector`). Secrets belong only to profiles, so
+    /// `workspaces:` never carries secret material, only membership names;
+    /// it is omitted entirely for a profile-scoped selector.
+    pub fn export_config_yaml(
+        &self,
+        selector: ConfigSelector,
+        output_path: &Path,
+    ) -> Result<PortabilityExportSummary, ServiceError> {
+        if output_path.exists() {
+            return Err(ServiceError::Conflict);
+        }
+        let (profiles, workspaces, package_kind) =
+            self.resolve_config_export_selection(selector)?;
+        let (profiles_doc, secret_count) = self.build_config_profile_docs(&profiles)?;
+        let (workspaces_doc, membership_count) = self.build_config_workspace_docs(&workspaces)?;
+
+        let document = ConfigDocument {
+            version: CONFIG_DOCUMENT_VERSION,
+            source_vault_id: self.vault_id.0,
+            profiles: profiles_doc,
+            workspaces: workspaces_doc,
+        };
+        let yaml = Zeroizing::new(
+            serde_yaml::to_string(&document).map_err(|_| ServiceError::Serialization)?,
+        );
+        write_plaintext_no_replace(output_path, yaml.as_bytes())?;
+        let counts = PortabilityCounts {
+            scopes: 0,
+            profiles: u64::try_from(document.profiles.len()).map_err(|_| ServiceError::Corrupt)?,
+            secrets: secret_count,
+            versions: secret_count,
+            workspaces: u64::try_from(document.workspaces.len())
+                .map_err(|_| ServiceError::Corrupt)?,
+            memberships: membership_count,
+        };
+        Ok(PortabilityExportSummary {
+            package_id: Uuid::new_v4(),
+            kind: package_kind,
+            output_path: output_path.display().to_string(),
+            counts,
+            password_slots: 0,
+            age_slots: 0,
+        })
+    }
+
+    /// Resolves a `ConfigSelector` to the concrete profiles/workspaces an
+    /// export should include, deduplicated, plus the `PackageKind` used only
+    /// to describe the selection's shape in `PortabilityExportSummary`
+    /// (`Profiles` -> `Profile`; `Vault`/`Workspaces` -> `Workspace`, since
+    /// both touch workspace state).
+    fn resolve_config_export_selection(
+        &self,
+        selector: ConfigSelector,
+    ) -> Result<(Vec<ProfileView>, Vec<WorkspaceView>, PackageKind), ServiceError> {
+        match selector {
+            ConfigSelector::Vault => {
+                Ok((self.profiles()?, self.workspaces()?, PackageKind::Workspace))
+            }
+            ConfigSelector::Profiles(names) => {
+                let mut selected = Vec::new();
+                let mut seen = BTreeSet::new();
+                for name in &names {
+                    let profile = self.profile(name)?;
+                    if seen.insert(profile.id) {
+                        selected.push(profile);
+                    }
+                }
+                Ok((selected, Vec::new(), PackageKind::Profile))
+            }
+            ConfigSelector::Workspaces(names) => {
+                let mut selected_workspaces = Vec::new();
+                let mut seen_workspaces = BTreeSet::new();
+                for name in &names {
+                    let workspace = self.workspace_by_name(name)?;
+                    if seen_workspaces.insert(workspace.id) {
+                        selected_workspaces.push(workspace);
+                    }
+                }
+                let mut selected_profiles = Vec::new();
+                let mut seen_profiles = BTreeSet::new();
+                for workspace in &selected_workspaces {
+                    for profile in self.profiles_in_workspace(&workspace.name)? {
+                        if seen_profiles.insert(profile.id) {
+                            selected_profiles.push(profile);
+                        }
+                    }
+                }
+                Ok((
+                    selected_profiles,
+                    selected_workspaces,
+                    PackageKind::Workspace,
+                ))
+            }
+        }
+    }
+
+    fn build_config_profile_docs(
+        &self,
+        profiles: &[ProfileView],
+    ) -> Result<(Vec<ConfigDocProfile>, u64), ServiceError> {
+        let mut profiles_doc = Vec::with_capacity(profiles.len());
+        let mut secret_count = 0_u64;
+        for profile in profiles {
+            let mut resolved = self.resolved_secrets(profile.scope_id)?;
+            resolved.sort_by(|left, right| left.secret.name.cmp(&right.secret.name));
+            let mut secrets_doc = Vec::with_capacity(resolved.len());
+            for item in &resolved {
+                let secret = self
+                    .store
+                    .secret_by_id(item.secret.id)?
+                    .ok_or(ServiceError::Corrupt)?;
+                let version = self
+                    .store
+                    .secret_versions(secret.id)?
+                    .into_iter()
+                    .last()
+                    .ok_or(ServiceError::Corrupt)?;
+                let value = self.decrypt_secret_version(&secret, &version)?;
+                let text = std::str::from_utf8(value.as_ref())
+                    .map_err(|_| ServiceError::PlaintextExportUnsupported)?
+                    .to_owned();
+                secrets_doc.push(ConfigDocSecret {
+                    name: item.secret.name.clone(),
+                    description: item.secret.description.clone(),
+                    value: text,
+                });
+            }
+            secret_count = secret_count.saturating_add(
+                u64::try_from(secrets_doc.len()).map_err(|_| ServiceError::Corrupt)?,
+            );
+            profiles_doc.push(ConfigDocProfile {
+                id: profile.id.0,
+                name: profile.name.clone(),
+                description: profile.description.clone(),
+                activate_on_start: profile.activate_on_start,
+                secrets: secrets_doc,
+            });
+        }
+        profiles_doc.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok((profiles_doc, secret_count))
+    }
+
+    fn build_config_workspace_docs(
+        &self,
+        workspaces: &[WorkspaceView],
+    ) -> Result<(Vec<ConfigDocWorkspace>, u64), ServiceError> {
+        let mut membership_count = 0_u64;
+        let mut workspaces_doc = Vec::with_capacity(workspaces.len());
+        for workspace in workspaces {
+            let mut members = self
+                .profiles_in_workspace(&workspace.name)?
+                .into_iter()
+                .map(|profile| profile.name)
+                .collect::<Vec<_>>();
+            members.sort();
+            membership_count = membership_count
+                .saturating_add(u64::try_from(members.len()).map_err(|_| ServiceError::Corrupt)?);
+            workspaces_doc.push(ConfigDocWorkspace {
+                id: workspace.id.0,
+                name: workspace.name.clone(),
+                members,
+            });
+        }
+        workspaces_doc.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok((workspaces_doc, membership_count))
+    }
+
+    pub fn preview_config_import(
+        &self,
+        input_path: &Path,
+        strategy: ImportConflictStrategy,
+    ) -> Result<ConfigPreview, ServiceError> {
+        Ok(self.plan_config_import(input_path, strategy)?.preview)
+    }
+
+    pub fn commit_config_import(
+        &mut self,
+        input_path: &Path,
+        strategy: ImportConflictStrategy,
+        expected_plan_hash: &str,
+    ) -> Result<PortabilityImportSummary, ServiceError> {
+        validate_plan_hash(expected_plan_hash)?;
+        let plan = self.plan_config_import(input_path, strategy)?;
+        if !constant_time_text_eq(&plan.preview.plan_hash, expected_plan_hash) {
+            return Err(ServiceError::StaleImportPlan);
+        }
+        if plan.rejected {
+            return Err(ServiceError::Conflict);
+        }
+        let mut batch = ImportBatch::default();
+        let (profile_scope_ids, created_profiles) =
+            self.stage_config_profiles(&plan, &mut batch)?;
+        let (created_secrets, appended_versions, skipped) =
+            self.stage_config_secrets(&plan, &profile_scope_ids, &mut batch)?;
+        let created_workspaces = self.stage_config_workspaces(&plan, &mut batch)?;
+        let created_memberships =
+            u64::try_from(plan.new_memberships.len()).map_err(|_| ServiceError::Corrupt)?;
+        batch
+            .workspace_memberships
+            .clone_from(&plan.new_memberships);
+
+        self.store.apply_import_batch(&batch)?;
+        self.store.integrity_check()?;
+        self.validate_encrypted_metadata()
+            .map_err(|_| ServiceError::Corrupt)?;
+
+        let created = created_profiles
+            .saturating_add(created_secrets)
+            .saturating_add(created_workspaces)
+            .saturating_add(created_memberships);
+        Ok(PortabilityImportSummary {
+            package_id: None,
+            kind: None,
+            counts: plan.preview.counts,
+            created,
+            replaced: 0,
+            skipped,
+            versions_appended: appended_versions,
+        })
+    }
+
+    /// Stages scope+profile inserts for every profile the plan will create,
+    /// and records every profile's (new or existing) scope id so
+    /// `stage_config_secrets` knows where to place its secrets. Returns the
+    /// scope-id map and the number of profiles created.
+    fn stage_config_profiles(
+        &self,
+        plan: &ConfigPlan,
+        batch: &mut ImportBatch,
+    ) -> Result<(BTreeMap<String, ScopeId>, u64), ServiceError> {
+        let root_path = self.root_scope_path()?;
+        let mut profile_scope_ids: BTreeMap<String, ScopeId> = BTreeMap::new();
+        let mut created_profiles = 0_u64;
+        for doc_profile in &plan.document.profiles {
+            let normalized = normalize_name(&doc_profile.name)?;
+            let profile_id = *plan
+                .profile_ids
+                .get(&normalized)
+                .ok_or(ServiceError::Corrupt)?;
+            if plan.new_profiles.contains(&normalized) {
+                let scope_id = ScopeId(Uuid::new_v4());
+                let scope_path = format!("{root_path}/profile/{}", scope_id.0);
+                batch.scopes.push(ScopeRecord {
+                    id: scope_id,
+                    vault_id: self.vault_id,
+                    parent_id: Some(self.root_scope_id),
+                    kind: scope_policy::scope_kind_code(ScopeKind::Profile),
+                    encrypted_path: self.encrypt_entity_text(
+                        EntityKind::Scope,
+                        scope_id.0,
+                        "path",
+                        &scope_path,
+                    )?,
+                    path_lookup: lookup_digest(
+                        &self.master_key,
+                        SCOPE_LOOKUP_DOMAIN,
+                        scope_path.as_bytes(),
+                    )
+                    .to_vec(),
+                });
+                batch.profiles.push(ProfileRecord {
+                    id: profile_id,
+                    vault_id: self.vault_id,
+                    scope_id,
+                    encrypted_name: self.encrypt_entity_text(
+                        EntityKind::Profile,
+                        profile_id.0,
+                        "name",
+                        doc_profile.name.trim(),
+                    )?,
+                    name_lookup: lookup_digest(
+                        &self.master_key,
+                        PROFILE_LOOKUP_DOMAIN,
+                        normalized.as_bytes(),
+                    )
+                    .to_vec(),
+                    encrypted_description: self.encrypt_optional_entity_text(
+                        EntityKind::Profile,
+                        profile_id.0,
+                        "description",
+                        doc_profile.description.as_deref(),
+                    )?,
+                    activate_on_start: false,
+                    generation: 1,
+                });
+                profile_scope_ids.insert(normalized.clone(), scope_id);
+                created_profiles = created_profiles.saturating_add(1);
+            } else {
+                let lookup = lookup_digest(
+                    &self.master_key,
+                    PROFILE_LOOKUP_DOMAIN,
+                    normalized.as_bytes(),
+                );
+                let existing = self
+                    .store
+                    .profile_by_lookup(self.vault_id, &lookup)?
+                    .ok_or(ServiceError::Corrupt)?;
+                profile_scope_ids.insert(normalized.clone(), existing.scope_id);
+            }
+        }
+        Ok((profile_scope_ids, created_profiles))
+    }
+
+    /// Stages secret creates and version appends per `plan.secret_decisions`.
+    /// Returns `(created, appended, skipped)`.
+    fn stage_config_secrets(
+        &self,
+        plan: &ConfigPlan,
+        profile_scope_ids: &BTreeMap<String, ScopeId>,
+        batch: &mut ImportBatch,
+    ) -> Result<(u64, u64, u64), ServiceError> {
+        let mut created_secrets = 0_u64;
+        let mut appended_versions = 0_u64;
+        let mut skipped = 0_u64;
+        for decision in &plan.secret_decisions {
+            let scope_id = *profile_scope_ids
+                .get(&decision.profile_normalized)
+                .ok_or(ServiceError::Corrupt)?;
+            match decision.action {
+                ImportAction::Create => {
+                    let secret_normalized = normalize_name(&decision.entry.name)?;
+                    let id = SecretId(Uuid::new_v4());
+                    let secret = SecretRecord {
+                        id,
+                        scope_id,
+                        encrypted_name: self.encrypt_entity_text(
+                            EntityKind::Secret,
+                            id.0,
+                            "name",
+                            decision.entry.name.trim(),
+                        )?,
+                        name_lookup: lookup_digest(
+                            &self.master_key,
+                            SECRET_LOOKUP_DOMAIN,
+                            secret_normalized.as_bytes(),
+                        )
+                        .to_vec(),
+                        encrypted_description: self.encrypt_optional_entity_text(
+                            EntityKind::Secret,
+                            id.0,
+                            "description",
+                            decision.entry.description.as_deref(),
+                        )?,
+                        current_version: 1,
+                        status: 0,
+                    };
+                    let version = self.encrypt_secret_version(
+                        &secret,
+                        1,
+                        SecretBytes::new(decision.entry.value.clone().into_bytes()),
+                        None,
+                    )?;
+                    batch.secrets.push(secret);
+                    batch.secret_versions.push(version);
+                    created_secrets = created_secrets.saturating_add(1);
+                }
+                ImportAction::AppendVersion => {
+                    let existing = decision.existing.clone().ok_or(ServiceError::Corrupt)?;
+                    let next = existing
+                        .current_version
+                        .checked_add(1)
+                        .ok_or(ServiceError::Corrupt)?;
+                    let version = self.encrypt_secret_version(
+                        &existing,
+                        next,
+                        SecretBytes::new(decision.entry.value.clone().into_bytes()),
+                        None,
+                    )?;
+                    batch.version_appends.push(SecretVersionAppend {
+                        secret_id: existing.id,
+                        expected_current_version: existing.current_version,
+                        version,
+                    });
+                    appended_versions = appended_versions.saturating_add(1);
+                }
+                ImportAction::Skip => skipped = skipped.saturating_add(1),
+                ImportAction::Reject | ImportAction::Replace | ImportAction::Rename => {
+                    return Err(ServiceError::Corrupt);
+                }
+            }
+        }
+        Ok((created_secrets, appended_versions, skipped))
+    }
+
+    /// Stages workspace inserts for every workspace the plan will create.
+    /// Membership rows are staged directly onto `batch.workspace_memberships`
+    /// by the caller, since they need no per-row encryption.
+    fn stage_config_workspaces(
+        &self,
+        plan: &ConfigPlan,
+        batch: &mut ImportBatch,
+    ) -> Result<u64, ServiceError> {
+        let mut created_workspaces = 0_u64;
+        for doc_workspace in &plan.document.workspaces {
+            let normalized = normalize_name(&doc_workspace.name)?;
+            if !plan.new_workspaces.contains(&normalized) {
+                continue;
+            }
+            let id = *plan
+                .workspace_ids
+                .get(&normalized)
+                .ok_or(ServiceError::Corrupt)?;
+            batch.workspaces.push(WorkspaceRecord {
+                id,
+                vault_id: self.vault_id,
+                encrypted_name: self.encrypt_entity_text(
+                    EntityKind::Workspace,
+                    id.0,
+                    "name",
+                    doc_workspace.name.trim(),
+                )?,
+                name_lookup: lookup_digest(
+                    &self.master_key,
+                    scope_policy::WORKSPACE_LOOKUP_DOMAIN,
+                    normalized.as_bytes(),
+                )
+                .to_vec(),
+            });
+            created_workspaces = created_workspaces.saturating_add(1);
+        }
+        Ok(created_workspaces)
+    }
+
+    fn plan_config_import(
+        &self,
+        input_path: &Path,
+        strategy: ImportConflictStrategy,
+    ) -> Result<ConfigPlan, ServiceError> {
+        if !matches!(
+            strategy,
+            ImportConflictStrategy::Abort
+                | ImportConflictStrategy::Skip
+                | ImportConflictStrategy::Replace
+        ) {
+            return Err(ServiceError::InvalidImportStrategy);
+        }
+        let bytes = Zeroizing::new(
+            envault_platform::read_bounded_private_file(input_path, MAX_CONFIG_FILE_BYTES)
+                .map_err(|error| match error {
+                    envault_platform::PlatformError::FileTooLarge => {
+                        ServiceError::InvalidConfigFile
+                    }
+                    error => ServiceError::Platform(error),
+                })?,
+        );
+        let source_digest = *blake3::hash(&bytes).as_bytes();
+        let document: ConfigDocument =
+            serde_yaml::from_slice(&bytes).map_err(|_| ServiceError::InvalidConfigFile)?;
+        if document.version != CONFIG_DOCUMENT_VERSION
+            || document.profiles.len() > MAX_PORTABILITY_ENTITIES
+            || document.workspaces.len() > MAX_PORTABILITY_ENTITIES
+        {
+            return Err(ServiceError::InvalidConfigFile);
+        }
+
+        let profile_plan = self.plan_config_profiles(&document, strategy)?;
+        let workspace_plan = self.plan_config_workspaces(&document, &profile_plan.profile_ids)?;
+        self.finalize_config_plan(
+            document,
+            strategy,
+            source_digest,
+            profile_plan,
+            workspace_plan,
+        )
+    }
+
+    /// Builds the plan-hash fingerprint (via `ImportConflictView`
+    /// projections of every profile/secret/workspace/membership decision),
+    /// the summary counts, and the final `ConfigPlan` from the already
+    /// resolved profile and workspace sub-plans.
+    fn finalize_config_plan(
+        &self,
+        document: ConfigDocument,
+        strategy: ImportConflictStrategy,
+        source_digest: [u8; 32],
+        profile_plan: ConfigProfilePlan,
+        workspace_plan: ConfigWorkspacePlan,
+    ) -> Result<ConfigPlan, ServiceError> {
+        let mut conflicts = Vec::new();
+        for entry in &profile_plan.profile_entries {
+            conflicts.push(ImportConflictView {
+                resource: "profile".to_owned(),
+                name: entry.name.clone(),
+                action: entry.action,
+            });
+        }
+        for entry in &profile_plan.secret_entries {
+            conflicts.push(ImportConflictView {
+                resource: "secret".to_owned(),
+                name: format!("{}.{}", entry.profile, entry.name),
+                action: entry.action,
+            });
+        }
+        for entry in &workspace_plan.workspace_entries {
+            conflicts.push(ImportConflictView {
+                resource: "workspace".to_owned(),
+                name: entry.name.clone(),
+                action: entry.action,
+            });
+        }
+        for entry in &workspace_plan.membership_entries {
+            conflicts.push(ImportConflictView {
+                resource: "membership".to_owned(),
+                name: format!("{}.{}", entry.workspace, entry.profile),
+                action: entry.action,
+            });
+        }
+
+        let created_secrets = profile_plan
+            .secret_entries
+            .iter()
+            .filter(|entry| entry.action == ImportAction::Create)
+            .count();
+        let appended_secrets = profile_plan
+            .secret_entries
+            .iter()
+            .filter(|entry| entry.action == ImportAction::AppendVersion)
+            .count();
+        let counts = PortabilityCounts {
+            scopes: 0,
+            profiles: u64::try_from(profile_plan.new_profiles.len())
+                .map_err(|_| ServiceError::Corrupt)?,
+            secrets: u64::try_from(created_secrets).map_err(|_| ServiceError::Corrupt)?,
+            versions: u64::try_from(created_secrets.saturating_add(appended_secrets))
+                .map_err(|_| ServiceError::Corrupt)?,
+            workspaces: u64::try_from(workspace_plan.new_workspaces.len())
+                .map_err(|_| ServiceError::Corrupt)?,
+            memberships: u64::try_from(workspace_plan.new_memberships.len())
+                .map_err(|_| ServiceError::Corrupt)?,
+        };
+
+        let state_digest = self.destination_state_digest()?;
+        let plan_hash = self.compute_plan_hash(&PlanFingerprint {
+            kind: PlanKind::Config,
+            source_digest,
+            package_id: None,
+            destination_vault_id: self.vault_id,
+            destination_state_digest: state_digest,
+            profile_name: None,
+            strategy,
+            rename_to: None,
+            actions: &conflicts,
+        })?;
+
+        Ok(ConfigPlan {
+            preview: ConfigPreview {
+                source_vault_id: document.source_vault_id,
+                strategy,
+                counts,
+                profiles: profile_plan.profile_entries,
+                secrets: profile_plan.secret_entries,
+                workspaces: workspace_plan.workspace_entries,
+                memberships: workspace_plan.membership_entries,
+                plan_hash,
+                warnings: vec![
+                    "Values are redacted from preview output.".to_owned(),
+                    "The plaintext source file remains on disk after import.".to_owned(),
+                ],
+            },
+            rejected: profile_plan.rejected,
+            document,
+            profile_ids: profile_plan.profile_ids,
+            new_profiles: profile_plan.new_profiles,
+            secret_decisions: profile_plan.secret_decisions,
+            workspace_ids: workspace_plan.workspace_ids,
+            new_workspaces: workspace_plan.new_workspaces,
+            new_memberships: workspace_plan.new_memberships,
+        })
+    }
+
+    /// Per-profile (and per-secret-within-profile) plan: an existing profile
+    /// is never replaced, only merged into per the secret conflict strategy;
+    /// a missing profile is always created.
+    fn plan_config_profiles(
+        &self,
+        document: &ConfigDocument,
+        strategy: ImportConflictStrategy,
+    ) -> Result<ConfigProfilePlan, ServiceError> {
+        let mut profile_entries = Vec::new();
+        let mut secret_entries = Vec::new();
+        let mut secret_decisions = Vec::new();
+        let mut profile_ids = BTreeMap::new();
+        let mut new_profiles = BTreeSet::new();
+        let mut rejected = false;
+
+        for doc_profile in &document.profiles {
+            let normalized = normalize_name(&doc_profile.name)?;
+            let lookup = lookup_digest(
+                &self.master_key,
+                PROFILE_LOOKUP_DOMAIN,
+                normalized.as_bytes(),
+            );
+            let existing = self.store.profile_by_lookup(self.vault_id, &lookup)?;
+            let Some(record) = existing else {
+                profile_entries.push(ConfigProfileEntryView {
+                    name: doc_profile.name.clone(),
+                    action: ImportAction::Create,
+                });
+                let id = ProfileId(Uuid::new_v4());
+                profile_ids.insert(normalized.clone(), id);
+                new_profiles.insert(normalized.clone());
+                for doc_secret in &doc_profile.secrets {
+                    secret_entries.push(ConfigSecretEntryView {
+                        profile: doc_profile.name.clone(),
+                        name: doc_secret.name.clone(),
+                        action: ImportAction::Create,
+                    });
+                    secret_decisions.push(ConfigSecretDecision {
+                        profile_normalized: normalized.clone(),
+                        entry: doc_secret.clone(),
+                        existing: None,
+                        action: ImportAction::Create,
+                    });
+                }
+                continue;
+            };
+            profile_entries.push(ConfigProfileEntryView {
+                name: doc_profile.name.clone(),
+                action: ImportAction::Skip,
+            });
+            profile_ids.insert(normalized.clone(), record.id);
+            for doc_secret in &doc_profile.secrets {
+                let secret_normalized = normalize_name(&doc_secret.name)?;
+                let secret_lookup = lookup_digest(
+                    &self.master_key,
+                    SECRET_LOOKUP_DOMAIN,
+                    secret_normalized.as_bytes(),
+                );
+                let existing_secret = self
+                    .store
+                    .secret_by_lookup(record.scope_id, &secret_lookup)?;
+                let action = match (&existing_secret, strategy) {
+                    (None, _) => ImportAction::Create,
+                    (Some(_), ImportConflictStrategy::Skip) => ImportAction::Skip,
+                    (Some(secret), ImportConflictStrategy::Replace) if secret.status == 0 => {
+                        ImportAction::AppendVersion
+                    }
+                    (Some(_), ImportConflictStrategy::Abort | ImportConflictStrategy::Replace) => {
+                        ImportAction::Reject
+                    }
+                    (Some(_), ImportConflictStrategy::Rename) => {
+                        return Err(ServiceError::InvalidImportStrategy);
+                    }
+                };
+                if action == ImportAction::Reject {
+                    rejected = true;
+                }
+                secret_entries.push(ConfigSecretEntryView {
+                    profile: doc_profile.name.clone(),
+                    name: doc_secret.name.clone(),
+                    action,
+                });
+                secret_decisions.push(ConfigSecretDecision {
+                    profile_normalized: normalized.clone(),
+                    entry: doc_secret.clone(),
+                    existing: existing_secret,
+                    action,
+                });
+            }
+        }
+
+        Ok(ConfigProfilePlan {
+            profile_entries,
+            secret_entries,
+            secret_decisions,
+            profile_ids,
+            new_profiles,
+            rejected,
+        })
+    }
+
+    /// Per-workspace (and per-membership) plan. Config import only ever adds
+    /// workspaces/memberships the file mentions - it never removes an
+    /// existing membership the file is silent about, to avoid surprising
+    /// deletions on a partial/scoped import.
+    fn plan_config_workspaces(
+        &self,
+        document: &ConfigDocument,
+        profile_ids: &BTreeMap<String, ProfileId>,
+    ) -> Result<ConfigWorkspacePlan, ServiceError> {
+        let mut workspace_entries = Vec::new();
+        let mut membership_entries = Vec::new();
+        let mut workspace_ids = BTreeMap::new();
+        let mut new_workspaces = BTreeSet::new();
+        let mut new_memberships = Vec::new();
+        for doc_workspace in &document.workspaces {
+            let normalized = normalize_name(&doc_workspace.name)?;
+            let workspace_id = match self.workspace_by_name(&doc_workspace.name) {
+                Ok(view) => {
+                    workspace_entries.push(ConfigWorkspaceEntryView {
+                        name: doc_workspace.name.clone(),
+                        action: ImportAction::Skip,
+                    });
+                    view.id
+                }
+                Err(ServiceError::NotFound) => {
+                    workspace_entries.push(ConfigWorkspaceEntryView {
+                        name: doc_workspace.name.clone(),
+                        action: ImportAction::Create,
+                    });
+                    new_workspaces.insert(normalized.clone());
+                    WorkspaceId(Uuid::new_v4())
+                }
+                Err(error) => return Err(error),
+            };
+            workspace_ids.insert(normalized.clone(), workspace_id);
+            let existing_members = self.store.profiles_in_workspace(workspace_id)?;
+            for member in &doc_workspace.members {
+                let member_normalized = normalize_name(member)?;
+                let profile_id = *profile_ids
+                    .get(&member_normalized)
+                    .ok_or(ServiceError::InvalidConfigFile)?;
+                let already_member = existing_members
+                    .iter()
+                    .any(|profile| profile.id == profile_id);
+                let action = if already_member {
+                    ImportAction::Skip
+                } else {
+                    new_memberships.push((workspace_id, profile_id));
+                    ImportAction::Create
+                };
+                membership_entries.push(ConfigMembershipEntryView {
+                    workspace: doc_workspace.name.clone(),
+                    profile: member.clone(),
+                    action,
+                });
+            }
+        }
+
+        Ok(ConfigWorkspacePlan {
+            workspace_entries,
+            membership_entries,
+            workspace_ids,
+            new_workspaces,
+            new_memberships,
+        })
+    }
+
+    fn root_scope_path(&self) -> Result<String, ServiceError> {
+        let root = self
+            .store
+            .scope_by_id(self.root_scope_id)?
+            .ok_or(ServiceError::Corrupt)?;
+        self.decrypt_entity_text(EntityKind::Scope, root.id.0, "path", &root.encrypted_path)
+    }
+
     fn build_export_payload(
         &self,
         package_id: Uuid,
@@ -609,6 +1494,22 @@ impl VaultSession {
         let scopes = self.export_scopes(&all_scopes, &selected_scope_ids)?;
         let profiles = self.export_profiles(&profile_records)?;
         let secrets = self.export_secrets(package_id, transfer_key, &selected_scope_ids)?;
+        let (workspaces, memberships) = match kind {
+            PackageKind::Profile => (Vec::new(), Vec::new()),
+            PackageKind::Workspace => {
+                let workspaces = self.export_workspaces(&self.store.workspaces()?)?;
+                let memberships = self
+                    .store
+                    .all_workspace_memberships()?
+                    .into_iter()
+                    .map(|(workspace_id, profile_id)| PortableWorkspaceMembership {
+                        workspace_id,
+                        profile_id,
+                    })
+                    .collect();
+                (workspaces, memberships)
+            }
+        };
         Ok(PackagePayload {
             version: PACKAGE_VERSION,
             package_id,
@@ -618,7 +1519,29 @@ impl VaultSession {
             scopes,
             profiles,
             secrets,
+            workspaces,
+            memberships,
         })
+    }
+
+    fn export_workspaces(
+        &self,
+        workspace_records: &[WorkspaceRecord],
+    ) -> Result<Vec<PortableWorkspace>, ServiceError> {
+        workspace_records
+            .iter()
+            .map(|workspace| {
+                Ok(PortableWorkspace {
+                    id: workspace.id,
+                    name: self.decrypt_entity_text(
+                        EntityKind::Workspace,
+                        workspace.id.0,
+                        "name",
+                        &workspace.encrypted_name,
+                    )?,
+                })
+            })
+            .collect()
     }
 
     fn export_scopes(
@@ -758,6 +1681,7 @@ impl VaultSession {
             }
         };
         let plan_hash = self.compute_plan_hash(&PlanFingerprint {
+            kind: PlanKind::Package,
             source_digest: loaded.source_digest,
             package_id: Some(loaded.envelope.package_id),
             destination_vault_id: self.vault_id,
@@ -970,7 +1894,44 @@ impl VaultSession {
         )?;
         self.append_import_profiles(payload, plan, &mut batch)?;
         self.append_import_secrets(loaded, plan, &mut batch)?;
+        self.append_import_workspaces(payload, plan, &mut batch)?;
         Ok(batch)
+    }
+
+    fn append_import_workspaces(
+        &self,
+        payload: &PackagePayload,
+        plan: &PackagePlan,
+        batch: &mut ImportBatch,
+    ) -> Result<(), ServiceError> {
+        if payload.kind != PackageKind::Workspace {
+            return Ok(());
+        }
+        for workspace in &payload.workspaces {
+            batch.workspaces.push(WorkspaceRecord {
+                id: workspace.id,
+                vault_id: self.vault_id,
+                encrypted_name: self.encrypt_entity_text(
+                    EntityKind::Workspace,
+                    workspace.id.0,
+                    "name",
+                    &workspace.name,
+                )?,
+                name_lookup: lookup_digest(
+                    &self.master_key,
+                    scope_policy::WORKSPACE_LOOKUP_DOMAIN,
+                    normalize_name(&workspace.name)?.as_bytes(),
+                )
+                .to_vec(),
+            });
+        }
+        for membership in &payload.memberships {
+            let profile_id = mapped(&plan.ids.profiles, membership.profile_id)?;
+            batch
+                .workspace_memberships
+                .push((membership.workspace_id, profile_id));
+        }
+        Ok(())
     }
 
     fn append_import_scopes(
@@ -1278,6 +2239,7 @@ impl VaultSession {
         }
         let state_digest = self.destination_state_digest()?;
         let plan_hash = self.compute_plan_hash(&PlanFingerprint {
+            kind: PlanKind::Env,
             source_digest,
             package_id: None,
             destination_vault_id: self.vault_id,
@@ -1382,13 +2344,29 @@ impl VaultSession {
                 hash_state_field(&mut hasher, &version.created_at.to_be_bytes());
             }
         }
+        let mut workspaces = self.store.workspaces()?;
+        workspaces.sort_by_key(|record| record.id);
+        for record in workspaces {
+            hash_state_field(&mut hasher, b"workspace");
+            hash_state_field(&mut hasher, record.id.0.as_bytes());
+            hash_state_field(&mut hasher, &record.encrypted_name);
+            hash_state_field(&mut hasher, &record.name_lookup);
+        }
+        let mut memberships = self.store.all_workspace_memberships()?;
+        memberships.sort();
+        for (workspace_id, profile_id) in memberships {
+            hash_state_field(&mut hasher, b"workspace_membership");
+            hash_state_field(&mut hasher, workspace_id.0.as_bytes());
+            hash_state_field(&mut hasher, profile_id.0.as_bytes());
+        }
         Ok(*hasher.finalize().as_bytes())
     }
 
     fn workspace_is_portably_empty(&self) -> Result<bool, ServiceError> {
         Ok(self.store.scopes()?.len() == 1
             && self.store.profiles()?.len() == 1
-            && self.store.secrets()?.is_empty())
+            && self.store.secrets()?.is_empty()
+            && self.store.workspaces()?.is_empty())
     }
 
     fn destination_base_profile(&self) -> Result<ProfileRecord, ServiceError> {
@@ -1940,6 +2918,10 @@ fn payload_counts(payload: &PackagePayload) -> Result<PortabilityCounts, Service
                 .sum::<usize>(),
         )
         .map_err(|_| ServiceError::InvalidPackage)?,
+        workspaces: u64::try_from(payload.workspaces.len())
+            .map_err(|_| ServiceError::InvalidPackage)?,
+        memberships: u64::try_from(payload.memberships.len())
+            .map_err(|_| ServiceError::InvalidPackage)?,
     })
 }
 
@@ -2812,6 +3794,123 @@ mod tests {
             b"postgres://private"
         );
         assert_eq!(base_secret.id, imported_base.id);
+    }
+
+    #[test]
+    fn workspace_package_import_preserves_workspace_and_membership_bindings() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let source_path = directory.path().join("source.db");
+        let destination_path = directory.path().join("destination.db");
+        let package_path = directory.path().join("workspace.envault-workspace");
+        let mut source = test_session(&source_path);
+        source.create_profile("alpha", None).expect("profile alpha");
+        source.create_profile("beta", None).expect("profile beta");
+        source.create_workspace("team").expect("workspace");
+        source
+            .bind_profile_to_workspace("team", "alpha")
+            .expect("bind alpha");
+        source
+            .bind_profile_to_workspace("team", "beta")
+            .expect("bind beta");
+        let transfer = SensitiveInput::copy_from_slice(TRANSFER_PASSWORD);
+        let summary = source
+            .export_package(
+                PackageKind::Workspace,
+                None,
+                &package_path,
+                Some(&transfer),
+                &[],
+            )
+            .expect("export");
+        assert_eq!(summary.counts.workspaces, 1);
+        assert_eq!(summary.counts.memberships, 2);
+
+        let mut destination = test_session(&destination_path);
+        let preview = destination
+            .preview_package_import(
+                &package_path,
+                Some(&transfer),
+                None,
+                ImportConflictStrategy::Replace,
+                None,
+            )
+            .expect("preview");
+        destination
+            .commit_package_import(
+                &package_path,
+                Some(&transfer),
+                None,
+                ImportConflictStrategy::Replace,
+                None,
+                &preview.plan_hash,
+            )
+            .expect("commit");
+
+        let workspaces = destination.workspaces().expect("workspaces");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].name, "team");
+        let members = destination.profiles_in_workspace("team").expect("members");
+        let mut member_names = members
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect::<Vec<_>>();
+        member_names.sort();
+        assert_eq!(member_names, vec!["alpha".to_owned(), "beta".to_owned()]);
+    }
+
+    #[test]
+    fn workspace_import_plan_goes_stale_on_concurrent_membership_change() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let source_path = directory.path().join("source.db");
+        let destination_path = directory.path().join("destination.db");
+        let package_path = directory.path().join("workspace.envault-workspace");
+        let mut source = test_session(&source_path);
+        source.create_profile("alpha", None).expect("profile alpha");
+        source.create_workspace("team").expect("workspace");
+        source
+            .bind_profile_to_workspace("team", "alpha")
+            .expect("bind alpha");
+        let transfer = SensitiveInput::copy_from_slice(TRANSFER_PASSWORD);
+        source
+            .export_package(
+                PackageKind::Workspace,
+                None,
+                &package_path,
+                Some(&transfer),
+                &[],
+            )
+            .expect("export");
+
+        let mut destination = test_session(&destination_path);
+        let preview = destination
+            .preview_package_import(
+                &package_path,
+                Some(&transfer),
+                None,
+                ImportConflictStrategy::Replace,
+                None,
+            )
+            .expect("preview");
+
+        // Concurrent workspace/membership change between preview and commit.
+        destination
+            .create_workspace("concurrent")
+            .expect("concurrent workspace");
+        destination
+            .bind_profile_to_workspace("concurrent", "base")
+            .expect("concurrent bind");
+
+        assert!(matches!(
+            destination.commit_package_import(
+                &package_path,
+                Some(&transfer),
+                None,
+                ImportConflictStrategy::Replace,
+                None,
+                &preview.plan_hash,
+            ),
+            Err(ServiceError::StaleImportPlan)
+        ));
     }
 
     #[test]

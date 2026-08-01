@@ -21,6 +21,7 @@ pub const MAX_PORTABILITY_KEY_SLOTS: usize = 32;
 pub const MAX_ENV_FILE_BYTES: usize = 1024 * 1024;
 pub const MAX_ENV_LINE_BYTES: usize = 64 * 1024;
 pub const MAX_SECRET_VALUE_BYTES: usize = 512 * 1024;
+pub const MAX_CONFIG_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct VaultId(pub Uuid);
@@ -37,19 +38,22 @@ pub struct SecretId(pub Uuid);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SecretVersionId(pub Uuid);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct WorkspaceId(pub Uuid);
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum EntityKind {
     Profile,
     Scope,
     Secret,
     SecretVersion,
+    Workspace,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ScopeKind {
     Root,
     Profile,
-    Workspace,
     Project,
 }
 
@@ -152,6 +156,12 @@ pub struct ScopeView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceView {
+    pub id: WorkspaceId,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProfileSession {
     pub profile_id: ProfileId,
     pub scope_id: ScopeId,
@@ -189,6 +199,8 @@ pub struct PortabilityCounts {
     pub profiles: u64,
     pub secrets: u64,
     pub versions: u64,
+    pub workspaces: u64,
+    pub memberships: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -253,6 +265,71 @@ pub struct PlaintextExportSummary {
     pub profile: String,
     pub output_path: String,
     pub secret_count: u64,
+}
+
+/// Scopes a plaintext `config export`/`config import` (YAML or `.env`) to
+/// the whole vault, a named set of profiles, or a named set of workspaces
+/// (and the profiles that are members of at least one of them). Shared
+/// between the CLI, the wire protocol, and the service layer - there is no
+/// separate "wire" variant of this type.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigSelector {
+    Vault,
+    Profiles(Vec<String>),
+    Workspaces(Vec<String>),
+}
+
+/// Distinguishes the two plaintext `config export`/`config import` formats
+/// on the wire. `encrypted` is deliberately not a variant here - it stays on
+/// the existing `ExportPackage`/`Preview|CommitPackageImport` operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigFormat {
+    Yaml,
+    Env,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConfigProfileEntryView {
+    pub name: String,
+    pub action: ImportAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConfigSecretEntryView {
+    pub profile: String,
+    pub name: String,
+    pub action: ImportAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConfigWorkspaceEntryView {
+    pub name: String,
+    pub action: ImportAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConfigMembershipEntryView {
+    pub workspace: String,
+    pub profile: String,
+    pub action: ImportAction,
+}
+
+/// Shaped like `PortabilityPreview`, but describing a plaintext `config
+/// import` plan: per-profile, per-secret, per-workspace, and per-membership
+/// entries instead of opaque package conflicts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConfigPreview {
+    pub source_vault_id: Uuid,
+    pub strategy: ImportConflictStrategy,
+    pub counts: PortabilityCounts,
+    pub profiles: Vec<ConfigProfileEntryView>,
+    pub secrets: Vec<ConfigSecretEntryView>,
+    pub workspaces: Vec<ConfigWorkspaceEntryView>,
+    pub memberships: Vec<ConfigMembershipEntryView>,
+    pub plan_hash: String,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

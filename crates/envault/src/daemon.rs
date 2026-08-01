@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use envault_core::validate_admin_lease;
+use envault_core::{ConfigFormat, validate_admin_lease};
 use envault_protocol::{
     AdminLeaseStatus, AuthenticatedRequest, BootstrapRequest, DaemonStatus, ErrorKind,
     HttpConstraint, Operation, PROTOCOL_VERSION, Reply, Request, Response, ResponseBody,
@@ -1015,7 +1015,10 @@ impl RuntimeState {
             operation @ (Operation::CreateWorkspace { .. }
             | Operation::ListWorkspaces
             | Operation::ShowWorkspace { .. }
-            | Operation::LoadWorkspace { .. }) => self.handle_workspace(peer, operation),
+            | Operation::LoadWorkspace { .. }
+            | Operation::BindProfileToWorkspace { .. }
+            | Operation::UnbindProfileFromWorkspace { .. }
+            | Operation::DeleteWorkspace { .. }) => self.handle_workspace(peer, operation),
             operation @ (Operation::CreateSecret { .. }
             | Operation::CreateGeneratedSecret { .. }
             | Operation::ListSecrets
@@ -1032,7 +1035,10 @@ impl RuntimeState {
             | Operation::CommitPackageImport { .. }
             | Operation::PreviewEnvImport { .. }
             | Operation::CommitEnvImport { .. }
-            | Operation::ExportPlaintextEnv { .. }) => self.handle_portability(peer, operation),
+            | Operation::ExportPlaintextEnv { .. }
+            | Operation::ExportConfig { .. }
+            | Operation::PreviewConfigImport { .. }
+            | Operation::CommitConfigImport { .. }) => self.handle_portability(peer, operation),
             Operation::HttpRequest { .. }
             | Operation::AdminUnlock { .. }
             | Operation::IssueRevealToken { .. } => Err(RuntimeFailure::Internal),
@@ -1071,15 +1077,23 @@ impl RuntimeState {
                 name,
                 description,
                 workspace,
-            } => Reply::Profile(
-                match &workspace {
-                    Some(workspace) => {
-                        vault.create_profile_in_workspace(workspace, &name, description.as_deref())
-                    }
-                    None => vault.create_profile(&name, description.as_deref()),
+            } => {
+                if let Some(workspace) = &workspace {
+                    vault
+                        .workspace_by_name(workspace)
+                        .map_err(|error| map_service_failure(&error))?;
                 }
-                .map_err(|error| map_service_failure(&error))?,
-            ),
+                let profile = vault
+                    .create_profile(&name, description.as_deref())
+                    .map_err(|error| map_service_failure(&error))?;
+                if let Some(workspace) = &workspace
+                    && let Err(error) = vault.bind_profile_to_workspace(workspace, &name)
+                {
+                    let _ = vault.delete_profile(&name);
+                    return Err(map_service_failure(&error));
+                }
+                Reply::Profile(profile)
+            }
             Operation::UpdateProfile {
                 name,
                 description,
@@ -1152,6 +1166,23 @@ impl RuntimeState {
                     .load_workspace(&name)
                     .map_err(|error| map_service_failure(&error))?,
             ),
+            Operation::BindProfileToWorkspace { workspace, profile } => {
+                vault
+                    .bind_profile_to_workspace(&workspace, &profile)
+                    .map_err(|error| map_service_failure(&error))?;
+                Reply::Acknowledged { no_op: false }
+            }
+            Operation::UnbindProfileFromWorkspace { workspace, profile } => {
+                vault
+                    .unbind_profile_from_workspace(&workspace, &profile)
+                    .map_err(|error| map_service_failure(&error))?;
+                Reply::Acknowledged { no_op: false }
+            }
+            Operation::DeleteWorkspace { name } => match vault.delete_workspace(&name) {
+                Ok(()) => Reply::Acknowledged { no_op: false },
+                Err(ServiceError::NotFound) => Reply::Acknowledged { no_op: true },
+                Err(error) => return Err(map_service_failure(&error)),
+            },
             _ => return Err(RuntimeFailure::Internal),
         };
         Ok((reply, false))
@@ -1294,9 +1325,59 @@ impl RuntimeState {
             | Operation::ExportPlaintextEnv { .. } => {
                 Self::handle_env_portability_operation(vault, operation)?
             }
+            Operation::ExportConfig { .. }
+            | Operation::PreviewConfigImport { .. }
+            | Operation::CommitConfigImport { .. } => {
+                Self::handle_config_portability_operation(vault, operation)?
+            }
             _ => return Err(RuntimeFailure::Internal),
         };
         Ok((reply, false))
+    }
+
+    fn handle_config_portability_operation(
+        vault: &mut VaultSession,
+        operation: Operation,
+    ) -> Result<Reply, RuntimeFailure> {
+        match operation {
+            Operation::ExportConfig {
+                selector,
+                format: ConfigFormat::Yaml,
+                output_path,
+            } => Ok(Reply::PortabilityExport(
+                vault
+                    .export_config_yaml(selector, Path::new(&output_path))
+                    .map_err(|error| map_service_failure(&error))?,
+            )),
+            Operation::PreviewConfigImport {
+                format: ConfigFormat::Yaml,
+                input_path,
+                strategy,
+            } => Ok(Reply::ConfigPlan(
+                vault
+                    .preview_config_import(Path::new(&input_path), strategy)
+                    .map_err(|error| map_service_failure(&error))?,
+            )),
+            Operation::CommitConfigImport {
+                format: ConfigFormat::Yaml,
+                input_path,
+                strategy,
+                expected_plan_hash,
+            } => Ok(Reply::PortabilityImport(
+                vault
+                    .commit_config_import(Path::new(&input_path), strategy, &expected_plan_hash)
+                    .map_err(|error| map_service_failure(&error))?,
+            )),
+            // `--format env` never reaches the daemon under `ExportConfig`/
+            // `Preview|CommitConfigImport` - the CLI dispatches that branch
+            // to the existing `ExportPlaintextEnv`/`Preview|CommitEnvImport`
+            // operations client-side instead (see `main.rs`'s `config`
+            // handlers).
+            Operation::ExportConfig { .. }
+            | Operation::PreviewConfigImport { .. }
+            | Operation::CommitConfigImport { .. } => Err(RuntimeFailure::InvalidInput),
+            _ => Err(RuntimeFailure::Internal),
+        }
     }
 
     fn handle_package_operation(
@@ -1536,6 +1617,7 @@ fn map_service_failure(error: &ServiceError) -> RuntimeFailure {
         ServiceError::PackageAuthenticationFailed => RuntimeFailure::PackageAuthenticationFailed,
         ServiceError::InvalidImportStrategy
         | ServiceError::InvalidEnvFile { .. }
+        | ServiceError::InvalidConfigFile
         | ServiceError::PlaintextExportUnsupported => RuntimeFailure::InvalidInput,
         ServiceError::StaleImportPlan => RuntimeFailure::StaleImportPlan,
         ServiceError::PlaintextAcknowledgementRequired => {

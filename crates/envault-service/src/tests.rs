@@ -512,18 +512,18 @@ fn scope_override_tombstone_and_profile_binding_are_deterministic() {
 #[test]
 fn nested_scope_cycles_fail_unlock_closed() {
     let (_directory, path, password, mut session) = initialized();
-    let workspace = session
-        .create_scope(session.root_scope_id(), ScopeKind::Workspace, "workspace")
-        .expect("workspace");
-    let project = session
-        .create_scope(workspace.id, ScopeKind::Project, "project")
-        .expect("project");
+    let outer = session
+        .create_scope(session.root_scope_id(), ScopeKind::Project, "outer")
+        .expect("outer project");
+    let inner = session
+        .create_scope(outer.id, ScopeKind::Project, "inner")
+        .expect("inner project");
     drop(session);
     let connection = rusqlite::Connection::open(&path).expect("open database");
     connection
         .execute(
             "UPDATE scope SET parent_id = ?1 WHERE id = ?2",
-            rusqlite::params![project.id.0.as_bytes(), workspace.id.0.as_bytes()],
+            rusqlite::params![inner.id.0.as_bytes(), outer.id.0.as_bytes()],
         )
         .expect("create cycle");
     drop(connection);
@@ -533,25 +533,139 @@ fn nested_scope_cycles_fail_unlock_closed() {
     ));
 }
 
+/// Workspace membership is a plain join table, entirely outside the
+/// integrity checks `unlock` runs over the scope/profile tree - so a
+/// membership row referencing a deleted profile does not, and should not,
+/// fail unlock closed. Coverage for that corruption shape lives at the
+/// store layer instead (`delete_profile_and_scope` cannot leave such a row
+/// behind because `workspace_membership.profile_id` is a foreign key with
+/// no `ON DELETE CASCADE`: deleting a profile that still has memberships
+/// fails closed with `StoreError::Integrity`, exercised by
+/// `deleting_profile_with_workspace_memberships_fails_closed` below).
 #[test]
-fn profile_scope_rebinding_fails_unlock_closed() {
-    let (_directory, path, password, mut session) = initialized();
-    let profile = session.create_profile("protected", None).expect("profile");
-    let workspace = session
-        .create_scope(session.root_scope_id(), ScopeKind::Workspace, "workspace")
-        .expect("workspace");
-    drop(session);
-    let connection = rusqlite::Connection::open(&path).expect("open database");
-    connection
-        .execute(
-            "UPDATE profile SET scope_id = ?1 WHERE id = ?2",
-            rusqlite::params![workspace.id.0.as_bytes(), profile.id.0.as_bytes()],
-        )
-        .expect("rebind profile");
-    drop(connection);
+fn workspace_membership_spans_multiple_workspaces_and_survives_unbind() {
+    let (_directory, _path, _password, mut session) = initialized();
+    session.create_workspace("blue").expect("workspace blue");
+    session.create_workspace("green").expect("workspace green");
+    session
+        .create_profile("alpha", None)
+        .expect("profile alpha");
+    session.create_profile("beta", None).expect("profile beta");
+
+    session
+        .bind_profile_to_workspace("blue", "alpha")
+        .expect("bind alpha to blue");
+    session
+        .bind_profile_to_workspace("blue", "beta")
+        .expect("bind beta to blue");
+    session
+        .bind_profile_to_workspace("green", "alpha")
+        .expect("bind alpha to green");
+
+    let mut blue_members = session
+        .profiles_in_workspace("blue")
+        .expect("blue members")
+        .into_iter()
+        .map(|profile| profile.name)
+        .collect::<Vec<_>>();
+    blue_members.sort();
+    assert_eq!(blue_members, vec!["alpha".to_string(), "beta".to_string()]);
+
+    let green_members = session
+        .profiles_in_workspace("green")
+        .expect("green members")
+        .into_iter()
+        .map(|profile| profile.name)
+        .collect::<Vec<_>>();
+    assert_eq!(green_members, vec!["alpha".to_string()]);
+
+    let mut loaded = session
+        .load_workspace("blue")
+        .expect("load blue")
+        .into_iter()
+        .map(|profile| profile.name)
+        .collect::<Vec<_>>();
+    loaded.sort();
+    assert_eq!(loaded, vec!["alpha".to_string(), "beta".to_string()]);
+
+    session
+        .unbind_profile_from_workspace("blue", "beta")
+        .expect("unbind beta from blue");
+    let blue_members = session
+        .profiles_in_workspace("blue")
+        .expect("blue members after unbind")
+        .into_iter()
+        .map(|profile| profile.name)
+        .collect::<Vec<_>>();
+    assert_eq!(blue_members, vec!["alpha".to_string()]);
+    // `alpha` is still bound to `green` - unbinding from `blue` must not
+    // touch its other memberships.
+    assert_eq!(
+        session
+            .profiles_in_workspace("green")
+            .expect("green members unaffected")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn deleting_profile_with_workspace_memberships_fails_closed() {
+    let (_directory, _path, _password, mut session) = initialized();
+    session.create_workspace("blue").expect("workspace blue");
+    let profile = session
+        .create_profile("alpha", None)
+        .expect("profile alpha");
+    session
+        .bind_profile_to_workspace("blue", "alpha")
+        .expect("bind alpha to blue");
+
+    // The profile still has a workspace_membership row referencing it; the
+    // store's foreign key (no ON DELETE CASCADE) must reject the delete
+    // rather than silently orphaning or cascading it away.
     assert!(matches!(
-        VaultSession::unlock(&path, &password),
-        Err(ServiceError::Corrupt)
+        session.delete_profile("alpha"),
+        Err(ServiceError::Store(_))
+    ));
+
+    session
+        .unbind_profile_from_workspace("blue", "alpha")
+        .expect("unbind alpha from blue");
+    session.delete_profile("alpha").expect("delete now clean");
+    assert!(matches!(
+        session.profile("alpha"),
+        Err(ServiceError::NotFound)
+    ));
+    let _ = profile;
+}
+
+#[test]
+fn workspace_names_are_unique_and_deletion_requires_empty_membership() {
+    let (_directory, _path, _password, mut session) = initialized();
+    session.create_workspace("blue").expect("workspace blue");
+    assert!(matches!(
+        session.create_workspace("blue"),
+        Err(ServiceError::Conflict)
+    ));
+
+    session
+        .create_profile("alpha", None)
+        .expect("profile alpha");
+    session
+        .bind_profile_to_workspace("blue", "alpha")
+        .expect("bind alpha to blue");
+    assert!(matches!(
+        session.delete_workspace("blue"),
+        Err(ServiceError::Store(_))
+    ));
+
+    session
+        .unbind_profile_from_workspace("blue", "alpha")
+        .expect("unbind alpha from blue");
+    session.delete_workspace("blue").expect("delete workspace");
+    assert!(matches!(
+        session.workspace_by_name("blue"),
+        Err(ServiceError::NotFound)
     ));
 }
 

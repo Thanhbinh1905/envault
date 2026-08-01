@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    fs,
+    env, fs,
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -10,9 +10,10 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum};
 use envault::client::{self, ClientError};
 use envault_core::{
-    EnvImportPreview, GeneratorFormat, GeneratorLength, GeneratorSpec, ImportConflictStrategy,
-    PackageKind, PlaintextExportSummary, PortabilityExportSummary, PortabilityImportSummary,
-    PortabilityPreview, ProfileView, ScopeView, SecretVersionView, SecretView,
+    ConfigFormat, ConfigPreview, ConfigSelector, EnvImportPreview, GeneratorFormat,
+    GeneratorLength, GeneratorSpec, ImportConflictStrategy, PackageKind, PlaintextExportSummary,
+    PortabilityExportSummary, PortabilityImportSummary, PortabilityPreview, ProfileView,
+    SecretVersionView, SecretView, WorkspaceView,
 };
 use envault_protocol::{
     AdminLeaseStatus, DaemonStatus, EnvVar, ErrorKind, HttpConstraint, HttpContentType, HttpMethod,
@@ -72,6 +73,10 @@ enum Command {
         #[command(subcommand)]
         command: PortabilityCommand,
     },
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
@@ -85,6 +90,7 @@ enum Command {
         command: SessionCommand,
     },
     Run(RunArgs),
+    Uninstall(UninstallArgs),
     /// Not part of the public command surface (absent from `--help` and
     /// `commands.toml`) - built only via the `internal-completions` feature,
     /// which the release workflow enables solely to render shell completion
@@ -199,6 +205,30 @@ enum AdminCommand {
     Lock,
 }
 
+#[derive(Debug, clap::Args)]
+struct UninstallArgs {
+    #[command(flatten)]
+    password: PasswordArgs,
+    #[arg(
+        long,
+        help = "Skip the interactive \"are you sure?\" confirmation prompt"
+    )]
+    yes: bool,
+    #[arg(
+        long,
+        conflicts_with = "backup_path",
+        help = "Do not export a backup before deleting all local EnVault data"
+    )]
+    skip_backup: bool,
+    #[arg(
+        short = 'O',
+        long,
+        value_name = "PATH",
+        help = "Export a backup to this path before deleting all local data, without prompting"
+    )]
+    backup_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Subcommand)]
 enum RequestCommand {
     Http(HttpRequestArgs),
@@ -227,11 +257,157 @@ enum PortabilityCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    Export(ConfigExportArgs),
+    Import(ConfigImportArgs),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ConfigFormatArg {
+    Yaml,
+    Env,
+    Encrypted,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum ConfigKindArg {
+    #[default]
+    Vault,
+    Profile,
+    Workspace,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum ConfigConflictStrategyArg {
+    #[default]
+    Abort,
+    Skip,
+    Replace,
+    Rename,
+}
+
+#[derive(Debug, clap::Args)]
+struct ConfigExportArgs {
+    #[arg(
+        short = 'F',
+        long,
+        value_enum,
+        help = "Output format: full-fidelity YAML, flat .env (single profile), or an encrypted package"
+    )]
+    format: ConfigFormatArg,
+    #[arg(
+        short = 'k',
+        long,
+        value_enum,
+        default_value_t = ConfigKindArg::Vault,
+        help = "Scope: the whole vault, named profiles, or named workspaces"
+    )]
+    kind: ConfigKindArg,
+    #[arg(
+        short = 'n',
+        long = "name",
+        help = "Profile or workspace name to include; repeat for multiple (required unless --kind vault)"
+    )]
+    names: Vec<String>,
+    #[arg(short = 'd', long, default_value = ".", help = "Destination directory")]
+    output_dir: PathBuf,
+    #[arg(
+        short = 'f',
+        long,
+        help = "File name within --output-dir (default: export.<ext> for the chosen format)"
+    )]
+    file_name: Option<String>,
+    #[command(flatten)]
+    password: TransferPasswordArgs,
+    #[arg(
+        short = 'a',
+        long = "age-recipient",
+        value_name = "RECIPIENT",
+        help = "Add an age recipient key slot; repeat for multiple recipients (--format encrypted only)"
+    )]
+    age_recipients: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct ConfigImportArgs {
+    #[arg(
+        value_name = "FILE",
+        help = "YAML, .env, or encrypted package to import"
+    )]
+    input_file: PathBuf,
+    #[arg(short = 'F', long, value_enum, help = "Format of the input file")]
+    format: ConfigFormatArg,
+    #[arg(
+        short = 'k',
+        long,
+        value_enum,
+        default_value_t = ConfigKindArg::Vault,
+        help = "Expected package kind (--format encrypted only): vault or profile"
+    )]
+    kind: ConfigKindArg,
+    #[arg(
+        short = 'n',
+        long = "name",
+        help = "Destination profile (--format env only, exactly one)"
+    )]
+    names: Vec<String>,
+    #[command(flatten)]
+    password: TransferPasswordArgs,
+    #[arg(
+        short = 'i',
+        long,
+        value_name = "FILE",
+        help = "Private age identity file used to unwrap a package key slot (--format encrypted only)"
+    )]
+    age_identity: Option<PathBuf>,
+    #[arg(
+        short = 'S',
+        long,
+        value_enum,
+        default_value_t = ConfigConflictStrategyArg::Abort,
+        help = "Conflict strategy for existing profiles, secrets, and workspace membership"
+    )]
+    strategy: ConfigConflictStrategyArg,
+    #[arg(
+        short = 'r',
+        long,
+        value_name = "PROFILE",
+        help = "Destination profile for rename, or an existing renamed profile for replace (--format encrypted, --kind profile only)"
+    )]
+    rename_to: Option<String>,
+    #[arg(
+        short = 'c',
+        long,
+        requires = "plan_hash",
+        help = "Atomically apply a previously previewed import plan"
+    )]
+    commit: bool,
+    #[arg(
+        short = 'H',
+        long,
+        value_name = "HASH",
+        requires = "commit",
+        allow_hyphen_values = true,
+        help = "Exact plan hash returned by the latest preview"
+    )]
+    plan_hash: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
 enum WorkspaceCommand {
     Create(NameArgs),
     List,
     Show(NameArgs),
     Load(NameArgs),
+    Bind(WorkspaceMembershipArgs),
+    Unbind(WorkspaceMembershipArgs),
+    Delete(NameArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct WorkspaceMembershipArgs {
+    workspace: String,
+    profile: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -700,10 +876,12 @@ fn main() -> ExitCode {
             command: RequestCommand::Http(arguments),
         } => http_request(cli.output, arguments),
         Command::Portability { command } => portability_command(cli.output, command),
+        Command::Config { command } => config_command(cli.output, command),
         Command::Workspace { command } => workspace_command(cli.output, command),
         Command::ConvenienceUnlock { command } => convenience_unlock_command(cli.output, command),
         Command::Session { command } => session_command(cli.output, command),
         Command::Run(arguments) => run_command(cli.output, arguments),
+        Command::Uninstall(arguments) => uninstall_command(cli.output, &arguments),
         #[cfg(feature = "internal-completions")]
         Command::Completions(arguments) => completions(arguments.shell),
     }
@@ -842,6 +1020,227 @@ fn resolve_start_password(password_stdin: bool) -> Result<SensitiveBytes, Struct
         }
     }
     read_master_password(password_stdin, false)
+}
+
+/// Permanently removes every local trace of `EnVault`: the vault database, the
+/// daemon's runtime socket/lock directory, and (if convenience unlock was
+/// enabled) the master password stored in the OS credential store. This does
+/// not touch the installed binaries themselves - see the "Upgrade and
+/// uninstall" section of `docs/INSTALLATION.md`.
+#[allow(clippy::too_many_lines)]
+fn uninstall_command(output: Output, arguments: &UninstallArgs) -> ExitCode {
+    let database_path = match vault_database_path() {
+        Ok(path) => path,
+        Err(error) => return print_error(output, &error),
+    };
+    let vault_exists = database_path.exists();
+
+    // Proving the caller holds the master password gates the whole
+    // operation on the same authority as every other admin-level command,
+    // even when the caller ends up declining the backup below. The admin
+    // lease acquired here is also what `ExportPackage` requires later.
+    if vault_exists {
+        let password = match read_master_password(arguments.password.password_stdin, false) {
+            Ok(password) => password,
+            Err(error) => return print_error(output, &error),
+        };
+        if let Err(error) = client::start(password.clone()) {
+            return print_error(output, &client_error(error));
+        }
+        match client::request(Operation::AdminUnlock {
+            password,
+            ttl_minutes: Some(envault_core::DEFAULT_ADMIN_LEASE_MINUTES),
+        }) {
+            Ok(Reply::AdminStatus(_)) => {}
+            Ok(_) => return print_error(output, &unexpected_response()),
+            Err(error) => return print_error(output, &client_error(error)),
+        }
+    }
+
+    if !arguments.yes {
+        match confirm(
+            "This permanently deletes the EnVault vault database, daemon runtime state, and any \
+             stored convenience-unlock credential on this machine. This cannot be undone. \
+             Continue? [y/N] ",
+            false,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                println!("uninstall: aborted");
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => return print_error(output, &error),
+        }
+    }
+
+    if vault_exists && !arguments.skip_backup {
+        let backup_path = match arguments.backup_path.clone() {
+            Some(path) => Some(path),
+            None => match confirm(
+                "Export a backup of everything before deleting? [Y/n] ",
+                true,
+            ) {
+                Ok(true) => match prompt_line("Backup path (default: ~): ") {
+                    Ok(input) => match resolve_backup_path(&input) {
+                        Ok(path) => Some(path),
+                        Err(error) => return print_error(output, &error),
+                    },
+                    Err(error) => return print_error(output, &error),
+                },
+                Ok(false) => None,
+                Err(error) => return print_error(output, &error),
+            },
+        };
+        if let Some(backup_path) = backup_path {
+            let transfer_password_args = TransferPasswordArgs {
+                transfer_password: true,
+                transfer_password_stdin: arguments.password.password_stdin,
+            };
+            let operation = match build_export_request(
+                PackageKind::Workspace,
+                None,
+                &backup_path,
+                transfer_password_args,
+                Vec::new(),
+            ) {
+                Ok(operation) => operation,
+                Err(error) => return print_error(output, &error),
+            };
+            match client::request(operation) {
+                Ok(Reply::PortabilityExport(summary)) => {
+                    print_portability_export(output, &summary);
+                }
+                Ok(_) => return print_error(output, &unexpected_response()),
+                Err(error) => return print_error(output, &client_error(error)),
+            }
+        }
+    }
+
+    match client::request(Operation::Stop) {
+        Ok(Reply::Acknowledged { .. }) | Err(ClientError::NotRunning) => {}
+        Ok(_) => return print_error(output, &unexpected_response()),
+        Err(error) => return print_error(output, &client_error(error)),
+    }
+
+    if let Err(error) = convenience_unlock::disable(&convenience_unlock::RealKeystore) {
+        return print_error(
+            output,
+            &input_error(
+                "io_error",
+                &format!("failed to remove the stored convenience-unlock credential: {error}"),
+            ),
+        );
+    }
+
+    let Ok(runtime_directory) = envault_platform::runtime_directory() else {
+        return print_error(
+            output,
+            &input_error(
+                "io_error",
+                "unable to resolve the EnVault runtime directory",
+            ),
+        );
+    };
+    if let Err(error) = remove_directory_tree(&runtime_directory) {
+        return print_error(output, &error);
+    }
+    if let Err(error) = remove_directory_tree(database_path.parent().unwrap_or(&database_path)) {
+        return print_error(output, &error);
+    }
+
+    match output {
+        Output::Human => println!("envault: uninstalled - all local vault data has been removed"),
+        Output::Json => println!("{{\"status\":\"uninstalled\"}}"),
+        Output::Toon => println!("envault{{status}}: uninstalled"),
+    }
+    ExitCode::SUCCESS
+}
+
+fn confirm(prompt: &str, default: bool) -> Result<bool, StructuredError> {
+    if !io::stdin().is_terminal() {
+        return Err(input_error(
+            "interactive_terminal_required",
+            "use `--yes` and either `--skip-backup` or `--backup-path` when standard input is not a terminal",
+        ));
+    }
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|_| input_error("io_error", "failed to write the confirmation prompt"))?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|_| input_error("io_error", "failed to read the confirmation response"))?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    Ok(matches!(trimmed.to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+fn prompt_line(prompt: &str) -> Result<String, StructuredError> {
+    if !io::stdin().is_terminal() {
+        return Err(input_error(
+            "interactive_terminal_required",
+            "use `--backup-path` when standard input is not a terminal",
+        ));
+    }
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|_| input_error("io_error", "failed to write the prompt"))?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|_| input_error("io_error", "failed to read the response"))?;
+    Ok(line.trim().to_owned())
+}
+
+/// Resolves the user's answer to the "backup path" prompt: an empty answer
+/// or a bare `~` defaults to the home directory, and any directory (existing
+/// or the home-directory default) gets a generated package file name
+/// appended so the export always has a concrete destination file.
+fn resolve_backup_path(input: &str) -> Result<PathBuf, StructuredError> {
+    let trimmed = input.trim();
+    let expanded = if trimmed.is_empty() || trimmed == "~" {
+        let home = env::var_os("HOME").ok_or_else(|| {
+            input_error(
+                "io_error",
+                "unable to resolve the home directory; pass --backup-path instead",
+            )
+        })?;
+        PathBuf::from(home)
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        let home = env::var_os("HOME").ok_or_else(|| {
+            input_error(
+                "io_error",
+                "unable to resolve the home directory; pass --backup-path instead",
+            )
+        })?;
+        PathBuf::from(home).join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if expanded.is_dir() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        Ok(expanded.join(format!("envault-backup-{timestamp}.envault-workspace")))
+    } else {
+        Ok(expanded)
+    }
+}
+
+fn remove_directory_tree(path: &Path) -> Result<(), StructuredError> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(input_error(
+            "io_error",
+            &format!("failed to remove {}: {error}", path.display()),
+        )),
+    }
 }
 
 fn convenience_unlock_command(output: Output, command: ConvenienceUnlockCommand) -> ExitCode {
@@ -1347,19 +1746,81 @@ fn workspace_command(output: Output, command: WorkspaceCommand) -> ExitCode {
                 Err(error) => print_error(output, &client_error(error)),
             }
         }
+        WorkspaceCommand::Bind(arguments) => {
+            match client::request(Operation::BindProfileToWorkspace {
+                workspace: arguments.workspace,
+                profile: arguments.profile,
+            }) {
+                Ok(Reply::Acknowledged { no_op }) => {
+                    print_acknowledgement(output, "workspace_profile_bound", no_op)
+                }
+                Ok(_) => print_error(output, &unexpected_response()),
+                Err(error) => print_error(output, &client_error(error)),
+            }
+        }
+        WorkspaceCommand::Unbind(arguments) => {
+            match client::request(Operation::UnbindProfileFromWorkspace {
+                workspace: arguments.workspace,
+                profile: arguments.profile,
+            }) {
+                Ok(Reply::Acknowledged { no_op }) => {
+                    print_acknowledgement(output, "workspace_profile_unbound", no_op)
+                }
+                Ok(_) => print_error(output, &unexpected_response()),
+                Err(error) => print_error(output, &client_error(error)),
+            }
+        }
+        WorkspaceCommand::Delete(arguments) => {
+            match client::request(Operation::DeleteWorkspace {
+                name: arguments.name,
+            }) {
+                Ok(Reply::Acknowledged { no_op }) => {
+                    print_acknowledgement(output, "workspace_deleted", no_op)
+                }
+                Ok(_) => print_error(output, &unexpected_response()),
+                Err(error) => print_error(output, &client_error(error)),
+            }
+        }
     }
 }
 
-fn print_workspace_scope(output: Output, scope: &ScopeView) -> ExitCode {
+fn print_workspace_scope(output: Output, workspace: &WorkspaceView) -> ExitCode {
     match output {
-        Output::Human => println!("workspace: {} · id: {}", scope.path, scope.id.0),
+        Output::Human => println!("workspace: {} · id: {}", workspace.name, workspace.id.0),
         Output::Json => println!(
             "{}",
-            serde_json::json!({ "path": scope.path, "id": scope.id.0.to_string() })
+            serde_json::json!({ "name": workspace.name, "id": workspace.id.0.to_string() })
         ),
-        Output::Toon => println!("workspace{{path,id}}: {},{}", scope.path, scope.id.0),
+        Output::Toon => println!(
+            "workspace{{name,id}}: {},{}",
+            workspace.name, workspace.id.0
+        ),
     }
     ExitCode::SUCCESS
+}
+
+fn build_export_request(
+    kind: PackageKind,
+    profile_name: Option<String>,
+    output_file: &Path,
+    password_arguments: TransferPasswordArgs,
+    age_recipients: Vec<String>,
+) -> Result<Operation, StructuredError> {
+    let transfer_password = read_optional_transfer_password(password_arguments, true)?;
+    if transfer_password.is_none() && age_recipients.is_empty() {
+        return Err(input_error(
+            "package_credential_required",
+            "choose a transfer password or at least one age recipient",
+        ));
+    }
+    let output_path = protocol_path(output_file)?;
+    Ok(Operation::ExportPackage {
+        kind,
+        profile_name,
+        output_path,
+        transfer_password,
+        age_recipients,
+    })
 }
 
 fn export_package(
@@ -1370,30 +1831,17 @@ fn export_package(
     password_arguments: TransferPasswordArgs,
     age_recipients: Vec<String>,
 ) -> ExitCode {
-    let transfer_password = match read_optional_transfer_password(password_arguments, true) {
-        Ok(password) => password,
-        Err(error) => return print_error(output, &error),
-    };
-    if transfer_password.is_none() && age_recipients.is_empty() {
-        return print_error(
-            output,
-            &input_error(
-                "package_credential_required",
-                "choose a transfer password or at least one age recipient",
-            ),
-        );
-    }
-    let output_path = match protocol_path(output_file) {
-        Ok(path) => path,
-        Err(error) => return print_error(output, &error),
-    };
-    match client::request(Operation::ExportPackage {
+    let operation = match build_export_request(
         kind,
         profile_name,
-        output_path,
-        transfer_password,
+        output_file,
+        password_arguments,
         age_recipients,
-    }) {
+    ) {
+        Ok(operation) => operation,
+        Err(error) => return print_error(output, &error),
+    };
+    match client::request(operation) {
         Ok(Reply::PortabilityExport(summary)) => print_portability_export(output, &summary),
         Ok(_) => print_error(output, &unexpected_response()),
         Err(error) => print_error(output, &client_error(error)),
@@ -1533,6 +1981,418 @@ fn export_plaintext_env(output: Output, arguments: PlaintextExportArgs) -> ExitC
         Ok(_) => print_error(output, &unexpected_response()),
         Err(error) => print_error(output, &client_error(error)),
     }
+}
+
+fn config_command(output: Output, command: ConfigCommand) -> ExitCode {
+    match command {
+        ConfigCommand::Export(arguments) => export_config(output, arguments),
+        ConfigCommand::Import(arguments) => import_config(output, arguments),
+    }
+}
+
+fn default_config_file_name(format: ConfigFormatArg, kind: ConfigKindArg) -> &'static str {
+    match format {
+        ConfigFormatArg::Yaml => "export.yml",
+        ConfigFormatArg::Env => "export.env",
+        ConfigFormatArg::Encrypted => match kind {
+            ConfigKindArg::Vault | ConfigKindArg::Workspace => "export.envault-workspace",
+            ConfigKindArg::Profile => "export.envault-profile",
+        },
+    }
+}
+
+fn export_config(output: Output, arguments: ConfigExportArgs) -> ExitCode {
+    let output_file =
+        arguments
+            .output_dir
+            .join(arguments.file_name.clone().unwrap_or_else(|| {
+                default_config_file_name(arguments.format, arguments.kind).to_owned()
+            }));
+    match arguments.format {
+        ConfigFormatArg::Yaml => export_config_yaml(output, &arguments, &output_file),
+        ConfigFormatArg::Env => export_config_env(output, &arguments, &output_file),
+        ConfigFormatArg::Encrypted => export_config_encrypted(output, arguments, &output_file),
+    }
+}
+
+fn export_config_yaml(
+    output: Output,
+    arguments: &ConfigExportArgs,
+    output_file: &Path,
+) -> ExitCode {
+    let selector = match arguments.kind {
+        ConfigKindArg::Vault => {
+            if !arguments.names.is_empty() {
+                return print_error(
+                    output,
+                    &input_error(
+                        "invalid_input",
+                        "--name is not accepted with `--kind vault`",
+                    ),
+                );
+            }
+            ConfigSelector::Vault
+        }
+        ConfigKindArg::Profile => {
+            if arguments.names.is_empty() {
+                return print_error(
+                    output,
+                    &input_error(
+                        "invalid_input",
+                        "`--kind profile` requires at least one `--name`",
+                    ),
+                );
+            }
+            ConfigSelector::Profiles(arguments.names.clone())
+        }
+        ConfigKindArg::Workspace => {
+            if arguments.names.is_empty() {
+                return print_error(
+                    output,
+                    &input_error(
+                        "invalid_input",
+                        "`--kind workspace` requires at least one `--name`",
+                    ),
+                );
+            }
+            ConfigSelector::Workspaces(arguments.names.clone())
+        }
+    };
+    let output_path = match protocol_path(output_file) {
+        Ok(path) => path,
+        Err(error) => return print_error(output, &error),
+    };
+    match client::request(Operation::ExportConfig {
+        selector,
+        format: ConfigFormat::Yaml,
+        output_path,
+    }) {
+        Ok(Reply::PortabilityExport(summary)) => print_portability_export(output, &summary),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn export_config_env(output: Output, arguments: &ConfigExportArgs, output_file: &Path) -> ExitCode {
+    if arguments.kind != ConfigKindArg::Profile && arguments.kind != ConfigKindArg::Vault {
+        return print_error(
+            output,
+            &input_error(
+                "invalid_input",
+                "`--format env` requires `--kind profile` (a flat .env file holds exactly one profile)",
+            ),
+        );
+    }
+    let [name] = arguments.names.as_slice() else {
+        return print_error(
+            output,
+            &input_error(
+                "invalid_input",
+                "`--format env` requires exactly one `--name`",
+            ),
+        );
+    };
+    let output_path = match protocol_path(output_file) {
+        Ok(path) => path,
+        Err(error) => return print_error(output, &error),
+    };
+    match client::request(Operation::ExportPlaintextEnv {
+        profile_name: name.clone(),
+        output_path,
+        allow_plaintext: true,
+    }) {
+        Ok(Reply::PlaintextExport(summary)) => print_plaintext_export(output, &summary),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn export_config_encrypted(
+    output: Output,
+    arguments: ConfigExportArgs,
+    output_file: &Path,
+) -> ExitCode {
+    let (kind, profile_name) = match arguments.kind {
+        ConfigKindArg::Vault => (PackageKind::Workspace, None),
+        ConfigKindArg::Profile => {
+            let [name] = arguments.names.as_slice() else {
+                return print_error(
+                    output,
+                    &input_error(
+                        "invalid_input",
+                        "`--format encrypted --kind profile` requires exactly one `--name`",
+                    ),
+                );
+            };
+            (PackageKind::Profile, Some(name.clone()))
+        }
+        ConfigKindArg::Workspace => {
+            return print_error(
+                output,
+                &input_error(
+                    "invalid_input",
+                    "`--format encrypted` does not support `--kind workspace`; use `--kind vault` for the whole encrypted vault package",
+                ),
+            );
+        }
+    };
+    export_package(
+        output,
+        kind,
+        profile_name,
+        output_file,
+        arguments.password,
+        arguments.age_recipients,
+    )
+}
+
+fn config_import_strategy(strategy: ConfigConflictStrategyArg) -> ImportConflictStrategy {
+    match strategy {
+        ConfigConflictStrategyArg::Abort => ImportConflictStrategy::Abort,
+        ConfigConflictStrategyArg::Skip => ImportConflictStrategy::Skip,
+        ConfigConflictStrategyArg::Replace => ImportConflictStrategy::Replace,
+        ConfigConflictStrategyArg::Rename => ImportConflictStrategy::Rename,
+    }
+}
+
+fn import_config(output: Output, arguments: ConfigImportArgs) -> ExitCode {
+    let strategy = config_import_strategy(arguments.strategy);
+    match arguments.format {
+        ConfigFormatArg::Yaml => import_config_yaml(output, arguments, strategy),
+        ConfigFormatArg::Env => import_config_env(output, arguments, strategy),
+        ConfigFormatArg::Encrypted => import_config_encrypted(output, arguments, strategy),
+    }
+}
+
+fn import_config_yaml(
+    output: Output,
+    arguments: ConfigImportArgs,
+    strategy: ImportConflictStrategy,
+) -> ExitCode {
+    if !matches!(
+        strategy,
+        ImportConflictStrategy::Abort
+            | ImportConflictStrategy::Skip
+            | ImportConflictStrategy::Replace
+    ) {
+        return print_error(
+            output,
+            &input_error(
+                "invalid_input",
+                "`--format yaml` does not support `--strategy rename`",
+            ),
+        );
+    }
+    let input_path = match protocol_path(&arguments.input_file) {
+        Ok(path) => path,
+        Err(error) => return print_error(output, &error),
+    };
+    let operation = if arguments.commit {
+        Operation::CommitConfigImport {
+            format: ConfigFormat::Yaml,
+            input_path,
+            strategy,
+            expected_plan_hash: arguments
+                .plan_hash
+                .expect("clap requires a plan hash for commit"),
+        }
+    } else {
+        Operation::PreviewConfigImport {
+            format: ConfigFormat::Yaml,
+            input_path,
+            strategy,
+        }
+    };
+    match client::request(operation) {
+        Ok(Reply::ConfigPlan(preview)) => print_config_preview(output, &preview),
+        Ok(Reply::PortabilityImport(summary)) => print_portability_import(output, &summary),
+        Ok(_) => print_error(output, &unexpected_response()),
+        Err(error) => print_error(output, &client_error(error)),
+    }
+}
+
+fn import_config_env(
+    output: Output,
+    arguments: ConfigImportArgs,
+    strategy: ImportConflictStrategy,
+) -> ExitCode {
+    if !matches!(
+        strategy,
+        ImportConflictStrategy::Abort
+            | ImportConflictStrategy::Skip
+            | ImportConflictStrategy::Replace
+    ) {
+        return print_error(
+            output,
+            &input_error(
+                "invalid_input",
+                "`--format env` does not support `--strategy rename`",
+            ),
+        );
+    }
+    let [name] = arguments.names.as_slice() else {
+        return print_error(
+            output,
+            &input_error(
+                "invalid_input",
+                "`--format env` requires exactly one `--name`",
+            ),
+        );
+    };
+    let name = name.clone();
+    import_env(
+        output,
+        EnvImportArgs {
+            name,
+            input_file: arguments.input_file,
+            strategy: match strategy {
+                ImportConflictStrategy::Abort => EnvConflictStrategyArg::Abort,
+                ImportConflictStrategy::Skip => EnvConflictStrategyArg::Skip,
+                ImportConflictStrategy::Replace => EnvConflictStrategyArg::Replace,
+                ImportConflictStrategy::Rename => unreachable!("rejected above"),
+            },
+            commit: arguments.commit,
+            plan_hash: arguments.plan_hash,
+        },
+    )
+}
+
+fn import_config_encrypted(
+    output: Output,
+    arguments: ConfigImportArgs,
+    strategy: ImportConflictStrategy,
+) -> ExitCode {
+    match arguments.kind {
+        ConfigKindArg::Vault => import_package(
+            output,
+            PackageImportRequest {
+                expected_kind: PackageKind::Workspace,
+                input_file: arguments.input_file,
+                password: arguments.password,
+                age_identity: arguments.age_identity,
+                strategy: import_workspace_strategy(match strategy {
+                    ImportConflictStrategy::Abort => WorkspaceConflictStrategyArg::Abort,
+                    ImportConflictStrategy::Replace => WorkspaceConflictStrategyArg::Replace,
+                    ImportConflictStrategy::Skip | ImportConflictStrategy::Rename => {
+                        return print_error(
+                            output,
+                            &input_error(
+                                "invalid_input",
+                                "`--format encrypted --kind vault` only supports `--strategy abort|replace`",
+                            ),
+                        );
+                    }
+                }),
+                rename_to: None,
+                commit: arguments.commit,
+                plan_hash: arguments.plan_hash,
+            },
+        ),
+        ConfigKindArg::Profile => import_package(
+            output,
+            PackageImportRequest {
+                expected_kind: PackageKind::Profile,
+                input_file: arguments.input_file,
+                password: arguments.password,
+                age_identity: arguments.age_identity,
+                strategy,
+                rename_to: arguments.rename_to,
+                commit: arguments.commit,
+                plan_hash: arguments.plan_hash,
+            },
+        ),
+        ConfigKindArg::Workspace => print_error(
+            output,
+            &input_error(
+                "invalid_input",
+                "`--format encrypted` does not support `--kind workspace`; use `--kind vault` for the whole encrypted vault package",
+            ),
+        ),
+    }
+}
+
+fn print_config_preview(output: Output, preview: &ConfigPreview) -> ExitCode {
+    match output {
+        Output::Human => {
+            println!(
+                "config import: preview · profiles: {} · secrets: {} · workspaces: {} · memberships: {} · strategy: {:?}",
+                preview.counts.profiles,
+                preview.counts.secrets,
+                preview.counts.workspaces,
+                preview.counts.memberships,
+                preview.strategy
+            );
+            for entry in &preview.profiles {
+                println!("profile: {} · action: {:?}", entry.name, entry.action);
+            }
+            for entry in &preview.secrets {
+                println!(
+                    "secret: {}.{} · action: {:?}",
+                    entry.profile, entry.name, entry.action
+                );
+            }
+            for entry in &preview.workspaces {
+                println!("workspace: {} · action: {:?}", entry.name, entry.action);
+            }
+            for entry in &preview.memberships {
+                println!(
+                    "membership: {}.{} · action: {:?}",
+                    entry.workspace, entry.profile, entry.action
+                );
+            }
+            println!("plan_hash: {}", preview.plan_hash);
+            println!(
+                "commit: repeat the command with `--commit --plan-hash {}`",
+                preview.plan_hash
+            );
+            for warning in &preview.warnings {
+                println!("warning: {warning}");
+            }
+        }
+        Output::Json => print_json(preview),
+        Output::Toon => {
+            println!(
+                "config_import{{status,profiles,secrets,workspaces,memberships,strategy,plan_hash}}: preview,{},{},{},{},{:?},{}",
+                preview.counts.profiles,
+                preview.counts.secrets,
+                preview.counts.workspaces,
+                preview.counts.memberships,
+                preview.strategy,
+                preview.plan_hash
+            );
+            for entry in &preview.profiles {
+                println!(
+                    "profile{{name,action}}: {},{:?}",
+                    toon_string(&entry.name),
+                    entry.action
+                );
+            }
+            for entry in &preview.secrets {
+                println!(
+                    "secret{{profile,name,action}}: {},{},{:?}",
+                    toon_string(&entry.profile),
+                    toon_string(&entry.name),
+                    entry.action
+                );
+            }
+            for entry in &preview.workspaces {
+                println!(
+                    "workspace{{name,action}}: {},{:?}",
+                    toon_string(&entry.name),
+                    entry.action
+                );
+            }
+            for entry in &preview.memberships {
+                println!(
+                    "membership{{workspace,profile,action}}: {},{},{:?}",
+                    toon_string(&entry.workspace),
+                    toon_string(&entry.profile),
+                    entry.action
+                );
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// No arm here may issue `Operation::RevealSecretValue` or print a
@@ -2358,22 +3218,26 @@ fn vault_database_path() -> Result<PathBuf, StructuredError> {
 fn print_portability_export(output: Output, summary: &PortabilityExportSummary) -> ExitCode {
     match output {
         Output::Human => println!(
-            "package: exported · kind: {:?} · id: {} · profiles: {} · secrets: {} · versions: {} · path: {}",
+            "package: exported · kind: {:?} · id: {} · profiles: {} · secrets: {} · versions: {} · workspaces: {} · memberships: {} · path: {}",
             summary.kind,
             summary.package_id,
             summary.counts.profiles,
             summary.counts.secrets,
             summary.counts.versions,
+            summary.counts.workspaces,
+            summary.counts.memberships,
             summary.output_path
         ),
         Output::Json => print_json(summary),
         Output::Toon => println!(
-            "package{{status,kind,id,profiles,secrets,versions,password_slots,age_slots,path}}: exported,{:?},{},{},{},{},{},{},{}",
+            "package{{status,kind,id,profiles,secrets,versions,workspaces,memberships,password_slots,age_slots,path}}: exported,{:?},{},{},{},{},{},{},{},{},{}",
             summary.kind,
             summary.package_id,
             summary.counts.profiles,
             summary.counts.secrets,
             summary.counts.versions,
+            summary.counts.workspaces,
+            summary.counts.memberships,
             summary.password_slots,
             summary.age_slots,
             toon_string(&summary.output_path)
@@ -2386,11 +3250,13 @@ fn print_portability_preview(output: Output, preview: &PortabilityPreview) -> Ex
     match output {
         Output::Human => {
             println!(
-                "import: preview · kind: {:?} · profiles: {} · secrets: {} · versions: {} · strategy: {:?}",
+                "import: preview · kind: {:?} · profiles: {} · secrets: {} · versions: {} · workspaces: {} · memberships: {} · strategy: {:?}",
                 preview.kind,
                 preview.counts.profiles,
                 preview.counts.secrets,
                 preview.counts.versions,
+                preview.counts.workspaces,
+                preview.counts.memberships,
                 preview.strategy
             );
             for conflict in &preview.conflicts {
@@ -2411,11 +3277,13 @@ fn print_portability_preview(output: Output, preview: &PortabilityPreview) -> Ex
         Output::Json => print_json(preview),
         Output::Toon => {
             println!(
-                "import{{status,kind,profiles,secrets,versions,strategy,plan_hash}}: preview,{:?},{},{},{},{:?},{}",
+                "import{{status,kind,profiles,secrets,versions,workspaces,memberships,strategy,plan_hash}}: preview,{:?},{},{},{},{},{},{:?},{}",
                 preview.kind,
                 preview.counts.profiles,
                 preview.counts.secrets,
                 preview.counts.versions,
+                preview.counts.workspaces,
+                preview.counts.memberships,
                 preview.strategy,
                 preview.plan_hash
             );
@@ -2806,6 +3674,7 @@ impl JsonPrintable for PortabilityPreview {}
 impl JsonPrintable for EnvImportPreview {}
 impl JsonPrintable for PortabilityImportSummary {}
 impl JsonPrintable for PlaintextExportSummary {}
+impl JsonPrintable for ConfigPreview {}
 impl JsonPrintable for HttpResponse {}
 
 fn print_json<T: JsonPrintable + ?Sized>(value: &T) {
@@ -3239,10 +4108,12 @@ mod tests {
                 "secret",
                 "request",
                 "portability",
+                "config",
                 "workspace",
                 "convenience-unlock",
                 "session",
-                "run"
+                "run",
+                "uninstall"
             ]
         );
     }

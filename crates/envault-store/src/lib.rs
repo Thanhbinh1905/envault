@@ -2,13 +2,13 @@
 
 use std::{path::Path, time::Duration};
 
-use envault_core::{ProfileId, ScopeId, SecretId, SecretVersionId, VaultId};
+use envault_core::{ProfileId, ScopeId, SecretId, SecretVersionId, VaultId, WorkspaceId};
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, backup::Backup, params,
 };
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug)]
 pub struct Store {
@@ -45,6 +45,14 @@ pub struct ProfileRecord {
     pub encrypted_description: Option<Vec<u8>>,
     pub activate_on_start: bool,
     pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceRecord {
+    pub id: WorkspaceId,
+    pub vault_id: VaultId,
+    pub encrypted_name: Vec<u8>,
+    pub name_lookup: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,6 +124,8 @@ pub struct ImportBatch {
     pub secrets: Vec<SecretRecord>,
     pub secret_versions: Vec<SecretVersionRecord>,
     pub version_appends: Vec<SecretVersionAppend>,
+    pub workspaces: Vec<WorkspaceRecord>,
+    pub workspace_memberships: Vec<(WorkspaceId, ProfileId)>,
 }
 
 impl Default for ImportBatch {
@@ -129,6 +139,8 @@ impl Default for ImportBatch {
             secrets: Vec::new(),
             secret_versions: Vec::new(),
             version_appends: Vec::new(),
+            workspaces: Vec::new(),
+            workspace_memberships: Vec::new(),
         }
     }
 }
@@ -396,6 +408,124 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_scope(&transaction, scope)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn create_workspace(&mut self, workspace: &WorkspaceRecord) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_workspace(&transaction, workspace)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn workspaces(&self) -> Result<Vec<WorkspaceRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, vault_id, encrypted_name, name_lookup
+             FROM workspace ORDER BY rowid",
+        )?;
+        statement
+            .query_map([], map_workspace)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn workspace_by_lookup(
+        &self,
+        vault_id: VaultId,
+        lookup: &[u8],
+    ) -> Result<Option<WorkspaceRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, vault_id, encrypted_name, name_lookup
+                 FROM workspace WHERE vault_id = ?1 AND name_lookup = ?2",
+                params![id_bytes(vault_id.0), lookup],
+                map_workspace,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn add_workspace_membership(
+        &mut self,
+        workspace_id: WorkspaceId,
+        profile_id: ProfileId,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO workspace_membership (workspace_id, profile_id) VALUES (?1, ?2)",
+            params![id_bytes(workspace_id.0), id_bytes(profile_id.0)],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_workspace_membership(
+        &mut self,
+        workspace_id: WorkspaceId,
+        profile_id: ProfileId,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "DELETE FROM workspace_membership WHERE workspace_id = ?1 AND profile_id = ?2",
+            params![id_bytes(workspace_id.0), id_bytes(profile_id.0)],
+        )?;
+        expect_single_change(changed)
+    }
+
+    pub fn profiles_in_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<ProfileRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT profile.id, profile.vault_id, profile.scope_id, profile.encrypted_name,
+                    profile.name_lookup, profile.encrypted_description,
+                    profile.activate_on_start, profile.generation
+             FROM profile
+             JOIN workspace_membership ON workspace_membership.profile_id = profile.id
+             WHERE workspace_membership.workspace_id = ?1
+             ORDER BY profile.rowid",
+        )?;
+        statement
+            .query_map(params![id_bytes(workspace_id.0)], map_profile)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Every `(workspace_id, profile_id)` membership pair in the vault, in one
+    /// query - used by the portability layer to avoid N+1 lookups when
+    /// exporting/digesting the whole workspace/membership state.
+    pub fn all_workspace_memberships(&self) -> Result<Vec<(WorkspaceId, ProfileId)>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT workspace_id, profile_id FROM workspace_membership
+             ORDER BY workspace_id, profile_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((WorkspaceId(read_id(row, 0)?), ProfileId(read_id(row, 1)?)))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn delete_workspace(&mut self, workspace_id: WorkspaceId) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let member_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM workspace_membership WHERE workspace_id = ?1",
+            params![id_bytes(workspace_id.0)],
+            |row| row.get(0),
+        )?;
+        if member_count != 0 {
+            return Err(StoreError::Integrity);
+        }
+        let changed = transaction.execute(
+            "DELETE FROM workspace WHERE id = ?1",
+            params![id_bytes(workspace_id.0)],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Integrity);
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -668,6 +798,15 @@ impl Store {
         for profile in &batch.profiles {
             insert_profile(&transaction, profile)?;
         }
+        for workspace in &batch.workspaces {
+            insert_workspace(&transaction, workspace)?;
+        }
+        for (workspace_id, profile_id) in &batch.workspace_memberships {
+            transaction.execute(
+                "INSERT INTO workspace_membership (workspace_id, profile_id) VALUES (?1, ?2)",
+                params![id_bytes(workspace_id.0), id_bytes(profile_id.0)],
+            )?;
+        }
         for secret in &batch.secrets {
             insert_secret(&transaction, secret)?;
         }
@@ -738,7 +877,7 @@ impl Store {
         }
         if current == 0 {
             let transaction = self.connection.transaction()?;
-            transaction.execute_batch(SCHEMA_V3)?;
+            transaction.execute_batch(SCHEMA_V4)?;
             transaction.commit()?;
         } else if current == 1 {
             let vault_count: i64 =
@@ -756,10 +895,13 @@ impl Store {
                  DROP TABLE scope;
                  DROP TABLE vault;",
             )?;
-            transaction.execute_batch(SCHEMA_V3)?;
+            transaction.execute_batch(SCHEMA_V4)?;
             transaction.commit()?;
         } else if current == 2 {
             self.migrate_v2_to_v3()?;
+            self.migrate_v3_to_v4()?;
+        } else if current == 3 {
+            self.migrate_v3_to_v4()?;
         }
         Ok(())
     }
@@ -788,9 +930,34 @@ impl Store {
         }
         Ok(())
     }
+
+    fn migrate_v3_to_v4(&mut self) -> Result<(), StoreError> {
+        self.connection.pragma_update(None, "foreign_keys", "OFF")?;
+        let migration = (|| {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(MIGRATE_V3_TO_V4)?;
+            transaction.commit()?;
+            Ok::<(), StoreError>(())
+        })();
+        let restore = self.connection.pragma_update(None, "foreign_keys", "ON");
+        migration?;
+        restore?;
+        let violation: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM pragma_foreign_key_check LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if violation.is_some() {
+            return Err(StoreError::Integrity);
+        }
+        Ok(())
+    }
 }
 
-const SCHEMA_V3: &str = "
+const SCHEMA_V4: &str = "
 CREATE TABLE vault (
     id BLOB PRIMARY KEY NOT NULL,
     format_version INTEGER NOT NULL,
@@ -854,7 +1021,35 @@ CREATE TABLE secret_http_access (
     max_request_bytes INTEGER NOT NULL,
     max_response_bytes INTEGER NOT NULL
 ) STRICT;
-PRAGMA user_version = 3;
+CREATE TABLE workspace (
+    id BLOB PRIMARY KEY NOT NULL,
+    vault_id BLOB NOT NULL REFERENCES vault(id),
+    encrypted_name BLOB NOT NULL,
+    name_lookup BLOB NOT NULL,
+    UNIQUE(vault_id, name_lookup)
+) STRICT;
+CREATE TABLE workspace_membership (
+    workspace_id BLOB NOT NULL REFERENCES workspace(id),
+    profile_id BLOB NOT NULL REFERENCES profile(id),
+    PRIMARY KEY (workspace_id, profile_id)
+) STRICT;
+PRAGMA user_version = 4;
+";
+
+const MIGRATE_V3_TO_V4: &str = "
+CREATE TABLE workspace (
+    id BLOB PRIMARY KEY NOT NULL,
+    vault_id BLOB NOT NULL REFERENCES vault(id),
+    encrypted_name BLOB NOT NULL,
+    name_lookup BLOB NOT NULL,
+    UNIQUE(vault_id, name_lookup)
+) STRICT;
+CREATE TABLE workspace_membership (
+    workspace_id BLOB NOT NULL REFERENCES workspace(id),
+    profile_id BLOB NOT NULL REFERENCES profile(id),
+    PRIMARY KEY (workspace_id, profile_id)
+) STRICT;
+PRAGMA user_version = 4;
 ";
 
 const MIGRATE_V2_TO_V3: &str = "
@@ -969,6 +1164,24 @@ fn insert_profile(transaction: &Transaction<'_>, record: &ProfileRecord) -> Resu
     Ok(())
 }
 
+fn insert_workspace(
+    transaction: &Transaction<'_>,
+    record: &WorkspaceRecord,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO workspace
+         (id, vault_id, encrypted_name, name_lookup)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            id_bytes(record.id.0),
+            id_bytes(record.vault_id.0),
+            record.encrypted_name,
+            record.name_lookup,
+        ],
+    )?;
+    Ok(())
+}
+
 fn insert_secret(transaction: &Transaction<'_>, record: &SecretRecord) -> Result<(), StoreError> {
     transaction.execute(
         "INSERT INTO secret
@@ -1026,6 +1239,8 @@ fn apply_import_reset(
             transaction.execute("DELETE FROM secret_http_access", [])?;
             transaction.execute("DELETE FROM secret_version", [])?;
             transaction.execute("DELETE FROM secret", [])?;
+            transaction.execute("DELETE FROM workspace_membership", [])?;
+            transaction.execute("DELETE FROM workspace", [])?;
             transaction.execute(
                 "DELETE FROM profile WHERE id != ?1",
                 params![id_bytes(base_profile_id.0)],
@@ -1179,6 +1394,15 @@ fn map_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProfileRecord> {
         encrypted_description: row.get(5)?,
         activate_on_start: row.get(6)?,
         generation: read_u64(row, 7)?,
+    })
+}
+
+fn map_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
+    Ok(WorkspaceRecord {
+        id: WorkspaceId(read_id(row, 0)?),
+        vault_id: VaultId(read_id(row, 1)?),
+        encrypted_name: row.get(2)?,
+        name_lookup: row.get(3)?,
     })
 }
 
@@ -1444,7 +1668,7 @@ mod tests {
         let path = directory.path().join("vault.db");
         let (vault, scope, profile) = fixture();
         let mut store = Store::open(&path).expect("first open");
-        assert_eq!(store.schema_version().expect("version"), 3);
+        assert_eq!(store.schema_version().expect("version"), 4);
         store
             .initialize(&vault, &scope, &profile)
             .expect("initialize");
@@ -1459,7 +1683,7 @@ mod tests {
                 .expect("second open")
                 .schema_version()
                 .expect("version"),
-            3
+            4
         );
     }
 
@@ -1591,13 +1815,154 @@ mod tests {
         drop(connection);
 
         let migrated = Store::open(&path).expect("migrate");
-        assert_eq!(migrated.schema_version().expect("version"), 3);
+        assert_eq!(migrated.schema_version().expect("version"), 4);
         assert_eq!(migrated.profiles().expect("profiles")[0].scope_id, scope.id);
         assert_eq!(
             migrated.secret_versions(secret_id).expect("versions")[0].id,
             version_id
         );
         migrated.integrity_check().expect("integrity");
+    }
+
+    const SCHEMA_V3_FIXTURE: &str = "
+    CREATE TABLE vault (
+        id BLOB PRIMARY KEY NOT NULL,
+        format_version INTEGER NOT NULL,
+        wrapped_master_key BLOB NOT NULL,
+        kdf_parameters BLOB NOT NULL,
+        kdf_salt BLOB NOT NULL,
+        created_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE scope (
+        id BLOB PRIMARY KEY NOT NULL,
+        vault_id BLOB NOT NULL REFERENCES vault(id),
+        parent_id BLOB REFERENCES scope(id),
+        kind INTEGER NOT NULL,
+        encrypted_path BLOB NOT NULL,
+        path_lookup BLOB NOT NULL,
+        UNIQUE(vault_id, path_lookup)
+    ) STRICT;
+    CREATE UNIQUE INDEX one_root_scope_per_vault
+        ON scope(vault_id) WHERE parent_id IS NULL;
+    CREATE TABLE profile (
+        id BLOB PRIMARY KEY NOT NULL,
+        vault_id BLOB NOT NULL REFERENCES vault(id),
+        scope_id BLOB NOT NULL REFERENCES scope(id),
+        encrypted_name BLOB NOT NULL,
+        name_lookup BLOB NOT NULL,
+        encrypted_description BLOB,
+        activate_on_start INTEGER NOT NULL CHECK (activate_on_start IN (0, 1)),
+        generation INTEGER NOT NULL CHECK (generation >= 1),
+        UNIQUE(vault_id, name_lookup)
+    ) STRICT;
+    CREATE TABLE secret (
+        id BLOB PRIMARY KEY NOT NULL,
+        scope_id BLOB NOT NULL REFERENCES scope(id),
+        encrypted_name BLOB NOT NULL,
+        name_lookup BLOB NOT NULL,
+        encrypted_description BLOB,
+        current_version INTEGER NOT NULL CHECK (current_version >= 0),
+        status INTEGER NOT NULL CHECK (status IN (0, 1)),
+        CHECK ((status = 0 AND current_version >= 1) OR (status = 1 AND current_version = 0)),
+        UNIQUE(scope_id, name_lookup)
+    ) STRICT;
+    CREATE TABLE secret_version (
+        id BLOB PRIMARY KEY NOT NULL,
+        secret_id BLOB NOT NULL REFERENCES secret(id),
+        version INTEGER NOT NULL CHECK (version >= 1),
+        ciphertext BLOB NOT NULL,
+        wrapped_dek BLOB NOT NULL,
+        aad_digest BLOB NOT NULL,
+        generator INTEGER,
+        generated_length INTEGER,
+        entropy_bits INTEGER,
+        created_at INTEGER NOT NULL,
+        UNIQUE(secret_id, version)
+    ) STRICT;
+    CREATE TABLE secret_http_access (
+        secret_id BLOB PRIMARY KEY NOT NULL REFERENCES secret(id),
+        encrypted_host BLOB NOT NULL,
+        port INTEGER NOT NULL,
+        methods TEXT NOT NULL,
+        encrypted_path_prefix BLOB NOT NULL,
+        max_request_bytes INTEGER NOT NULL,
+        max_response_bytes INTEGER NOT NULL
+    ) STRICT;
+    PRAGMA user_version = 3;
+    ";
+
+    #[test]
+    fn phase_two_schema_migrates_to_workspace_tables_cleanly() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("phase-two.db");
+        let (vault, scope, profile) = fixture();
+        let connection = Connection::open(&path).expect("open v3");
+        connection
+            .execute_batch(SCHEMA_V3_FIXTURE)
+            .expect("schema v3");
+        connection
+            .execute(
+                "INSERT INTO vault VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id_bytes(vault.id.0),
+                    i64::from(vault.format_version),
+                    vault.wrapped_master_key,
+                    vault.kdf_parameters,
+                    vault.kdf_salt,
+                    vault.created_at,
+                ],
+            )
+            .expect("vault");
+        connection
+            .execute(
+                "INSERT INTO scope VALUES (?1, ?2, NULL, ?3, ?4, ?5)",
+                params![
+                    id_bytes(scope.id.0),
+                    id_bytes(scope.vault_id.0),
+                    i64::from(scope.kind),
+                    scope.encrypted_path,
+                    scope.path_lookup,
+                ],
+            )
+            .expect("scope");
+        connection
+            .execute(
+                "INSERT INTO profile VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
+                params![
+                    id_bytes(profile.id.0),
+                    id_bytes(profile.vault_id.0),
+                    id_bytes(profile.scope_id.0),
+                    profile.encrypted_name,
+                    profile.name_lookup,
+                    profile.activate_on_start,
+                    to_i64(profile.generation).expect("generation"),
+                ],
+            )
+            .expect("profile");
+        drop(connection);
+
+        let migrated = Store::open(&path).expect("migrate");
+        assert_eq!(migrated.schema_version().expect("version"), 4);
+        assert_eq!(migrated.profiles().expect("profiles"), vec![profile]);
+        assert!(migrated.workspaces().expect("workspaces").is_empty());
+        migrated.integrity_check().expect("integrity");
+
+        let mut migrated = migrated;
+        let workspace_id = WorkspaceId(Uuid::new_v4());
+        let workspace = WorkspaceRecord {
+            id: workspace_id,
+            vault_id: vault.id,
+            encrypted_name: vec![13_u8],
+            name_lookup: vec![14_u8; 32],
+        };
+        migrated.create_workspace(&workspace).expect("workspace");
+        assert_eq!(migrated.workspaces().expect("workspaces"), vec![workspace]);
+        assert!(
+            migrated
+                .profiles_in_workspace(workspace_id)
+                .expect("members")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1714,7 +2079,7 @@ mod tests {
                 .expect("migrate")
                 .schema_version()
                 .expect("version"),
-            3
+            4
         );
 
         let occupied = directory.path().join("occupied-v1.db");
