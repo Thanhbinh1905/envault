@@ -478,6 +478,9 @@ impl VaultSession {
             .ok_or(ServiceError::Corrupt)?;
         self.store.update_profile_metadata(&record)?;
         if let Some(activate_on_start) = activate_on_start {
+            if !activate_on_start && record.scope_id == self.root_scope_id {
+                return Err(ServiceError::StartupProfileRequired);
+            }
             let other_active = self
                 .store
                 .profiles()?

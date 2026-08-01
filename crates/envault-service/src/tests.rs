@@ -156,10 +156,16 @@ fn update_profile_rejects_clearing_the_last_activate_on_start_profile() {
     session
         .update_profile("personal", None, Some(true))
         .expect("set activate_on_start");
-    // Now `base` is no longer the only `activate_on_start` profile.
+    // `base` is the permanent underlay: it can never have
+    // `activate_on_start` cleared, even when another profile is active.
+    assert!(matches!(
+        session.update_profile("base", None, Some(false)),
+        Err(ServiceError::StartupProfileRequired)
+    ));
+
     session
-        .update_profile("base", None, Some(false))
-        .expect("clear activate_on_start");
+        .update_profile("personal", None, Some(false))
+        .expect("clear activate_on_start on a non-root profile");
 }
 
 #[test]
