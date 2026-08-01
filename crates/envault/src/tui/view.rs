@@ -100,7 +100,7 @@ fn draw_tabs<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>) {
         "  u:unlock admin"
     };
     let line = Line::from(format!(
-        "{}{}{}{}{}  (d/p/s/o, arrows, enter, esc, r, q){admin_hint}",
+        "{}{}{}{}{}  (d/p/s/o/tab/⇧tab/←→/h/l: tabs, ↑↓/j/k: move, enter, esc, r, q){admin_hint}",
         label("Dashboard", screen == Screen::Dashboard),
         label("Profiles", screen == Screen::Profiles),
         label("Secrets", screen == Screen::Secrets),

@@ -417,6 +417,32 @@ pub enum Screen {
     Portability,
 }
 
+impl Screen {
+    /// Cycles forward through the tab strip in the order it's drawn, for
+    /// Tab/Right/`l`. Wraps from the last tab back to the first.
+    fn next(self) -> Self {
+        match self {
+            Screen::Dashboard => Screen::Profiles,
+            Screen::Profiles => Screen::Secrets,
+            Screen::Secrets => Screen::Versions,
+            Screen::Versions => Screen::Portability,
+            Screen::Portability => Screen::Dashboard,
+        }
+    }
+
+    /// Cycles backward through the tab strip, for Shift+Tab/Left/`h`. Wraps
+    /// from the first tab back to the last.
+    fn previous(self) -> Self {
+        match self {
+            Screen::Dashboard => Screen::Portability,
+            Screen::Profiles => Screen::Dashboard,
+            Screen::Secrets => Screen::Profiles,
+            Screen::Versions => Screen::Secrets,
+            Screen::Portability => Screen::Versions,
+        }
+    }
+}
+
 /// Which package or file kind a portability import/export wizard is acting
 /// on. Drives which conflict strategies are offered, matching exactly what
 /// each daemon operation accepts.
@@ -980,6 +1006,10 @@ impl<C: DaemonClient> App<C> {
             KeyCode::Char('s') => self.go_to(Screen::Secrets),
             KeyCode::Char('o') => self.go_to(Screen::Portability),
             KeyCode::Char('r') => self.go_to(self.screen),
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.go_to(self.screen.next()),
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                self.go_to(self.screen.previous());
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
             KeyCode::Enter => self.select(),
