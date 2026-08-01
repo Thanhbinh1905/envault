@@ -335,3 +335,11 @@ daemon = "required"
 agent = true
 outputs = ["human", "json", "toon"]
 errors = ["envault_locked", "run_target_required", "secret_not_utf8", "run_spawn_failed", "protocol_error", "duplicate_secret_across_profiles", "profile_not_loaded", "invalid_placeholder", "argv_pipe_failed", "argv_placeholder_unsupported"]
+
+[[command]]
+path = "uninstall"
+auth = "human"
+daemon = "spawns"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["authentication_failed", "interactive_terminal_required", "package_credential_required", "package_error", "package_authentication_failed", "io_error"]

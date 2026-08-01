@@ -127,7 +127,7 @@ install -d "$HOME/.local/bin"
 install -m 0755 target/release/envault target/release/envaultd target/release/envaultui "$HOME/.local/bin/"
 ```
 
-## Upgrade and uninstall
+## Upgrade
 
 Stop the daemon before replacing binaries:
 
@@ -138,9 +138,40 @@ envault stop
 Replace only the executable files, then run `envault status` to confirm that the new client can reach the daemon.
 Upgrading binaries does not migrate or delete the encrypted vault.
 
-To uninstall the binaries, remove the three executable files from the installation directory.
-The vault data is separate and is not removed by uninstalling EnVault.
-Back up or securely destroy vault data only after confirming that it is no longer needed.
+## Uninstall
+
+Removing the `envault`, `envaultd`, and `envaultui` executables does not remove the vault.
+The vault database, the daemon's runtime state, and (if convenience unlock was enabled) the master password stored in the OS credential store all live outside the installation directory:
+
+| Data | Location |
+| --- | --- |
+| Vault database | `$XDG_DATA_HOME/envault/vault.db`, or `~/.local/share/envault/vault.db` |
+| Daemon runtime state (socket, lock file) | `$XDG_RUNTIME_DIR/envault/`, or `~/.local/share/envault/run/` |
+| Convenience-unlock marker | `~/.local/share/envault/convenience-unlock.enabled` |
+| Master password (only if convenience unlock is enabled) | OS credential store, service `envault`, account `master-password` |
+
+Use `envault uninstall` to remove all of this in one step, instead of deleting these paths by hand:
+
+```sh
+envault uninstall
+```
+
+This requires the master password (proving the caller owns the vault before anything is deleted), then asks for confirmation before doing anything destructive.
+If a vault database exists, it also offers to export a full backup package first; answering `y` prompts for a destination path (default: the home directory) and a transfer password to encrypt the backup with.
+Once the caller confirms, the command stops the daemon, deletes the vault database and daemon runtime directory, and removes any convenience-unlock credential from the OS keyring.
+It does not remove the installed binaries themselves - remove `envault`, `envaultd`, and `envaultui` from the installation directory separately.
+
+For scripted or CI use, skip the interactive prompts entirely with:
+
+```sh
+envault uninstall --password-stdin --yes --skip-backup
+```
+
+`--backup-path` skips only the "where to export" question (the transfer password to encrypt that backup with is always requested on a masked terminal, since it cannot share the same standard input as `--password-stdin`).
+Run a backup through `envault portability export` first, then `envault uninstall --password-stdin --yes --skip-backup`, for a fully non-interactive backup-and-uninstall sequence.
+
+`envault uninstall --help` documents every flag.
+This action is irreversible without a backup: back up or securely destroy vault data only after confirming it is no longer needed.
 
 ## Security notes
 

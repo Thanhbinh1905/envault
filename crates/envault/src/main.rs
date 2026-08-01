@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    fs,
+    env, fs,
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -85,6 +85,7 @@ enum Command {
         command: SessionCommand,
     },
     Run(RunArgs),
+    Uninstall(UninstallArgs),
     /// Not part of the public command surface (absent from `--help` and
     /// `commands.toml`) - built only via the `internal-completions` feature,
     /// which the release workflow enables solely to render shell completion
@@ -197,6 +198,30 @@ enum AdminCommand {
     Unlock(AdminUnlockArgs),
     Status,
     Lock,
+}
+
+#[derive(Debug, clap::Args)]
+struct UninstallArgs {
+    #[command(flatten)]
+    password: PasswordArgs,
+    #[arg(
+        long,
+        help = "Skip the interactive \"are you sure?\" confirmation prompt"
+    )]
+    yes: bool,
+    #[arg(
+        long,
+        conflicts_with = "backup_path",
+        help = "Do not export a backup before deleting all local EnVault data"
+    )]
+    skip_backup: bool,
+    #[arg(
+        short = 'O',
+        long,
+        value_name = "PATH",
+        help = "Export a backup to this path before deleting all local data, without prompting"
+    )]
+    backup_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -704,6 +729,7 @@ fn main() -> ExitCode {
         Command::ConvenienceUnlock { command } => convenience_unlock_command(cli.output, command),
         Command::Session { command } => session_command(cli.output, command),
         Command::Run(arguments) => run_command(cli.output, arguments),
+        Command::Uninstall(arguments) => uninstall_command(cli.output, &arguments),
         #[cfg(feature = "internal-completions")]
         Command::Completions(arguments) => completions(arguments.shell),
     }
@@ -842,6 +868,227 @@ fn resolve_start_password(password_stdin: bool) -> Result<SensitiveBytes, Struct
         }
     }
     read_master_password(password_stdin, false)
+}
+
+/// Permanently removes every local trace of `EnVault`: the vault database, the
+/// daemon's runtime socket/lock directory, and (if convenience unlock was
+/// enabled) the master password stored in the OS credential store. This does
+/// not touch the installed binaries themselves - see the "Upgrade and
+/// uninstall" section of `docs/INSTALLATION.md`.
+#[allow(clippy::too_many_lines)]
+fn uninstall_command(output: Output, arguments: &UninstallArgs) -> ExitCode {
+    let database_path = match vault_database_path() {
+        Ok(path) => path,
+        Err(error) => return print_error(output, &error),
+    };
+    let vault_exists = database_path.exists();
+
+    // Proving the caller holds the master password gates the whole
+    // operation on the same authority as every other admin-level command,
+    // even when the caller ends up declining the backup below. The admin
+    // lease acquired here is also what `ExportPackage` requires later.
+    if vault_exists {
+        let password = match read_master_password(arguments.password.password_stdin, false) {
+            Ok(password) => password,
+            Err(error) => return print_error(output, &error),
+        };
+        if let Err(error) = client::start(password.clone()) {
+            return print_error(output, &client_error(error));
+        }
+        match client::request(Operation::AdminUnlock {
+            password,
+            ttl_minutes: Some(envault_core::DEFAULT_ADMIN_LEASE_MINUTES),
+        }) {
+            Ok(Reply::AdminStatus(_)) => {}
+            Ok(_) => return print_error(output, &unexpected_response()),
+            Err(error) => return print_error(output, &client_error(error)),
+        }
+    }
+
+    if !arguments.yes {
+        match confirm(
+            "This permanently deletes the EnVault vault database, daemon runtime state, and any \
+             stored convenience-unlock credential on this machine. This cannot be undone. \
+             Continue? [y/N] ",
+            false,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                println!("uninstall: aborted");
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => return print_error(output, &error),
+        }
+    }
+
+    if vault_exists && !arguments.skip_backup {
+        let backup_path = match arguments.backup_path.clone() {
+            Some(path) => Some(path),
+            None => match confirm(
+                "Export a backup of everything before deleting? [Y/n] ",
+                true,
+            ) {
+                Ok(true) => match prompt_line("Backup path (default: ~): ") {
+                    Ok(input) => match resolve_backup_path(&input) {
+                        Ok(path) => Some(path),
+                        Err(error) => return print_error(output, &error),
+                    },
+                    Err(error) => return print_error(output, &error),
+                },
+                Ok(false) => None,
+                Err(error) => return print_error(output, &error),
+            },
+        };
+        if let Some(backup_path) = backup_path {
+            let transfer_password_args = TransferPasswordArgs {
+                transfer_password: true,
+                transfer_password_stdin: arguments.password.password_stdin,
+            };
+            let operation = match build_export_request(
+                PackageKind::Workspace,
+                None,
+                &backup_path,
+                transfer_password_args,
+                Vec::new(),
+            ) {
+                Ok(operation) => operation,
+                Err(error) => return print_error(output, &error),
+            };
+            match client::request(operation) {
+                Ok(Reply::PortabilityExport(summary)) => {
+                    print_portability_export(output, &summary);
+                }
+                Ok(_) => return print_error(output, &unexpected_response()),
+                Err(error) => return print_error(output, &client_error(error)),
+            }
+        }
+    }
+
+    match client::request(Operation::Stop) {
+        Ok(Reply::Acknowledged { .. }) | Err(ClientError::NotRunning) => {}
+        Ok(_) => return print_error(output, &unexpected_response()),
+        Err(error) => return print_error(output, &client_error(error)),
+    }
+
+    if let Err(error) = convenience_unlock::disable(&convenience_unlock::RealKeystore) {
+        return print_error(
+            output,
+            &input_error(
+                "io_error",
+                &format!("failed to remove the stored convenience-unlock credential: {error}"),
+            ),
+        );
+    }
+
+    let Ok(runtime_directory) = envault_platform::runtime_directory() else {
+        return print_error(
+            output,
+            &input_error(
+                "io_error",
+                "unable to resolve the EnVault runtime directory",
+            ),
+        );
+    };
+    if let Err(error) = remove_directory_tree(&runtime_directory) {
+        return print_error(output, &error);
+    }
+    if let Err(error) = remove_directory_tree(database_path.parent().unwrap_or(&database_path)) {
+        return print_error(output, &error);
+    }
+
+    match output {
+        Output::Human => println!("envault: uninstalled - all local vault data has been removed"),
+        Output::Json => println!("{{\"status\":\"uninstalled\"}}"),
+        Output::Toon => println!("envault{{status}}: uninstalled"),
+    }
+    ExitCode::SUCCESS
+}
+
+fn confirm(prompt: &str, default: bool) -> Result<bool, StructuredError> {
+    if !io::stdin().is_terminal() {
+        return Err(input_error(
+            "interactive_terminal_required",
+            "use `--yes` and either `--skip-backup` or `--backup-path` when standard input is not a terminal",
+        ));
+    }
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|_| input_error("io_error", "failed to write the confirmation prompt"))?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|_| input_error("io_error", "failed to read the confirmation response"))?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    Ok(matches!(trimmed.to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+fn prompt_line(prompt: &str) -> Result<String, StructuredError> {
+    if !io::stdin().is_terminal() {
+        return Err(input_error(
+            "interactive_terminal_required",
+            "use `--backup-path` when standard input is not a terminal",
+        ));
+    }
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|_| input_error("io_error", "failed to write the prompt"))?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|_| input_error("io_error", "failed to read the response"))?;
+    Ok(line.trim().to_owned())
+}
+
+/// Resolves the user's answer to the "backup path" prompt: an empty answer
+/// or a bare `~` defaults to the home directory, and any directory (existing
+/// or the home-directory default) gets a generated package file name
+/// appended so the export always has a concrete destination file.
+fn resolve_backup_path(input: &str) -> Result<PathBuf, StructuredError> {
+    let trimmed = input.trim();
+    let expanded = if trimmed.is_empty() || trimmed == "~" {
+        let home = env::var_os("HOME").ok_or_else(|| {
+            input_error(
+                "io_error",
+                "unable to resolve the home directory; pass --backup-path instead",
+            )
+        })?;
+        PathBuf::from(home)
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        let home = env::var_os("HOME").ok_or_else(|| {
+            input_error(
+                "io_error",
+                "unable to resolve the home directory; pass --backup-path instead",
+            )
+        })?;
+        PathBuf::from(home).join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if expanded.is_dir() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        Ok(expanded.join(format!("envault-backup-{timestamp}.envault-workspace")))
+    } else {
+        Ok(expanded)
+    }
+}
+
+fn remove_directory_tree(path: &Path) -> Result<(), StructuredError> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(input_error(
+            "io_error",
+            &format!("failed to remove {}: {error}", path.display()),
+        )),
+    }
 }
 
 fn convenience_unlock_command(output: Output, command: ConvenienceUnlockCommand) -> ExitCode {
@@ -1362,6 +1609,30 @@ fn print_workspace_scope(output: Output, scope: &ScopeView) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn build_export_request(
+    kind: PackageKind,
+    profile_name: Option<String>,
+    output_file: &Path,
+    password_arguments: TransferPasswordArgs,
+    age_recipients: Vec<String>,
+) -> Result<Operation, StructuredError> {
+    let transfer_password = read_optional_transfer_password(password_arguments, true)?;
+    if transfer_password.is_none() && age_recipients.is_empty() {
+        return Err(input_error(
+            "package_credential_required",
+            "choose a transfer password or at least one age recipient",
+        ));
+    }
+    let output_path = protocol_path(output_file)?;
+    Ok(Operation::ExportPackage {
+        kind,
+        profile_name,
+        output_path,
+        transfer_password,
+        age_recipients,
+    })
+}
+
 fn export_package(
     output: Output,
     kind: PackageKind,
@@ -1370,30 +1641,17 @@ fn export_package(
     password_arguments: TransferPasswordArgs,
     age_recipients: Vec<String>,
 ) -> ExitCode {
-    let transfer_password = match read_optional_transfer_password(password_arguments, true) {
-        Ok(password) => password,
-        Err(error) => return print_error(output, &error),
-    };
-    if transfer_password.is_none() && age_recipients.is_empty() {
-        return print_error(
-            output,
-            &input_error(
-                "package_credential_required",
-                "choose a transfer password or at least one age recipient",
-            ),
-        );
-    }
-    let output_path = match protocol_path(output_file) {
-        Ok(path) => path,
-        Err(error) => return print_error(output, &error),
-    };
-    match client::request(Operation::ExportPackage {
+    let operation = match build_export_request(
         kind,
         profile_name,
-        output_path,
-        transfer_password,
+        output_file,
+        password_arguments,
         age_recipients,
-    }) {
+    ) {
+        Ok(operation) => operation,
+        Err(error) => return print_error(output, &error),
+    };
+    match client::request(operation) {
         Ok(Reply::PortabilityExport(summary)) => print_portability_export(output, &summary),
         Ok(_) => print_error(output, &unexpected_response()),
         Err(error) => print_error(output, &client_error(error)),
@@ -3242,7 +3500,8 @@ mod tests {
                 "workspace",
                 "convenience-unlock",
                 "session",
-                "run"
+                "run",
+                "uninstall"
             ]
         );
     }
