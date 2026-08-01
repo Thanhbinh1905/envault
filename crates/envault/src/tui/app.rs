@@ -2094,6 +2094,60 @@ mod tests {
     }
 
     #[test]
+    fn tab_and_arrow_and_vim_keys_cycle_through_every_screen_and_wrap() {
+        let client = FakeClient::default();
+        client
+            .status
+            .borrow_mut()
+            .push_back(Ok(sample_status(false)));
+        client
+            .admin_status
+            .borrow_mut()
+            .push_back(Ok(sample_admin_status(false)));
+        // Forward lap (Tab x4: Dashboard -> Profiles -> Secrets -> Versions
+        // -> Portability) plus the wrap back to Dashboard, then a full
+        // backward lap (Shift+Tab x4) plus its wrap: each traversal touches
+        // Profiles/Secrets/Versions/Dashboard twice.
+        for _ in 0..2 {
+            client.profiles.borrow_mut().push_back(Ok(Vec::new()));
+            client.secrets.borrow_mut().push_back(Ok(Vec::new()));
+            client.versions.borrow_mut().push_back(Ok(Vec::new()));
+            client
+                .status
+                .borrow_mut()
+                .push_back(Ok(sample_status(false)));
+            client
+                .admin_status
+                .borrow_mut()
+                .push_back(Ok(sample_admin_status(false)));
+        }
+        let mut app = app_with(client);
+        assert_eq!(app.screen(), Screen::Dashboard);
+
+        app.on_key(KeyCode::Tab);
+        assert_eq!(app.screen(), Screen::Profiles);
+        app.on_key(KeyCode::Right);
+        assert_eq!(app.screen(), Screen::Secrets);
+        app.on_key(KeyCode::Char('l'));
+        assert_eq!(app.screen(), Screen::Versions);
+        app.on_key(KeyCode::Tab);
+        assert_eq!(app.screen(), Screen::Portability);
+        app.on_key(KeyCode::Tab);
+        assert_eq!(app.screen(), Screen::Dashboard, "next() must wrap");
+
+        app.on_key(KeyCode::BackTab);
+        assert_eq!(app.screen(), Screen::Portability);
+        app.on_key(KeyCode::Left);
+        assert_eq!(app.screen(), Screen::Versions);
+        app.on_key(KeyCode::Char('h'));
+        assert_eq!(app.screen(), Screen::Secrets);
+        app.on_key(KeyCode::BackTab);
+        assert_eq!(app.screen(), Screen::Profiles);
+        app.on_key(KeyCode::BackTab);
+        assert_eq!(app.screen(), Screen::Dashboard, "previous() must wrap");
+    }
+
+    #[test]
     fn password_input_cancel_returns_to_normal_without_calling_the_client() {
         let client = FakeClient::default();
         client
