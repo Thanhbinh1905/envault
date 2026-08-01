@@ -1086,11 +1086,11 @@ impl RuntimeState {
                 let profile = vault
                     .create_profile(&name, description.as_deref())
                     .map_err(|error| map_service_failure(&error))?;
-                if let Some(workspace) = &workspace {
-                    if let Err(error) = vault.bind_profile_to_workspace(workspace, &name) {
-                        let _ = vault.delete_profile(&name);
-                        return Err(map_service_failure(&error));
-                    }
+                if let Some(workspace) = &workspace
+                    && let Err(error) = vault.bind_profile_to_workspace(workspace, &name)
+                {
+                    let _ = vault.delete_profile(&name);
+                    return Err(map_service_failure(&error));
                 }
                 Reply::Profile(profile)
             }
