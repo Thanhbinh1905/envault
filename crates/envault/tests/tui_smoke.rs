@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 
-//! Real-binary coverage for `envault-tui`.
+//! Real-binary coverage for `envaultui`.
 //!
-//! A full interactive walkthrough (spawn a real daemon, drive `envault-tui`
+//! A full interactive walkthrough (spawn a real daemon, drive `envaultui`
 //! over a pseudo-terminal, send keystrokes, scan the transcript for secret or
 //! password leakage) is deferred: no pseudo-terminal crate is a dependency
 //! anywhere in this workspace yet, and adding one plus a robust,
@@ -18,20 +18,20 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn tui_refuses_to_render_without_an_interactive_terminal() {
-    let output = Command::new(env!("CARGO_BIN_EXE_envault-tui"))
+    let output = Command::new(env!("CARGO_BIN_EXE_envaultui"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("spawn envault-tui");
+        .expect("spawn envaultui");
 
     assert!(
         !output.status.success(),
-        "envault-tui must not report success when it never rendered"
+        "envaultui must not report success when it never rendered"
     );
     assert!(
         output.stdout.is_empty(),
-        "envault-tui must write nothing to stdout when refusing to render"
+        "envaultui must write nothing to stdout when refusing to render"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

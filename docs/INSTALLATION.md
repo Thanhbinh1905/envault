@@ -48,13 +48,13 @@ if ($expected -ne $actual) { throw "SHA-256 verification failed" }
 ```
 
 Extract the archive and place the three binaries in a directory on your `PATH`.
-The archive contains `envault`, `envaultd`, and `envault-tui` on Unix systems, and the corresponding `.exe` files on Windows.
+The archive contains `envault`, `envaultd`, and `envaultui` on Unix systems, and the corresponding `.exe` files on Windows.
 
 For a per-user Unix installation:
 
 ```sh
 install -d "$HOME/.local/bin"
-install -m 0755 envault envaultd envault-tui "$HOME/.local/bin/"
+install -m 0755 envault envaultd envaultui "$HOME/.local/bin/"
 ```
 
 Add `$HOME/.local/bin` to `PATH` if it is not already present.
@@ -78,7 +78,7 @@ envault status
 ```
 
 Use `envault lock` when the vault should be locked and `envault stop` when the daemon should exit.
-The `envault-tui` binary is an optional interactive client and does not replace the daemon.
+The `envaultui` binary is an optional interactive client and does not replace the daemon.
 
 On Unix, `envault start` can spawn the daemon after the human bootstrap prompt.
 On Windows, start `envaultd.exe` from a supervised process or terminal before using client commands because automatic client-side daemon spawning is not available yet.
@@ -124,7 +124,7 @@ For a local per-user Unix installation:
 
 ```sh
 install -d "$HOME/.local/bin"
-install -m 0755 target/release/envault target/release/envaultd target/release/envault-tui "$HOME/.local/bin/"
+install -m 0755 target/release/envault target/release/envaultd target/release/envaultui "$HOME/.local/bin/"
 ```
 
 ## Upgrade and uninstall

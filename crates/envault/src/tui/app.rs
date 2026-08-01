@@ -417,6 +417,32 @@ pub enum Screen {
     Portability,
 }
 
+impl Screen {
+    /// Cycles forward through the tab strip in the order it's drawn, for
+    /// Tab/Right/`l`. Wraps from the last tab back to the first.
+    fn next(self) -> Self {
+        match self {
+            Screen::Dashboard => Screen::Profiles,
+            Screen::Profiles => Screen::Secrets,
+            Screen::Secrets => Screen::Versions,
+            Screen::Versions => Screen::Portability,
+            Screen::Portability => Screen::Dashboard,
+        }
+    }
+
+    /// Cycles backward through the tab strip, for Shift+Tab/Left/`h`. Wraps
+    /// from the first tab back to the last.
+    fn previous(self) -> Self {
+        match self {
+            Screen::Dashboard => Screen::Portability,
+            Screen::Profiles => Screen::Dashboard,
+            Screen::Secrets => Screen::Profiles,
+            Screen::Versions => Screen::Secrets,
+            Screen::Portability => Screen::Versions,
+        }
+    }
+}
+
 /// Which package or file kind a portability import/export wizard is acting
 /// on. Drives which conflict strategies are offered, matching exactly what
 /// each daemon operation accepts.
@@ -980,6 +1006,10 @@ impl<C: DaemonClient> App<C> {
             KeyCode::Char('s') => self.go_to(Screen::Secrets),
             KeyCode::Char('o') => self.go_to(Screen::Portability),
             KeyCode::Char('r') => self.go_to(self.screen),
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.go_to(self.screen.next()),
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                self.go_to(self.screen.previous());
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
             KeyCode::Enter => self.select(),
@@ -2061,6 +2091,60 @@ mod tests {
 
         app.on_key(KeyCode::Esc);
         assert_eq!(app.screen(), Screen::Secrets);
+    }
+
+    #[test]
+    fn tab_and_arrow_and_vim_keys_cycle_through_every_screen_and_wrap() {
+        let client = FakeClient::default();
+        client
+            .status
+            .borrow_mut()
+            .push_back(Ok(sample_status(false)));
+        client
+            .admin_status
+            .borrow_mut()
+            .push_back(Ok(sample_admin_status(false)));
+        // Forward lap (Tab x4: Dashboard -> Profiles -> Secrets -> Versions
+        // -> Portability) plus the wrap back to Dashboard, then a full
+        // backward lap (Shift+Tab x4) plus its wrap: each traversal touches
+        // Profiles/Secrets/Versions/Dashboard twice.
+        for _ in 0..2 {
+            client.profiles.borrow_mut().push_back(Ok(Vec::new()));
+            client.secrets.borrow_mut().push_back(Ok(Vec::new()));
+            client.versions.borrow_mut().push_back(Ok(Vec::new()));
+            client
+                .status
+                .borrow_mut()
+                .push_back(Ok(sample_status(false)));
+            client
+                .admin_status
+                .borrow_mut()
+                .push_back(Ok(sample_admin_status(false)));
+        }
+        let mut app = app_with(client);
+        assert_eq!(app.screen(), Screen::Dashboard);
+
+        app.on_key(KeyCode::Tab);
+        assert_eq!(app.screen(), Screen::Profiles);
+        app.on_key(KeyCode::Right);
+        assert_eq!(app.screen(), Screen::Secrets);
+        app.on_key(KeyCode::Char('l'));
+        assert_eq!(app.screen(), Screen::Versions);
+        app.on_key(KeyCode::Tab);
+        assert_eq!(app.screen(), Screen::Portability);
+        app.on_key(KeyCode::Tab);
+        assert_eq!(app.screen(), Screen::Dashboard, "next() must wrap");
+
+        app.on_key(KeyCode::BackTab);
+        assert_eq!(app.screen(), Screen::Portability);
+        app.on_key(KeyCode::Left);
+        assert_eq!(app.screen(), Screen::Versions);
+        app.on_key(KeyCode::Char('h'));
+        assert_eq!(app.screen(), Screen::Secrets);
+        app.on_key(KeyCode::BackTab);
+        assert_eq!(app.screen(), Screen::Profiles);
+        app.on_key(KeyCode::BackTab);
+        assert_eq!(app.screen(), Screen::Dashboard, "previous() must wrap");
     }
 
     #[test]

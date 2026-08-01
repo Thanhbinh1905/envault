@@ -6,7 +6,7 @@ fn main() -> ExitCode {
     match envault::tui::run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("envault-tui: {error}");
+            eprintln!("envaultui: {error}");
             ExitCode::FAILURE
         }
     }
