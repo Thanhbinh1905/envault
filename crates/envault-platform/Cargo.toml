@@ -15,7 +15,7 @@ nix.workspace = true
 rustix.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-envault-windows-ffi = { version = "=0.0.1", path = "../envault-windows-ffi" }
+envault-windows-ffi = { version = "=0.1.0", path = "../envault-windows-ffi" }
 
 [dev-dependencies]
 tempfile.workspace = true

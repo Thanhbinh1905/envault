@@ -123,7 +123,13 @@ pub struct ProfileView {
     pub scope_id: ScopeId,
     pub name: String,
     pub description: Option<String>,
+    /// Persisted preference: auto-load into the runtime loaded set the next
+    /// time the vault unlocks. Independent of `loaded`.
     pub activate_on_start: bool,
+    /// Runtime-only: whether this profile is in the loaded set for the
+    /// current vault session. Reset on every unlock, seeded from
+    /// `activate_on_start`, then mutated ad hoc by `load`/`unload`.
+    pub loaded: bool,
     pub generation: u64,
 }
 

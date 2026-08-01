@@ -287,16 +287,18 @@ impl Store {
         expect_single_change(changed)
     }
 
-    /// Adds or removes a single profile from the "loaded set"
-    /// (`activate_on_start`), independent of every other profile's flag.
-    pub fn set_profile_loaded(
+    /// Sets a single profile's `activate_on_start` preference (auto-load the
+    /// next time the vault unlocks), independent of every other profile's
+    /// flag and independent of whether the profile is loaded in the current
+    /// runtime session.
+    pub fn set_profile_activate_on_start(
         &mut self,
         profile_id: ProfileId,
-        loaded: bool,
+        activate_on_start: bool,
     ) -> Result<(), StoreError> {
         let changed = self.connection.execute(
             "UPDATE profile SET activate_on_start = ?1, generation = generation + 1 WHERE id = ?2",
-            params![loaded, id_bytes(profile_id.0)],
+            params![activate_on_start, id_bytes(profile_id.0)],
         )?;
         expect_single_change(changed)
     }
@@ -1607,7 +1609,7 @@ mod tests {
             .expect("initialize");
 
         assert!(matches!(
-            store.set_profile_loaded(ProfileId(Uuid::new_v4()), true),
+            store.set_profile_activate_on_start(ProfileId(Uuid::new_v4()), true),
             Err(StoreError::Integrity)
         ));
         assert!(store.profiles().expect("profiles")[0].activate_on_start);

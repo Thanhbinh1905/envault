@@ -1073,6 +1073,124 @@ fn secret_http_access_gates_request_http_without_any_principal_or_token() {
 }
 
 #[test]
+fn run_accepts_repeated_profile_flags_across_unrelated_profiles() {
+    let fixture = DaemonFixture::initialize_and_start();
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+    assert_success(&fixture.run(
+        &["--output", "json", "profile", "create", "db"],
+        None,
+    ));
+    assert_success(&fixture.run(
+        &["--output", "json", "profile", "create", "cache"],
+        None,
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "db.PGHOST",
+            "--stdin",
+        ],
+        Some(b"db-host"),
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "cache.REDIS_HOST",
+            "--stdin",
+        ],
+        Some(b"cache-host"),
+    ));
+    assert_success(&fixture.run(&["--output", "json", "profile", "load", "db"], None));
+    assert_success(&fixture.run(&["--output", "json", "profile", "load", "cache"], None));
+
+    let output = fixture.run(
+        &[
+            "run",
+            "--profile",
+            "db",
+            "--profile",
+            "cache",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s %s' \"$PGHOST\" \"$REDIS_HOST\"",
+        ],
+        None,
+    );
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "db-host cache-host"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_resolves_argv_placeholders_via_a_pipe_without_a_profile_or_workspace_flag() {
+    let fixture = DaemonFixture::initialize_and_start();
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+    assert_success(&fixture.run(
+        &["--output", "json", "profile", "create", "db"],
+        None,
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "db.PGPASSWORD",
+            "--stdin",
+        ],
+        Some(b"argv-placeholder-secret"),
+    ));
+    assert_success(&fixture.run(&["--output", "json", "profile", "load", "db"], None));
+
+    let output = fixture.run(
+        &[
+            "run",
+            "--",
+            "cat",
+            "{{db.PGPASSWORD}}",
+        ],
+        None,
+    );
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "argv-placeholder-secret"
+    );
+
+    // The placeholder's own text never appears in the exec'd argv - only a
+    // /dev/fd path does, so `ps`-style inspection never sees the secret.
+    let unloaded = fixture.run(
+        &["run", "--", "cat", "{{db.MISSING}}"],
+        None,
+    );
+    assert_eq!(unloaded.status.code(), Some(1));
+
+    let malformed = fixture.run(&["run", "--", "cat", "{{no-dot-here}}"], None);
+    assert_eq!(malformed.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr).contains("invalid_placeholder"),
+        "stderr: {}",
+        String::from_utf8_lossy(&malformed.stderr)
+    );
+}
+
+#[test]
 fn run_injects_resolved_secrets_into_child_env_never_into_its_own_stdout() {
     let fixture = DaemonFixture::initialize_and_start();
     assert_success(&fixture.run(
@@ -1107,6 +1225,53 @@ fn run_injects_resolved_secrets_into_child_env_never_into_its_own_stdout() {
     assert_success(&bare_status);
     assert_no_bytes(&bare_status.stdout, b"run-command-e2e-secret");
     assert_no_bytes(&bare_status.stderr, b"run-command-e2e-secret");
+}
+
+#[test]
+fn run_rejects_a_profile_that_has_not_been_loaded() {
+    let fixture = DaemonFixture::initialize_and_start();
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+    assert_success(&fixture.run(
+        &["--output", "json", "profile", "create", "unloaded"],
+        None,
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "unloaded.RUN_TOKEN",
+            "--stdin",
+        ],
+        Some(b"unloaded-secret"),
+    ));
+
+    let output = fixture.run(
+        &["run", "--profile", "unloaded", "--", "printenv", "RUN_TOKEN"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("profile_not_loaded"), "stderr: {stderr}");
+    assert_no_bytes(&output.stdout, b"unloaded-secret");
+
+    assert_success(&fixture.run(
+        &["--output", "json", "profile", "load", "unloaded"],
+        None,
+    ));
+    let output = fixture.run(
+        &["run", "--profile", "unloaded", "--", "printenv", "RUN_TOKEN"],
+        None,
+    );
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "unloaded-secret"
+    );
 }
 
 #[test]
@@ -1165,6 +1330,14 @@ fn run_workspace_rejects_duplicate_secret_name_across_profiles() {
             "--stdin",
         ],
         Some(b"team-b-secret"),
+    ));
+    assert_success(&fixture.run(
+        &["--output", "json", "profile", "load", "team-a"],
+        None,
+    ));
+    assert_success(&fixture.run(
+        &["--output", "json", "profile", "load", "team-b"],
+        None,
     ));
 
     let output = fixture.run(

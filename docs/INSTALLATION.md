@@ -83,24 +83,6 @@ The `envault-tui` binary is an optional interactive client and does not replace 
 On Unix, `envault start` can spawn the daemon after the human bootstrap prompt.
 On Windows, start `envaultd.exe` from a supervised process or terminal before using client commands because automatic client-side daemon spawning is not available yet.
 
-## Shell completions
-
-The quick installer (`install.sh`) detects `bash`, `zsh`, and `fish` on the machine and installs a completion script for each into the shell's standard completion directory, adding an `fpath` entry to `~/.zshrc` for zsh if one is not already present.
-Restart the shell, or source the generated file directly, to pick up completions immediately.
-
-For a manual install, a build without `install.sh`, or `elvish`/`powershell`, generate the script directly:
-
-```sh
-# bash
-envault completions bash | sudo tee /etc/bash_completion.d/envault >/dev/null
-
-# zsh (any directory on $fpath)
-envault completions zsh > "${fpath[1]}/_envault"
-
-# fish
-envault completions fish > ~/.config/fish/completions/envault.fish
-```
-
 ## Agent integration
 
 EnVault supports both an explicit session hook and an installable Agent Skill.

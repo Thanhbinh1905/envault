@@ -307,8 +307,8 @@ impl RuntimeState {
             .map_err(|error| map_service_failure(&error))
     }
 
-    /// Not admin-gated and not loaded-set-gated: naming a profile here is
-    /// itself the explicit action `envault run` requires.
+    /// Not admin-gated, but every named profile must already be in the
+    /// runtime loaded set - `resolve_run_env` enforces that.
     fn resolve_run_env(
         &mut self,
         profiles: &[String],
@@ -326,6 +326,22 @@ impl RuntimeState {
                 value: SensitiveBytes::new(value.into_vec()),
             })
             .collect())
+    }
+
+    /// Not admin-gated, but the named profile must already be in the
+    /// runtime loaded set - `resolve_argv_secret` enforces that.
+    fn resolve_argv_secret(
+        &mut self,
+        profile: &str,
+        name: &str,
+    ) -> Result<SensitiveBytes, RuntimeFailure> {
+        let value = self
+            .vault
+            .as_ref()
+            .ok_or(RuntimeFailure::Locked)?
+            .resolve_argv_secret(profile, name)
+            .map_err(|error| map_service_failure(&error))?;
+        Ok(SensitiveBytes::new(value.into_vec()))
     }
 
     fn require_admin(&mut self, peer: PeerIdentity) -> Result<(), RuntimeFailure> {
@@ -966,6 +982,10 @@ impl RuntimeState {
                 let vars = self.resolve_run_env(&profiles)?;
                 Ok((Reply::RunEnv(vars), false))
             }
+            Operation::ResolveArgvSecret { profile, name } => {
+                let value = self.resolve_argv_secret(&profile, &name)?;
+                Ok((Reply::ArgvSecret(value), false))
+            }
             Operation::RevealSecretValue {
                 profile,
                 name,
@@ -1060,9 +1080,13 @@ impl RuntimeState {
                 }
                 .map_err(|error| map_service_failure(&error))?,
             ),
-            Operation::UpdateProfile { name, description } => Reply::Profile(
+            Operation::UpdateProfile {
+                name,
+                description,
+                activate_on_start,
+            } => Reply::Profile(
                 vault
-                    .update_profile(&name, description.as_deref())
+                    .update_profile(&name, description.as_deref(), activate_on_start)
                     .map_err(|error| map_service_failure(&error))?,
             ),
             Operation::RenameProfile { old_name, new_name } => Reply::Profile(

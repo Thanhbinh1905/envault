@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -94,6 +94,14 @@ pub struct VaultSession {
     root_scope_id: ScopeId,
     master_key: SecretKey,
     database_path: PathBuf,
+    /// The runtime loaded set for this session only - reset every time the
+    /// vault unlocks. Seeded from every profile with `activate_on_start`
+    /// (the persisted "auto-load on next unlock" preference), then mutated
+    /// ad hoc by `load_profile`/`unload_profile`. Never written back to
+    /// `activate_on_start` - the two are deliberately decoupled: a profile
+    /// can be loaded this session without being flagged to auto-load next
+    /// time, and vice versa.
+    loaded: HashSet<ProfileId>,
 }
 
 impl core::fmt::Debug for VaultSession {
@@ -313,12 +321,18 @@ impl VaultSession {
             })
             .collect::<Vec<_>>();
         validate_startup_profile(&summaries).map_err(|_| ServiceError::Corrupt)?;
+        let loaded = profiles
+            .iter()
+            .filter(|profile| profile.activate_on_start)
+            .map(|profile| profile.id)
+            .collect();
         let session = Self {
             store,
             vault_id: vault.id,
             root_scope_id: root_scope.id,
             master_key,
             database_path: database_path.to_path_buf(),
+            loaded,
         };
         session.store.integrity_check()?;
         session
@@ -448,6 +462,7 @@ impl VaultSession {
         &mut self,
         name: &str,
         description: Option<&str>,
+        activate_on_start: Option<bool>,
     ) -> Result<ProfileView, ServiceError> {
         validate_optional_description(description)?;
         let mut record = self.profile_by_name(name)?;
@@ -462,6 +477,21 @@ impl VaultSession {
             .checked_add(1)
             .ok_or(ServiceError::Corrupt)?;
         self.store.update_profile_metadata(&record)?;
+        if let Some(activate_on_start) = activate_on_start {
+            let other_active = self
+                .store
+                .profiles()?
+                .iter()
+                .filter(|other| other.id != record.id)
+                .filter(|other| other.activate_on_start)
+                .count();
+            if !activate_on_start && other_active == 0 {
+                return Err(ServiceError::StartupProfileRequired);
+            }
+            self.store
+                .set_profile_activate_on_start(record.id, activate_on_start)?;
+            record.activate_on_start = activate_on_start;
+        }
         self.profile_view(&record)
     }
 
@@ -495,32 +525,27 @@ impl VaultSession {
         self.profile_view(&record)
     }
 
-    /// Adds `name` to the loaded set (`activate_on_start`), making its
-    /// secrets (and any other already-loaded profile's) reachable this
-    /// session and every future daemon start, until `unload_profile`.
+    /// Adds `name` to the runtime loaded set for this session only. Does
+    /// not touch the persisted `activate_on_start` preference - loading a
+    /// profile here does not make it auto-load on the next unlock, and a
+    /// profile flagged `activate_on_start` still needs nothing further,
+    /// since it was already seeded into `loaded` at unlock time.
     pub fn load_profile(&mut self, name: &str) -> Result<ProfileView, ServiceError> {
         let record = self.profile_by_name(name)?;
-        if record.activate_on_start {
-            return self.profile_view(&record);
-        }
-        self.store.set_profile_loaded(record.id, true)?;
-        self.profile_by_name(name)
-            .and_then(|updated| self.profile_view(&updated))
+        self.loaded.insert(record.id);
+        self.profile_view(&record)
     }
 
-    /// Removes `name` from the loaded set. The base profile (root scope)
-    /// can never be unloaded - it is the permanent underlay.
+    /// Removes `name` from the runtime loaded set for this session only.
+    /// The base profile (root scope) can never be unloaded - it is the
+    /// permanent underlay.
     pub fn unload_profile(&mut self, name: &str) -> Result<ProfileView, ServiceError> {
         let record = self.profile_by_name(name)?;
         if record.scope_id == self.root_scope_id {
             return Err(ServiceError::StartupProfileRequired);
         }
-        if !record.activate_on_start {
-            return self.profile_view(&record);
-        }
-        self.store.set_profile_loaded(record.id, false)?;
-        self.profile_by_name(name)
-            .and_then(|updated| self.profile_view(&updated))
+        self.loaded.remove(&record.id);
+        self.profile_view(&record)
     }
 
     /// Every profile grouped under `workspace` (its own profiles plus any
@@ -596,7 +621,7 @@ impl VaultSession {
         profile: &str,
     ) -> Result<Vec<envault_core::ResolvedSecretView>, ServiceError> {
         let record = self.profile_by_name(profile)?;
-        if !record.activate_on_start {
+        if !self.loaded.contains(&record.id) {
             return Err(ServiceError::ProfileNotLoaded);
         }
         self.resolved_secrets(record.scope_id)
@@ -609,18 +634,21 @@ impl VaultSession {
 
     /// Resolves the effective (name, plaintext) pairs across one or more
     /// profiles for `envault run` - the sole path that lets plaintext leave
-    /// the daemon into a process, never through CLI stdout. Deliberately
-    /// does not require the profile to already be in the loaded set: naming
-    /// it here is itself the explicit action. Later profiles in `profiles`
-    /// override earlier ones on name collision.
+    /// the daemon into a process, never through CLI stdout. Each profile
+    /// must already be in the runtime loaded set, matching `secret_by_ref`'s
+    /// `require_loaded` check used by `request http`; `run` never loads a
+    /// profile as a side effect of naming it here.
     pub fn resolve_run_env(
         &self,
         profiles: &[String],
     ) -> Result<Vec<(String, SecretBytes)>, ServiceError> {
         let mut values: BTreeMap<String, SecretBytes> = BTreeMap::new();
         for profile_name in profiles {
-            let scope_id = self.bind_profile(profile_name)?.scope_id;
-            for item in self.resolved_secrets(scope_id)? {
+            let record = self.profile_by_name(profile_name)?;
+            if !self.loaded.contains(&record.id) {
+                return Err(ServiceError::ProfileNotLoaded);
+            }
+            for item in self.resolved_secrets(record.scope_id)? {
                 let secret = self
                     .store
                     .secret_by_id(item.secret.id)?
@@ -638,6 +666,21 @@ impl VaultSession {
             }
         }
         Ok(values.into_iter().collect())
+    }
+
+    /// Resolves one secret's plaintext for a `{{profile.NAME}}` placeholder
+    /// in `envault run`'s command args. Same `require_loaded` gate as
+    /// `resolve_run_env`; the CLI never prints this, only feeds it into an
+    /// anonymous pipe inherited by the spawned child.
+    pub fn resolve_argv_secret(&self, profile: &str, name: &str) -> Result<SecretBytes, ServiceError> {
+        let secret = self.secret_by_ref(profile, name, true)?;
+        let version = self
+            .store
+            .secret_versions(secret.id)?
+            .into_iter()
+            .last()
+            .ok_or(ServiceError::Corrupt)?;
+        self.decrypt_secret_version(&secret, &version)
     }
 
     pub fn update_secret(
@@ -1087,9 +1130,9 @@ impl VaultSession {
     }
 
     /// Resolves a secret within `profile`'s own scope. When `require_loaded`
-    /// is set, the profile must be in the loaded set (`activate_on_start`) -
-    /// used for ambient/ad-hoc reads (describe, versions), not for direct
-    /// admin management (rename/update/delete/rotate).
+    /// is set, the profile must be in the runtime loaded set - used for
+    /// ambient/ad-hoc reads (describe, versions), not for direct admin
+    /// management (rename/update/delete/rotate).
     fn secret_by_ref(
         &self,
         profile: &str,
@@ -1097,7 +1140,7 @@ impl VaultSession {
         require_loaded: bool,
     ) -> Result<SecretRecord, ServiceError> {
         let profile_record = self.profile_by_name(profile)?;
-        if require_loaded && !profile_record.activate_on_start {
+        if require_loaded && !self.loaded.contains(&profile_record.id) {
             return Err(ServiceError::ProfileNotLoaded);
         }
         let normalized = normalize_name(name)?;
@@ -1128,6 +1171,7 @@ impl VaultSession {
                 record.encrypted_description.as_deref(),
             )?,
             activate_on_start: record.activate_on_start,
+            loaded: self.loaded.contains(&record.id),
             generation: record.generation,
         })
     }

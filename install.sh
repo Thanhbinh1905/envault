@@ -127,26 +127,26 @@ ok "$install_dir/envault-tui"
 info "Shell completions"
 completions_installed=0
 
-if command -v bash >/dev/null 2>&1; then
+if [ -f "$bundle/completions/envault.bash" ] && command -v bash >/dev/null 2>&1; then
   bash_comp_dir="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
   mkdir -p "$bash_comp_dir"
-  "$install_dir/envault" completions bash >"$bash_comp_dir/envault"
+  cp "$bundle/completions/envault.bash" "$bash_comp_dir/envault"
   ok "bash: $bash_comp_dir/envault"
   completions_installed=1
 fi
 
-if command -v fish >/dev/null 2>&1; then
+if [ -f "$bundle/completions/envault.fish" ] && command -v fish >/dev/null 2>&1; then
   fish_comp_dir="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
   mkdir -p "$fish_comp_dir"
-  "$install_dir/envault" completions fish >"$fish_comp_dir/envault.fish"
+  cp "$bundle/completions/envault.fish" "$fish_comp_dir/envault.fish"
   ok "fish: $fish_comp_dir/envault.fish"
   completions_installed=1
 fi
 
-if command -v zsh >/dev/null 2>&1; then
+if [ -f "$bundle/completions/_envault" ] && command -v zsh >/dev/null 2>&1; then
   zsh_comp_dir="$HOME/.zsh/completions"
   mkdir -p "$zsh_comp_dir"
-  "$install_dir/envault" completions zsh >"$zsh_comp_dir/_envault"
+  cp "$bundle/completions/_envault" "$zsh_comp_dir/_envault"
   completions_installed=1
 
   zshrc="$HOME/.zshrc"
@@ -164,7 +164,7 @@ if command -v zsh >/dev/null 2>&1; then
 fi
 
 if [ "$completions_installed" -eq 0 ]; then
-  warn "no supported shell (bash/zsh/fish) detected; run '$install_dir/envault completions <bash|zsh|fish|elvish|powershell>' and source the output manually"
+  warn "no supported shell (bash/zsh/fish) detected, or this release archive has no completions/ directory"
 fi
 
 if case ":${PATH:-}:" in *":$install_dir:"*) true ;; *) false ;; esac; then
