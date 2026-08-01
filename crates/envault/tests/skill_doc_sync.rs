@@ -71,8 +71,11 @@ fn skill_doc_matches_live_cli() {
     };
 
     let bin_path = PathBuf::from(env!("CARGO_BIN_EXE_envault"));
+    // clap's usage line uses `bin_name`, which defaults to the actual
+    // executable's file name (envault.exe on Windows) rather than the
+    // `name = "envault"` set on the `Cli` command.
     let bin_name = bin_path
-        .file_stem()
+        .file_name()
         .expect("envault binary path has a file name")
         .to_string_lossy();
 
