@@ -675,7 +675,11 @@ impl VaultSession {
     /// in `envault run`'s command args. Same `require_loaded` gate as
     /// `resolve_run_env`; the CLI never prints this, only feeds it into an
     /// anonymous pipe inherited by the spawned child.
-    pub fn resolve_argv_secret(&self, profile: &str, name: &str) -> Result<SecretBytes, ServiceError> {
+    pub fn resolve_argv_secret(
+        &self,
+        profile: &str,
+        name: &str,
+    ) -> Result<SecretBytes, ServiceError> {
         let secret = self.secret_by_ref(profile, name, true)?;
         let version = self
             .store

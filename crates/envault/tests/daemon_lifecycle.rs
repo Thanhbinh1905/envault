@@ -1079,14 +1079,8 @@ fn run_accepts_repeated_profile_flags_across_unrelated_profiles() {
         &["--output", "json", "admin", "unlock", "--password-stdin"],
         Some(PASSWORD),
     ));
-    assert_success(&fixture.run(
-        &["--output", "json", "profile", "create", "db"],
-        None,
-    ));
-    assert_success(&fixture.run(
-        &["--output", "json", "profile", "create", "cache"],
-        None,
-    ));
+    assert_success(&fixture.run(&["--output", "json", "profile", "create", "db"], None));
+    assert_success(&fixture.run(&["--output", "json", "profile", "create", "cache"], None));
     assert_success(&fixture.run(
         &[
             "--output",
@@ -1141,10 +1135,7 @@ fn run_resolves_argv_placeholders_via_a_pipe_without_a_profile_or_workspace_flag
         &["--output", "json", "admin", "unlock", "--password-stdin"],
         Some(PASSWORD),
     ));
-    assert_success(&fixture.run(
-        &["--output", "json", "profile", "create", "db"],
-        None,
-    ));
+    assert_success(&fixture.run(&["--output", "json", "profile", "create", "db"], None));
     assert_success(&fixture.run(
         &[
             "--output",
@@ -1158,15 +1149,7 @@ fn run_resolves_argv_placeholders_via_a_pipe_without_a_profile_or_workspace_flag
     ));
     assert_success(&fixture.run(&["--output", "json", "profile", "load", "db"], None));
 
-    let output = fixture.run(
-        &[
-            "run",
-            "--",
-            "cat",
-            "{{db.PGPASSWORD}}",
-        ],
-        None,
-    );
+    let output = fixture.run(&["run", "--", "cat", "{{db.PGPASSWORD}}"], None);
     assert_success(&output);
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
@@ -1175,10 +1158,7 @@ fn run_resolves_argv_placeholders_via_a_pipe_without_a_profile_or_workspace_flag
 
     // The placeholder's own text never appears in the exec'd argv - only a
     // /dev/fd path does, so `ps`-style inspection never sees the secret.
-    let unloaded = fixture.run(
-        &["run", "--", "cat", "{{db.MISSING}}"],
-        None,
-    );
+    let unloaded = fixture.run(&["run", "--", "cat", "{{db.MISSING}}"], None);
     assert_eq!(unloaded.status.code(), Some(1));
 
     let malformed = fixture.run(&["run", "--", "cat", "{{no-dot-here}}"], None);
@@ -1234,10 +1214,7 @@ fn run_rejects_a_profile_that_has_not_been_loaded() {
         &["--output", "json", "admin", "unlock", "--password-stdin"],
         Some(PASSWORD),
     ));
-    assert_success(&fixture.run(
-        &["--output", "json", "profile", "create", "unloaded"],
-        None,
-    ));
+    assert_success(&fixture.run(&["--output", "json", "profile", "create", "unloaded"], None));
     assert_success(&fixture.run(
         &[
             "--output",
@@ -1251,7 +1228,14 @@ fn run_rejects_a_profile_that_has_not_been_loaded() {
     ));
 
     let output = fixture.run(
-        &["run", "--profile", "unloaded", "--", "printenv", "RUN_TOKEN"],
+        &[
+            "run",
+            "--profile",
+            "unloaded",
+            "--",
+            "printenv",
+            "RUN_TOKEN",
+        ],
         None,
     );
     assert_eq!(output.status.code(), Some(1));
@@ -1259,12 +1243,16 @@ fn run_rejects_a_profile_that_has_not_been_loaded() {
     assert!(stderr.contains("profile_not_loaded"), "stderr: {stderr}");
     assert_no_bytes(&output.stdout, b"unloaded-secret");
 
-    assert_success(&fixture.run(
-        &["--output", "json", "profile", "load", "unloaded"],
-        None,
-    ));
+    assert_success(&fixture.run(&["--output", "json", "profile", "load", "unloaded"], None));
     let output = fixture.run(
-        &["run", "--profile", "unloaded", "--", "printenv", "RUN_TOKEN"],
+        &[
+            "run",
+            "--profile",
+            "unloaded",
+            "--",
+            "printenv",
+            "RUN_TOKEN",
+        ],
         None,
     );
     assert_success(&output);
@@ -1281,10 +1269,7 @@ fn run_workspace_rejects_duplicate_secret_name_across_profiles() {
         &["--output", "json", "admin", "unlock", "--password-stdin"],
         Some(PASSWORD),
     ));
-    assert_success(&fixture.run(
-        &["--output", "json", "workspace", "create", "team"],
-        None,
-    ));
+    assert_success(&fixture.run(&["--output", "json", "workspace", "create", "team"], None));
     assert_success(&fixture.run(
         &[
             "--output",
@@ -1331,14 +1316,8 @@ fn run_workspace_rejects_duplicate_secret_name_across_profiles() {
         ],
         Some(b"team-b-secret"),
     ));
-    assert_success(&fixture.run(
-        &["--output", "json", "profile", "load", "team-a"],
-        None,
-    ));
-    assert_success(&fixture.run(
-        &["--output", "json", "profile", "load", "team-b"],
-        None,
-    ));
+    assert_success(&fixture.run(&["--output", "json", "profile", "load", "team-a"], None));
+    assert_success(&fixture.run(&["--output", "json", "profile", "load", "team-b"], None));
 
     let output = fixture.run(
         &[

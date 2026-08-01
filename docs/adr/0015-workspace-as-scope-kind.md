@@ -28,3 +28,8 @@ A profile's workspace is fixed at creation time by which parent scope it is boun
 Workspace membership, override, and tombstone behavior are exactly the pre-existing scope-tree semantics: no separate test surface is needed for "does a workspace override correctly," because it is the same scope-chain resolution already covered for profiles.
 Renaming or deleting a workspace is renaming or deleting its scope, subject to the same non-empty and root-scope protections as any other scope.
 A future need to move a profile between workspaces would require a scope re-parenting operation, which does not exist yet.
+
+## Addendum (2026-08-01): workspace load targets the runtime loaded set only
+
+`envault workspace load <name>` now adds every profile in the subtree to the runtime loaded set (see the glossary) instead of setting `activate_on_start = true`.
+It no longer changes which profiles auto-load on the next unlock; use `profile update --activate-on-start` for that.

@@ -343,11 +343,7 @@ struct SecretCreateArgs {
 
 #[derive(Clone, Debug, clap::Args)]
 struct SecretListArgs {
-    #[arg(
-        short,
-        long,
-        help = "Deprecated: use `--fields description` instead"
-    )]
+    #[arg(short, long, help = "Deprecated: use `--fields description` instead")]
     describe: bool,
     #[arg(
         short,
@@ -744,11 +740,11 @@ fn report_parse_error(error: &clap::Error) -> ExitCode {
 /// terminal that isn't opted out via `NO_COLOR`, so piped/redirected help
 /// output stays plain text.
 fn dim_help_descriptions(help: &str) -> String {
+    const DIM: &str = "\x1b[2m";
+    const RESET: &str = "\x1b[0m";
     if !io::stdout().is_terminal() || std::env::var_os("NO_COLOR").is_some() {
         return help.to_string();
     }
-    const DIM: &str = "\x1b[2m";
-    const RESET: &str = "\x1b[0m";
     let mut out = String::with_capacity(help.len() + 128);
     for chunk in help.split_inclusive('\n') {
         let (line, newline) = match chunk.strip_suffix('\n') {
@@ -2013,11 +2009,11 @@ fn run_command(output: Output, arguments: RunArgs) -> ExitCode {
         Ok(env_vars) => env_vars,
         Err(exit_code) => return exit_code,
     };
-    let placeholder_guards =
-        match resolve_placeholders(output, &placeholders, &mut command_tokens) {
-            Ok(guards) => guards,
-            Err(exit_code) => return exit_code,
-        };
+    let placeholder_guards = match resolve_placeholders(output, &placeholders, &mut command_tokens)
+    {
+        Ok(guards) => guards,
+        Err(exit_code) => return exit_code,
+    };
 
     let (program, args) = command_tokens
         .split_first()

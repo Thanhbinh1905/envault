@@ -94,7 +94,7 @@ auth = "admin"
 daemon = "required"
 agent = false
 outputs = ["human", "json", "toon"]
-errors = ["admin_auth_required", "not_found", "invalid_input"]
+errors = ["admin_auth_required", "not_found", "invalid_input", "conflict"]
 
 [[command]]
 path = "profile rename"
@@ -158,7 +158,7 @@ auth = "admin"
 daemon = "required"
 agent = false
 outputs = ["human", "json", "toon"]
-errors = ["admin_auth_required", "not_found", "invalid_input"]
+errors = ["admin_auth_required", "not_found", "invalid_input", "conflict"]
 
 [[command]]
 path = "secret rename"
@@ -190,7 +190,7 @@ auth = "admin"
 daemon = "required"
 agent = false
 outputs = ["human", "json", "toon"]
-errors = ["admin_auth_required", "not_found", "invalid_input"]
+errors = ["admin_auth_required", "not_found", "invalid_input", "conflict"]
 
 [[command]]
 path = "secret value generate"
@@ -198,7 +198,7 @@ auth = "admin"
 daemon = "required"
 agent = false
 outputs = ["human", "json", "toon"]
-errors = ["admin_auth_required", "not_found", "invalid_input"]
+errors = ["admin_auth_required", "not_found", "invalid_input", "conflict"]
 
 [[command]]
 path = "request http"
@@ -334,4 +334,4 @@ auth = "service"
 daemon = "required"
 agent = true
 outputs = ["human", "json", "toon"]
-errors = ["envault_locked", "run_target_required", "secret_not_utf8", "run_spawn_failed", "protocol_error", "duplicate_secret_across_profiles"]
+errors = ["envault_locked", "run_target_required", "secret_not_utf8", "run_spawn_failed", "protocol_error", "duplicate_secret_across_profiles", "profile_not_loaded", "invalid_placeholder", "argv_pipe_failed", "argv_placeholder_unsupported"]

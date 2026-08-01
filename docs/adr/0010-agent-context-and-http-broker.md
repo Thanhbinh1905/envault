@@ -44,6 +44,6 @@ The first broker deliberately supports Bearer authentication only and cannot pro
 
 `Operation::Context`, `CreateAgentSession`, `AgentSessionStatus`, `RevokeAgentSession`, and the entire `Principal`/`PrincipalKind::Agent` concept were removed.
 There is no session, token, or identity distinguishing one agent process from another, or from a human's own CLI use.
-Agent access to secret metadata is now governed purely by the loaded set (whether a profile has `activate_on_start = true`); agent access to an HTTP action is governed purely by the `secret_http_access` record on the target secret (ADR 0004's addendum).
+Agent access to secret metadata is now governed purely by the loaded set (see the glossary); agent access to an HTTP action is governed purely by the `secret_http_access` record on the target secret (ADR 0004's addendum).
 Both checks depend only on same-uid trust in the daemon's peer authentication (ADR 0009), not on any claim the caller presents.
 The broker's own constraints (HTTPS-only, no redirects, host/method/path matching, response firewall) are unchanged, per ADR 0006's addendum.
