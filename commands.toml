@@ -377,6 +377,22 @@ outputs = ["human", "json", "toon"]
 errors = ["envault_locked", "run_target_required", "secret_not_utf8", "run_spawn_failed", "protocol_error", "duplicate_secret_across_profiles", "profile_not_loaded", "invalid_placeholder", "argv_pipe_failed", "argv_placeholder_unsupported"]
 
 [[command]]
+path = "load"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found", "conflict", "project_config_not_found", "project_config_invalid", "io_error"]
+
+[[command]]
+path = "unload"
+auth = "admin"
+daemon = "required"
+agent = false
+outputs = ["human", "json", "toon"]
+errors = ["admin_auth_required", "not_found", "conflict", "io_error"]
+
+[[command]]
 path = "uninstall"
 auth = "human"
 daemon = "spawns"
