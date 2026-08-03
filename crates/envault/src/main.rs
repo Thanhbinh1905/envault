@@ -1763,7 +1763,11 @@ fn print_unload_summary(output: Output, summary: &UnloadSummary) -> ExitCode {
 /// and workspace it lists, then unloads whatever this same project directory
 /// had auto-loaded on a previous `envault load` that is no longer listed.
 /// Only profiles this mechanism itself loaded are ever candidates for
-/// unloading - profiles the user loaded some other way are left alone.
+/// unloading - profiles the user loaded some other way are left alone. To
+/// tell the two apart, each profile's loaded state is checked before this
+/// call loads it: a profile already loaded that this project did not
+/// previously track as its own is someone else's and is left out of the
+/// tracked set, even though loading it here is still requested and shown.
 fn cmd_load(output: Output) -> ExitCode {
     let cwd = match env::current_dir() {
         Ok(cwd) => cwd,
@@ -1789,24 +1793,24 @@ fn cmd_load(output: Output) -> ExitCode {
         Ok(state) => state,
         Err(error) => return print_error(output, &error),
     };
+    let previous = state.remove(&project_key).unwrap_or_default();
 
     let mut loaded = Vec::new();
+    let mut seen = HashSet::new();
     let mut effective = HashSet::new();
     for name in manifest.profiles {
-        match client::request(Operation::LoadProfile { name }) {
-            Ok(Reply::Profile(profile)) => {
-                effective.insert(profile.name.clone());
-                loaded.push(profile);
-            }
+        let was_loaded_before = match client::request(Operation::ShowProfile { name: name.clone() })
+        {
+            Ok(Reply::Profile(profile)) => profile.loaded,
             Ok(_) => return print_error(output, &unexpected_response()),
             Err(error) => return print_error(output, &client_error(error)),
-        }
-    }
-    for name in manifest.workspaces {
-        match client::request(Operation::LoadWorkspace { name }) {
-            Ok(Reply::WorkspaceProfiles(profiles)) => {
-                for profile in profiles {
+        };
+        match client::request(Operation::LoadProfile { name }) {
+            Ok(Reply::Profile(profile)) => {
+                if !was_loaded_before || previous.effective_profiles.contains(&profile.name) {
                     effective.insert(profile.name.clone());
+                }
+                if seen.insert(profile.name.clone()) {
                     loaded.push(profile);
                 }
             }
@@ -1814,8 +1818,35 @@ fn cmd_load(output: Output) -> ExitCode {
             Err(error) => return print_error(output, &client_error(error)),
         }
     }
+    for name in manifest.workspaces {
+        let already_loaded: HashSet<String> =
+            match client::request(Operation::ShowWorkspace { name: name.clone() }) {
+                Ok(Reply::WorkspaceProfiles(profiles)) => profiles
+                    .into_iter()
+                    .filter(|profile| profile.loaded)
+                    .map(|profile| profile.name)
+                    .collect(),
+                Ok(_) => return print_error(output, &unexpected_response()),
+                Err(error) => return print_error(output, &client_error(error)),
+            };
+        match client::request(Operation::LoadWorkspace { name }) {
+            Ok(Reply::WorkspaceProfiles(profiles)) => {
+                for profile in profiles {
+                    if !already_loaded.contains(&profile.name)
+                        || previous.effective_profiles.contains(&profile.name)
+                    {
+                        effective.insert(profile.name.clone());
+                    }
+                    if seen.insert(profile.name.clone()) {
+                        loaded.push(profile);
+                    }
+                }
+            }
+            Ok(_) => return print_error(output, &unexpected_response()),
+            Err(error) => return print_error(output, &client_error(error)),
+        }
+    }
 
-    let previous = state.remove(&project_key).unwrap_or_default();
     let mut unloaded = Vec::new();
     for name in previous.effective_profiles {
         if effective.contains(&name) {
@@ -1830,7 +1861,10 @@ fn cmd_load(output: Output) -> ExitCode {
 
     let mut effective_profiles: Vec<String> = effective.into_iter().collect();
     effective_profiles.sort();
-    state.insert(project_key, project::ProjectLoadState { effective_profiles });
+    state.insert(
+        project_key,
+        project::ProjectLoadState { effective_profiles },
+    );
     if let Err(error) = project::write_state(&state) {
         return print_error(output, &error);
     }
@@ -1863,7 +1897,12 @@ fn cmd_unload(output: Output) -> ExitCode {
         Err(error) => return print_error(output, &error),
     };
     let Some(previous) = state.remove(&project_key) else {
-        return print_unload_summary(output, &UnloadSummary { unloaded: Vec::new() });
+        return print_unload_summary(
+            output,
+            &UnloadSummary {
+                unloaded: Vec::new(),
+            },
+        );
     };
     for name in &previous.effective_profiles {
         match client::request(Operation::UnloadProfile { name: name.clone() }) {
