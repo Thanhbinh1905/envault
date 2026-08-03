@@ -1176,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "envault"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.0",
  "clap",
@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "envault-broker"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.0",
  "percent-encoding",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "envault-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "proptest",
  "serde",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "envault-crypto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "blake3",
@@ -1245,7 +1245,7 @@ dependencies = [
 
 [[package]]
 name = "envault-platform"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "envault-windows-ffi",
  "nix",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "envault-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ciborium",
  "envault-broker",
@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "envault-service"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "age",
  "base64 0.23.0",
@@ -1293,7 +1293,7 @@ dependencies = [
 
 [[package]]
 name = "envault-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "envault-core",
@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "envault-windows-ffi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "tokio",
  "windows-sys 0.61.2",
@@ -4466,7 +4466,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "serde",

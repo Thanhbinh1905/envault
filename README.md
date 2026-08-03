@@ -1,61 +1,114 @@
 <h1 align="center">EnVault</h1>
 
 <p align="center">
+  <img src="assets/brand/envault-logo.png" alt="EnVault logo" width="180">
+</p>
+
+<p align="center">
+  Give developer tools and AI agents access to credentials without giving them the credentials themselves.
+</p>
+
+<p align="center">
   A local-first encrypted secret vault for developers and AI agents.
 </p>
 
-## The problem
+<p align="center">
+  <a href="#quick-start">Quick start</a> · <a href="#how-it-works">How it works</a> · <a href="#security-boundary">Security</a> · <a href="#command-reference">Command reference</a>
+</p>
 
-Developers and AI agents need credentials to do their job, but handing an agent a plaintext API key or database password is a standing risk.
-Once a secret is in an agent's context or environment, you can't take it back, scope it down, or make it expire.
-A single prompt injection, misconfigured tool, or leaked log line can turn one credential into a full compromise.
+## Why EnVault
 
-## The solution
+AI agents and developer tools need credentials to do useful work.
+Giving them a plaintext API key or database password creates a standing risk.
+Once a secret is in an agent's context, environment, logs, or tool output, you cannot reliably take it back, narrow its scope, or know where it travelled.
 
-EnVault keeps secrets in an encrypted local vault and never releases plaintext to an agent.
-A trusted local daemon, started only by an explicit human or automation action, brokers access on behalf of callers.
-Agents can read secret metadata and use a narrow, per-secret HTTP access allowlist, but they can never request admin actions, plaintext export, reveal, or arbitrary execution.
-Everything is local-first: no cloud dependency, no third party holding your secrets.
+This is not only a prompt-injection problem.
+An over-permissive tool, a copied terminal transcript, or a verbose error can turn one exposed credential into a much wider compromise.
 
-Read [the threat model](docs/threat-model.md) for the full security.
+EnVault is for the narrower, safer model: a human decides what may use a secret and for which action, while the agent never receives the secret value.
 
-## Quick setup
+## The EnVault model
 
-Install the latest release on macOS or Linux with the verified installer:
+EnVault stores secrets in an encrypted vault on your machine.
+A local daemon, started only by an explicit human or automation action, is the trusted boundary between callers and secret plaintext.
+There is no cloud service, shared control plane, or third party that holds your vault.
+
+For a human-operated command, EnVault can inject selected secrets into a child process without printing them.
+For an agent, EnVault exposes metadata and a constrained HTTP broker action for a pre-authorized secret and destination.
+Agents cannot request admin actions, plaintext reveal or export, arbitrary command execution, or daemon startup.
+
+## How it works
+
+1. Create a vault and start it explicitly.
+2. Store credentials in named profiles and grant an admin lease only while making changes.
+3. Run a trusted local command with secrets injected into its environment, or allow an agent to make one narrowly scoped HTTP request without seeing the credential.
+4. Lock or stop the daemon when the work is finished.
+
+The important distinction is who receives the plaintext.
+Your selected child process can receive it when that is the intended action.
+An AI agent never does.
+
+## Quick start
+
+Install the current release on macOS or Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Thanhbinh1905/envault/main/install.sh | sh
 ```
 
-The installer detects the platform, downloads the matching archive, verifies its SHA-256 checksum, and installs the binaries into `$HOME/.local/bin`.
+The installer detects your platform, verifies the downloaded archive's SHA-256 checksum, and installs the binaries into `$HOME/.local/bin`.
+For Windows, source installation, upgrades, and manual checksum verification, read the [installation guide](docs/INSTALLATION.md).
 
-Until then, use the [source installation instructions](docs/INSTALLATION.md#install-from-source).
-
-Initialize the vault and start the daemon explicitly:
+Create your vault, start the daemon, and store a first secret in the default `base` profile:
 
 ```sh
 envault init
 envault start
-envault status
+envault admin unlock
+printf '%s' "$MY_TOKEN" | envault secret create API_TOKEN --stdin
 ```
 
-Install the EnVault Agent Skill for on-demand guidance in an agent harness:
+Run a command with the loaded profile's secrets injected only into that child process:
+
+```sh
+envault run -- your-command
+```
+
+EnVault does not print secret values to the terminal.
+Use `envault status` to inspect the daemon state, `envault lock` to lock the vault, and `envault stop` to end the daemon.
+
+### Use EnVault with an agent
+
+Choose one integration for your agent harness.
+
+Install the EnVault Agent Skill when you want on-demand guidance:
 
 ```sh
 npx skills add Thanhbinh1905/envault --skill envault
 ```
 
-Alternatively, configure the explicit session hook:
+Or configure the explicit session hook when the harness supports session-start context injection:
 
 ```sh
 envault session setup
 ```
 
-Use either the Agent Skill or the session hook.
-See [docs/INSTALLATION.md](docs/INSTALLATION.md) for Windows, source installation, upgrades, and security details.
-See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the workspace layout, build commands, and CLI usage.
+Neither integration starts the daemon, authenticates, changes the vault, or receives plaintext credentials.
 
-## Commands
+## Security boundary
+
+EnVault is designed around a small trusted local boundary.
+
+- Secret values and metadata are encrypted at rest.
+- The daemon starts only through `envault start` and fails closed while stopped or locked.
+- Passwords are prompted securely or read from standard input, never accepted as command-line arguments or environment variables.
+- An admin lease is required for mutations, plaintext reveal, and plaintext export.
+- Encrypted profile and workspace packages are previewed before import and committed only with the returned plan hash.
+
+Read the [threat model](docs/threat-model.md) before allowing an agent to use the broker.
+It explains the protection boundary, residual risks, and the cases EnVault deliberately does not claim to solve.
+
+## Command reference
 
 Every command accepts a global `-o, --output <human|json|toon>` (default `human`).
 Run `envault <command> --help` for the full, exact flag set - the tables below are a quick-reference, not the complete contract.
