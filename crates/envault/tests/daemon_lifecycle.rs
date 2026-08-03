@@ -93,6 +93,32 @@ impl DaemonFixture {
         child.wait_with_output().expect("wait for envault")
     }
 
+    fn run_in(&self, dir: &Path, arguments: &[&str], input: Option<&[u8]>) -> Output {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_envault"))
+            .args(arguments)
+            .current_dir(dir)
+            .env("XDG_DATA_HOME", &self.data_home)
+            .env("XDG_RUNTIME_DIR", &self.runtime_home)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn envault");
+        if let Some(input) = input {
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(input)
+                .expect("write input");
+        }
+        child.wait_with_output().expect("wait for envault")
+    }
+
     fn json(&self, arguments: &[&str]) -> Value {
         let output = self.run(arguments, None);
         assert_success(&output);
@@ -1379,6 +1405,133 @@ fn describe_secret_typo_suggests_the_closest_existing_name() {
             .any(|item| item
                 .as_str()
                 .is_some_and(|item| item.contains("did you mean \"DATABASE_URL\"")))
+    );
+}
+
+#[test]
+fn project_load_and_unload_round_trip_via_manifest() {
+    let fixture = DaemonFixture::initialize_and_start();
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+    assert_success(&fixture.run(&["--output", "json", "profile", "create", "manual"], None));
+    assert_success(&fixture.run(&["--output", "json", "profile", "create", "alpha"], None));
+    assert_success(&fixture.run(&["--output", "json", "workspace", "create", "team"], None));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "profile",
+            "create",
+            "beta",
+            "--workspace",
+            "team",
+        ],
+        None,
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "profile",
+            "create",
+            "gamma",
+            "--workspace",
+            "team",
+        ],
+        None,
+    ));
+
+    // "manual" is loaded outside the manifest mechanism and must never be
+    // touched by `envault load`/`envault unload`.
+    assert_success(&fixture.run(&["--output", "json", "profile", "load", "manual"], None));
+
+    let project_dir = fixture.directory.path().to_path_buf();
+    fs::write(
+        project_dir.join(".envault.toml"),
+        "profiles = [\"alpha\"]\nworkspaces = [\"team\"]\n",
+    )
+    .expect("write manifest");
+
+    let loaded = fixture.run_in(&project_dir, &["--output", "json", "load"], None);
+    assert_success(&loaded);
+    let loaded_body: Value = serde_json::from_slice(&loaded.stdout).expect("load JSON");
+    let loaded_names: Vec<&str> = loaded_body["loaded"]
+        .as_array()
+        .expect("loaded array")
+        .iter()
+        .map(|profile| profile["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(loaded_names, vec!["alpha", "beta", "gamma"]);
+    assert!(loaded_body["unloaded"].as_array().expect("unloaded array").is_empty());
+
+    for name in ["alpha", "beta", "gamma", "manual"] {
+        assert_eq!(
+            fixture.json(&["--output", "json", "profile", "show", name])[0]["loaded"],
+            true,
+            "{name} should be loaded"
+        );
+    }
+
+    // Drop the workspace from the manifest; the next `load` should auto-unload
+    // beta/gamma (this mechanism's own doing) but leave "manual" alone.
+    fs::write(project_dir.join(".envault.toml"), "profiles = [\"alpha\"]\n")
+        .expect("rewrite manifest");
+    let reloaded = fixture.run_in(&project_dir, &["--output", "json", "load"], None);
+    assert_success(&reloaded);
+    let reloaded_body: Value = serde_json::from_slice(&reloaded.stdout).expect("reload JSON");
+    let mut unloaded: Vec<&str> = reloaded_body["unloaded"]
+        .as_array()
+        .expect("unloaded array")
+        .iter()
+        .map(|name| name.as_str().expect("name"))
+        .collect();
+    unloaded.sort_unstable();
+    assert_eq!(unloaded, vec!["beta", "gamma"]);
+
+    assert_eq!(
+        fixture.json(&["--output", "json", "profile", "show", "alpha"])[0]["loaded"],
+        true
+    );
+    assert_eq!(
+        fixture.json(&["--output", "json", "profile", "show", "beta"])[0]["loaded"],
+        false
+    );
+    assert_eq!(
+        fixture.json(&["--output", "json", "profile", "show", "gamma"])[0]["loaded"],
+        false
+    );
+    assert_eq!(
+        fixture.json(&["--output", "json", "profile", "show", "manual"])[0]["loaded"],
+        true,
+        "manually loaded profile must survive project auto-unload"
+    );
+
+    // Full teardown via `envault unload`.
+    let unload = fixture.run_in(&project_dir, &["--output", "json", "unload"], None);
+    assert_success(&unload);
+    let unload_body: Value = serde_json::from_slice(&unload.stdout).expect("unload JSON");
+    assert_eq!(unload_body["unloaded"], serde_json::json!(["alpha"]));
+    assert_eq!(
+        fixture.json(&["--output", "json", "profile", "show", "alpha"])[0]["loaded"],
+        false
+    );
+    assert_eq!(
+        fixture.json(&["--output", "json", "profile", "show", "manual"])[0]["loaded"],
+        true
+    );
+
+    // A second `unload` with nothing tracked is a no-op, not an error.
+    let second_unload = fixture.run_in(&project_dir, &["--output", "json", "unload"], None);
+    assert_success(&second_unload);
+    let second_unload_body: Value =
+        serde_json::from_slice(&second_unload.stdout).expect("second unload JSON");
+    assert!(
+        second_unload_body["unloaded"]
+            .as_array()
+            .expect("unloaded array")
+            .is_empty()
     );
 }
 
