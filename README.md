@@ -150,6 +150,8 @@ Individual credentials that live inside a profile.
 | `workspace load <name>` | Load every profile in a workspace | admin lease | - |
 | `workspace bind <workspace> <profile>` / `unbind <workspace> <profile>` | Add or remove a profile's membership in a workspace | admin lease | - |
 | `workspace delete <name>` | Delete a workspace (must have no remaining members) | admin lease | - |
+| `load` | Load the profiles/workspaces listed in this directory's `.envault.toml`, unloading anything this same directory previously auto-loaded that's no longer listed | admin lease | - |
+| `unload` | Unload everything `load` previously auto-loaded for this directory | admin lease | - |
 | `request http <url>` | Make an outbound HTTP request using a secret as a header/query value, without exposing it | unlocked | `-s, --secret <profile.name>`; `-m, --method`; `-b, --body-file`; `-f, --full` |
 | `convenience-unlock enable` | Store the master password in the OS keyring so `start` doesn't need to prompt | password | `-p, --password-stdin`; `-a, --acknowledge-os-keystore` (required) |
 | `convenience-unlock disable` / `status` | Remove the stored password / check whether it's enabled | none | - |

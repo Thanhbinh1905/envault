@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::HashSet,
     env, fs,
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
@@ -25,6 +26,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 mod convenience_unlock;
+mod project;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -90,6 +92,12 @@ enum Command {
         command: SessionCommand,
     },
     Run(RunArgs),
+    /// Load the profiles/workspaces listed in this directory's `.envault.toml`,
+    /// unloading anything previously auto-loaded for this project that's no
+    /// longer listed
+    Load,
+    /// Unload everything `envault load` previously auto-loaded for this directory
+    Unload,
     Uninstall(UninstallArgs),
     /// Not part of the public command surface (absent from `--help` and
     /// `commands.toml`) - built only via the `internal-completions` feature,
@@ -881,6 +889,8 @@ fn main() -> ExitCode {
         Command::ConvenienceUnlock { command } => convenience_unlock_command(cli.output, command),
         Command::Session { command } => session_command(cli.output, command),
         Command::Run(arguments) => run_command(cli.output, arguments),
+        Command::Load => cmd_load(cli.output),
+        Command::Unload => cmd_unload(cli.output),
         Command::Uninstall(arguments) => uninstall_command(cli.output, &arguments),
         #[cfg(feature = "internal-completions")]
         Command::Completions(arguments) => completions(arguments.shell),
@@ -1691,6 +1701,277 @@ fn profile_load(output: Output, arguments: ProfileLoadArgs) -> ExitCode {
         Ok(_) => print_error(output, &unexpected_response()),
         Err(error) => print_error(output, &client_error(error)),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct LoadSummary {
+    loaded: Vec<ProfileView>,
+    unloaded: Vec<String>,
+}
+
+impl JsonPrintable for LoadSummary {}
+
+fn print_load_summary(output: Output, summary: &LoadSummary) -> ExitCode {
+    match output {
+        Output::Json => {
+            print_json(summary);
+            ExitCode::SUCCESS
+        }
+        Output::Toon => {
+            print_profiles(output, &summary.loaded, &[]);
+            println!("unloaded[{}]{{name}}:", summary.unloaded.len());
+            for name in &summary.unloaded {
+                println!("  {}", toon_string(name));
+            }
+            ExitCode::SUCCESS
+        }
+        Output::Human => {
+            print_profiles(output, &summary.loaded, &[]);
+            if !summary.unloaded.is_empty() {
+                println!("unloaded: {}", summary.unloaded.join(", "));
+            }
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct UnloadSummary {
+    unloaded: Vec<String>,
+}
+
+impl JsonPrintable for UnloadSummary {}
+
+fn print_unload_summary(output: Output, summary: &UnloadSummary) -> ExitCode {
+    match output {
+        Output::Json => print_json(summary),
+        Output::Toon => {
+            println!("unloaded[{}]{{name}}:", summary.unloaded.len());
+            for name in &summary.unloaded {
+                println!("  {}", toon_string(name));
+            }
+        }
+        Output::Human if summary.unloaded.is_empty() => {
+            println!("status: project_unloaded (no-op)");
+        }
+        Output::Human => println!("unloaded: {}", summary.unloaded.join(", ")),
+    }
+    ExitCode::SUCCESS
+}
+
+/// Reads `.envault.toml` from the current directory and loads every profile
+/// and workspace it lists, then unloads whatever this same project directory
+/// had auto-loaded on a previous `envault load` that is no longer listed.
+/// Only profiles this mechanism itself loaded are ever candidates for
+/// unloading - profiles the user loaded some other way are left alone. To
+/// tell the two apart, each profile's loaded state is checked before this
+/// call loads it: a profile already loaded that this project did not
+/// previously track as its own is someone else's and is left out of the
+/// tracked set, even though loading it here is still requested and shown.
+fn load_manifest_profiles(
+    output: Output,
+    names: Vec<String>,
+    previous: &project::ProjectLoadState,
+    loaded: &mut Vec<ProfileView>,
+    seen: &mut HashSet<String>,
+    effective: &mut HashSet<String>,
+) -> Result<(), ExitCode> {
+    for name in names {
+        let was_loaded_before = match client::request(Operation::ShowProfile { name: name.clone() })
+        {
+            Ok(Reply::Profile(profile)) => profile.loaded,
+            Ok(_) => return Err(print_error(output, &unexpected_response())),
+            Err(error) => return Err(print_error(output, &client_error(error))),
+        };
+        match client::request(Operation::LoadProfile { name }) {
+            Ok(Reply::Profile(profile)) => {
+                if !was_loaded_before || previous.effective_profiles.contains(&profile.name) {
+                    effective.insert(profile.name.clone());
+                }
+                if seen.insert(profile.name.clone()) {
+                    loaded.push(profile);
+                }
+            }
+            Ok(_) => return Err(print_error(output, &unexpected_response())),
+            Err(error) => return Err(print_error(output, &client_error(error))),
+        }
+    }
+    Ok(())
+}
+
+fn load_manifest_workspaces(
+    output: Output,
+    names: Vec<String>,
+    previous: &project::ProjectLoadState,
+    loaded: &mut Vec<ProfileView>,
+    seen: &mut HashSet<String>,
+    effective: &mut HashSet<String>,
+) -> Result<(), ExitCode> {
+    for name in names {
+        let already_loaded: HashSet<String> =
+            match client::request(Operation::ShowWorkspace { name: name.clone() }) {
+                Ok(Reply::WorkspaceProfiles(profiles)) => profiles
+                    .into_iter()
+                    .filter(|profile| profile.loaded)
+                    .map(|profile| profile.name)
+                    .collect(),
+                Ok(_) => return Err(print_error(output, &unexpected_response())),
+                Err(error) => return Err(print_error(output, &client_error(error))),
+            };
+        match client::request(Operation::LoadWorkspace { name }) {
+            Ok(Reply::WorkspaceProfiles(profiles)) => {
+                for profile in profiles {
+                    if !already_loaded.contains(&profile.name)
+                        || previous.effective_profiles.contains(&profile.name)
+                    {
+                        effective.insert(profile.name.clone());
+                    }
+                    if seen.insert(profile.name.clone()) {
+                        loaded.push(profile);
+                    }
+                }
+            }
+            Ok(_) => return Err(print_error(output, &unexpected_response())),
+            Err(error) => return Err(print_error(output, &client_error(error))),
+        }
+    }
+    Ok(())
+}
+
+fn cmd_load(output: Output) -> ExitCode {
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            return print_error(
+                output,
+                &input_error(
+                    "io_error",
+                    &format!("Failed to resolve current directory: {error}"),
+                ),
+            );
+        }
+    };
+    let manifest = match project::load_manifest(&cwd) {
+        Ok(manifest) => manifest,
+        Err(error) => return print_error(output, &error),
+    };
+    let project_key = match project::project_key(&cwd) {
+        Ok(key) => key,
+        Err(error) => return print_error(output, &error),
+    };
+    let mut state = match project::read_state() {
+        Ok(state) => state,
+        Err(error) => return print_error(output, &error),
+    };
+    let previous = state.remove(&project_key).unwrap_or_default();
+
+    let mut loaded = Vec::new();
+    let mut seen = HashSet::new();
+    let mut effective = HashSet::new();
+    if let Err(code) = load_manifest_profiles(
+        output,
+        manifest.profiles,
+        &previous,
+        &mut loaded,
+        &mut seen,
+        &mut effective,
+    ) {
+        return code;
+    }
+    if let Err(code) = load_manifest_workspaces(
+        output,
+        manifest.workspaces,
+        &previous,
+        &mut loaded,
+        &mut seen,
+        &mut effective,
+    ) {
+        return code;
+    }
+
+    let mut unloaded = Vec::new();
+    for name in previous.effective_profiles {
+        if effective.contains(&name) {
+            continue;
+        }
+        match client::request(Operation::UnloadProfile { name: name.clone() }) {
+            Ok(Reply::Profile(_)) => unloaded.push(name),
+            Ok(_) => return print_error(output, &unexpected_response()),
+            Err(error) => {
+                let error = client_error(error);
+                if error.code != "not_found" {
+                    return print_error(output, &error);
+                }
+            }
+        }
+    }
+
+    let mut effective_profiles: Vec<String> = effective.into_iter().collect();
+    effective_profiles.sort();
+    state.insert(
+        project_key,
+        project::ProjectLoadState { effective_profiles },
+    );
+    if let Err(error) = project::write_state(&state) {
+        return print_error(output, &error);
+    }
+
+    print_load_summary(output, &LoadSummary { loaded, unloaded })
+}
+
+/// Unloads everything `envault load` previously auto-loaded for the current
+/// directory's project path and clears its tracked state. A no-op (not an
+/// error) when this project has no tracked auto-loaded profiles.
+fn cmd_unload(output: Output) -> ExitCode {
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            return print_error(
+                output,
+                &input_error(
+                    "io_error",
+                    &format!("Failed to resolve current directory: {error}"),
+                ),
+            );
+        }
+    };
+    let project_key = match project::project_key(&cwd) {
+        Ok(key) => key,
+        Err(error) => return print_error(output, &error),
+    };
+    let mut state = match project::read_state() {
+        Ok(state) => state,
+        Err(error) => return print_error(output, &error),
+    };
+    let Some(previous) = state.remove(&project_key) else {
+        return print_unload_summary(
+            output,
+            &UnloadSummary {
+                unloaded: Vec::new(),
+            },
+        );
+    };
+    for name in &previous.effective_profiles {
+        match client::request(Operation::UnloadProfile { name: name.clone() }) {
+            Ok(Reply::Profile(_)) => {}
+            Ok(_) => return print_error(output, &unexpected_response()),
+            Err(error) => {
+                let error = client_error(error);
+                if error.code != "not_found" {
+                    return print_error(output, &error);
+                }
+            }
+        }
+    }
+    if let Err(error) = project::write_state(&state) {
+        return print_error(output, &error);
+    }
+    print_unload_summary(
+        output,
+        &UnloadSummary {
+            unloaded: previous.effective_profiles,
+        },
+    )
 }
 
 fn portability_command(output: Output, command: PortabilityCommand) -> ExitCode {
@@ -4113,6 +4394,8 @@ mod tests {
                 "convenience-unlock",
                 "session",
                 "run",
+                "load",
+                "unload",
                 "uninstall"
             ]
         );

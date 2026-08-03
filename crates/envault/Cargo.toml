@@ -28,6 +28,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+toml.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
@@ -42,7 +43,6 @@ envault-windows-ffi = { version = "=0.2.0", path = "../envault-windows-ffi" }
 
 [dev-dependencies]
 tempfile.workspace = true
-toml.workspace = true
 
 [lints]
 workspace = true
