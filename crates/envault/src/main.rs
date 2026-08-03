@@ -1768,6 +1768,76 @@ fn print_unload_summary(output: Output, summary: &UnloadSummary) -> ExitCode {
 /// call loads it: a profile already loaded that this project did not
 /// previously track as its own is someone else's and is left out of the
 /// tracked set, even though loading it here is still requested and shown.
+fn load_manifest_profiles(
+    output: Output,
+    names: Vec<String>,
+    previous: &project::ProjectLoadState,
+    loaded: &mut Vec<ProfileView>,
+    seen: &mut HashSet<String>,
+    effective: &mut HashSet<String>,
+) -> Result<(), ExitCode> {
+    for name in names {
+        let was_loaded_before = match client::request(Operation::ShowProfile { name: name.clone() })
+        {
+            Ok(Reply::Profile(profile)) => profile.loaded,
+            Ok(_) => return Err(print_error(output, &unexpected_response())),
+            Err(error) => return Err(print_error(output, &client_error(error))),
+        };
+        match client::request(Operation::LoadProfile { name }) {
+            Ok(Reply::Profile(profile)) => {
+                if !was_loaded_before || previous.effective_profiles.contains(&profile.name) {
+                    effective.insert(profile.name.clone());
+                }
+                if seen.insert(profile.name.clone()) {
+                    loaded.push(profile);
+                }
+            }
+            Ok(_) => return Err(print_error(output, &unexpected_response())),
+            Err(error) => return Err(print_error(output, &client_error(error))),
+        }
+    }
+    Ok(())
+}
+
+fn load_manifest_workspaces(
+    output: Output,
+    names: Vec<String>,
+    previous: &project::ProjectLoadState,
+    loaded: &mut Vec<ProfileView>,
+    seen: &mut HashSet<String>,
+    effective: &mut HashSet<String>,
+) -> Result<(), ExitCode> {
+    for name in names {
+        let already_loaded: HashSet<String> =
+            match client::request(Operation::ShowWorkspace { name: name.clone() }) {
+                Ok(Reply::WorkspaceProfiles(profiles)) => profiles
+                    .into_iter()
+                    .filter(|profile| profile.loaded)
+                    .map(|profile| profile.name)
+                    .collect(),
+                Ok(_) => return Err(print_error(output, &unexpected_response())),
+                Err(error) => return Err(print_error(output, &client_error(error))),
+            };
+        match client::request(Operation::LoadWorkspace { name }) {
+            Ok(Reply::WorkspaceProfiles(profiles)) => {
+                for profile in profiles {
+                    if !already_loaded.contains(&profile.name)
+                        || previous.effective_profiles.contains(&profile.name)
+                    {
+                        effective.insert(profile.name.clone());
+                    }
+                    if seen.insert(profile.name.clone()) {
+                        loaded.push(profile);
+                    }
+                }
+            }
+            Ok(_) => return Err(print_error(output, &unexpected_response())),
+            Err(error) => return Err(print_error(output, &client_error(error))),
+        }
+    }
+    Ok(())
+}
+
 fn cmd_load(output: Output) -> ExitCode {
     let cwd = match env::current_dir() {
         Ok(cwd) => cwd,
@@ -1798,53 +1868,25 @@ fn cmd_load(output: Output) -> ExitCode {
     let mut loaded = Vec::new();
     let mut seen = HashSet::new();
     let mut effective = HashSet::new();
-    for name in manifest.profiles {
-        let was_loaded_before = match client::request(Operation::ShowProfile { name: name.clone() })
-        {
-            Ok(Reply::Profile(profile)) => profile.loaded,
-            Ok(_) => return print_error(output, &unexpected_response()),
-            Err(error) => return print_error(output, &client_error(error)),
-        };
-        match client::request(Operation::LoadProfile { name }) {
-            Ok(Reply::Profile(profile)) => {
-                if !was_loaded_before || previous.effective_profiles.contains(&profile.name) {
-                    effective.insert(profile.name.clone());
-                }
-                if seen.insert(profile.name.clone()) {
-                    loaded.push(profile);
-                }
-            }
-            Ok(_) => return print_error(output, &unexpected_response()),
-            Err(error) => return print_error(output, &client_error(error)),
-        }
+    if let Err(code) = load_manifest_profiles(
+        output,
+        manifest.profiles,
+        &previous,
+        &mut loaded,
+        &mut seen,
+        &mut effective,
+    ) {
+        return code;
     }
-    for name in manifest.workspaces {
-        let already_loaded: HashSet<String> =
-            match client::request(Operation::ShowWorkspace { name: name.clone() }) {
-                Ok(Reply::WorkspaceProfiles(profiles)) => profiles
-                    .into_iter()
-                    .filter(|profile| profile.loaded)
-                    .map(|profile| profile.name)
-                    .collect(),
-                Ok(_) => return print_error(output, &unexpected_response()),
-                Err(error) => return print_error(output, &client_error(error)),
-            };
-        match client::request(Operation::LoadWorkspace { name }) {
-            Ok(Reply::WorkspaceProfiles(profiles)) => {
-                for profile in profiles {
-                    if !already_loaded.contains(&profile.name)
-                        || previous.effective_profiles.contains(&profile.name)
-                    {
-                        effective.insert(profile.name.clone());
-                    }
-                    if seen.insert(profile.name.clone()) {
-                        loaded.push(profile);
-                    }
-                }
-            }
-            Ok(_) => return print_error(output, &unexpected_response()),
-            Err(error) => return print_error(output, &client_error(error)),
-        }
+    if let Err(code) = load_manifest_workspaces(
+        output,
+        manifest.workspaces,
+        &previous,
+        &mut loaded,
+        &mut seen,
+        &mut effective,
+    ) {
+        return code;
     }
 
     let mut unloaded = Vec::new();
