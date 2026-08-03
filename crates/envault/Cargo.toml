@@ -16,11 +16,11 @@ clap.workspace = true
 clap_complete = { workspace = true, optional = true }
 comfy-table.workspace = true
 crossterm.workspace = true
-envault-core = { version = "=0.2.0", path = "../envault-core" }
-envault-crypto = { version = "=0.2.0", path = "../envault-crypto" }
-envault-platform = { version = "=0.2.0", path = "../envault-platform" }
-envault-protocol = { version = "=0.2.0", path = "../envault-protocol" }
-envault-service = { version = "=0.2.0", path = "../envault-service" }
+envault-core = { version = "=0.2.1", path = "../envault-core" }
+envault-crypto = { version = "=0.2.1", path = "../envault-crypto" }
+envault-platform = { version = "=0.2.1", path = "../envault-platform" }
+envault-protocol = { version = "=0.2.1", path = "../envault-protocol" }
+envault-service = { version = "=0.2.1", path = "../envault-service" }
 keyring.workspace = true
 ratatui.workspace = true
 rpassword.workspace = true
@@ -39,7 +39,7 @@ internal-completions = ["dep:clap_complete"]
 nix.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-envault-windows-ffi = { version = "=0.2.0", path = "../envault-windows-ffi" }
+envault-windows-ffi = { version = "=0.2.1", path = "../envault-windows-ffi" }
 
 [dev-dependencies]
 tempfile.workspace = true
