@@ -1409,6 +1409,7 @@ fn describe_secret_typo_suggests_the_closest_existing_name() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn project_load_and_unload_round_trip_via_manifest() {
     let fixture = DaemonFixture::initialize_and_start();
     assert_success(&fixture.run(
@@ -1464,7 +1465,12 @@ fn project_load_and_unload_round_trip_via_manifest() {
         .map(|profile| profile["name"].as_str().expect("name"))
         .collect();
     assert_eq!(loaded_names, vec!["alpha", "beta", "gamma"]);
-    assert!(loaded_body["unloaded"].as_array().expect("unloaded array").is_empty());
+    assert!(
+        loaded_body["unloaded"]
+            .as_array()
+            .expect("unloaded array")
+            .is_empty()
+    );
 
     for name in ["alpha", "beta", "gamma", "manual"] {
         assert_eq!(
@@ -1476,8 +1482,11 @@ fn project_load_and_unload_round_trip_via_manifest() {
 
     // Drop the workspace from the manifest; the next `load` should auto-unload
     // beta/gamma (this mechanism's own doing) but leave "manual" alone.
-    fs::write(project_dir.join(".envault.toml"), "profiles = [\"alpha\"]\n")
-        .expect("rewrite manifest");
+    fs::write(
+        project_dir.join(".envault.toml"),
+        "profiles = [\"alpha\"]\n",
+    )
+    .expect("rewrite manifest");
     let reloaded = fixture.run_in(&project_dir, &["--output", "json", "load"], None);
     assert_success(&reloaded);
     let reloaded_body: Value = serde_json::from_slice(&reloaded.stdout).expect("reload JSON");
