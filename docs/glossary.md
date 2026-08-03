@@ -25,7 +25,8 @@ A profile can belong to any number of workspaces at once; workspaces never hold 
 ## Loaded set
 
 The set of profiles a session can actually read secrets from.
-It is runtime-only and resets on every unlock, seeded at that point from every profile with `activate_on_start` set (see Profile), then mutated ad hoc by `envault profile load`/`unload` and `envault workspace load` for the rest of the session.
+It is runtime-only and resets on every unlock, seeded at that point from every profile with `activate_on_start` set (see Profile), then mutated ad hoc by `envault profile load`/`unload`, `envault workspace load`, and `envault load`/`unload` for the rest of the session.
+`envault load`/`unload` read the `.envault.toml` manifest in the current directory and apply the same profile/workspace load and unload operations, additionally tracking which profiles they auto-loaded per project path so a later `unload` (or a `load` that drops an entry from the manifest) only unloads what that directory previously auto-loaded.
 Loading or unloading a profile never writes back to its `activate_on_start` preference; the two are deliberately decoupled.
 Ambient reads (`secret describe`, `secret list --profile`, and similar) and `envault run` both require the target profile to already be in the loaded set - `run` never loads a profile as a side effect of naming it.
 The `base` profile is always loaded and cannot be unloaded.
