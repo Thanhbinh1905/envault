@@ -1855,7 +1855,12 @@ fn cmd_load(output: Output) -> ExitCode {
         match client::request(Operation::UnloadProfile { name: name.clone() }) {
             Ok(Reply::Profile(_)) => unloaded.push(name),
             Ok(_) => return print_error(output, &unexpected_response()),
-            Err(error) => return print_error(output, &client_error(error)),
+            Err(error) => {
+                let error = client_error(error);
+                if error.code != "not_found" {
+                    return print_error(output, &error);
+                }
+            }
         }
     }
 
@@ -1908,7 +1913,12 @@ fn cmd_unload(output: Output) -> ExitCode {
         match client::request(Operation::UnloadProfile { name: name.clone() }) {
             Ok(Reply::Profile(_)) => {}
             Ok(_) => return print_error(output, &unexpected_response()),
-            Err(error) => return print_error(output, &client_error(error)),
+            Err(error) => {
+                let error = client_error(error);
+                if error.code != "not_found" {
+                    return print_error(output, &error);
+                }
+            }
         }
     }
     if let Err(error) = project::write_state(&state) {
