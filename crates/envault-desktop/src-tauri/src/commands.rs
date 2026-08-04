@@ -97,10 +97,39 @@ fn read_autostart_preference() -> Result<Option<bool>, String> {
 
 fn write_autostart_preference(enabled: bool) -> Result<(), String> {
     let path = autostart_preference_path()?;
+    write_autostart_preference_at(&path, enabled)
+}
+
+fn write_autostart_preference_at(path: &std::path::Path, enabled: bool) -> Result<(), String> {
     let value = serde_json::to_string(&enabled)
         .map_err(|error| format!("could not encode the EnVault startup preference: {error}"))?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "could not resolve the EnVault data directory".to_owned())?;
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("could not create the EnVault data directory: {error}"))?;
     std::fs::write(path, value)
         .map_err(|error| format!("could not save the EnVault startup preference: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_autostart_preference_at;
+
+    #[test]
+    fn autostart_preference_write_creates_missing_data_directory() {
+        let directory = std::env::temp_dir().join(format!(
+            "envault-desktop-autostart-preference-{}",
+            std::process::id()
+        ));
+        let path = directory.join("data/desktop-autostart.json");
+        let _ = std::fs::remove_dir_all(&directory);
+
+        write_autostart_preference_at(&path, true).expect("write should create the data directory");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "true");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 pub fn configure_default_autostart(app: &tauri::AppHandle) -> Result<(), String> {
