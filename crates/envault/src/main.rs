@@ -4416,18 +4416,11 @@ mod tests {
 
     #[test]
     fn secret_value_set_requires_stdin() {
+        assert!(Cli::try_parse_from(["envault", "secret", "value", "set", "API_TOKEN"]).is_err());
         assert!(
-            Cli::try_parse_from(["envault", "secret", "value", "set", "API_TOKEN"]).is_err()
+            Cli::try_parse_from(["envault", "secret", "value", "set", "API_TOKEN", "--stdin",])
+                .is_ok()
         );
-        assert!(Cli::try_parse_from([
-            "envault",
-            "secret",
-            "value",
-            "set",
-            "API_TOKEN",
-            "--stdin",
-        ])
-        .is_ok());
     }
 
     #[test]

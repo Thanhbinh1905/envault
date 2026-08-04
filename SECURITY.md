@@ -2,10 +2,8 @@
 
 ## Supported versions
 
-The release target is `v0.0.1`; no supported release has been published yet.
-It becomes the supported release only when this branch merges into `main` and the `v0.0.1` tag completes the release workflow.
-Until that tag is published, treat repository revisions as pre-release builds.
-Security properties in the architecture and threat model remain release gates and are not weakened by the pre-release status.
+The current supported release is `v0.3.0`.
+Security properties are defined by the architecture and threat model.
 
 ## Reporting a vulnerability
 

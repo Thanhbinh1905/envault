@@ -137,9 +137,9 @@ fn enable_autostart(app: &tauri::AppHandle) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::write_autostart_preference_at;
     #[cfg(target_os = "linux")]
     use super::ensure_linux_autostart_directory_at;
+    use super::write_autostart_preference_at;
 
     #[test]
     fn autostart_preference_write_creates_missing_data_directory() {

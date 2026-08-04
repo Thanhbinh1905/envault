@@ -127,10 +127,19 @@ fn verify() -> Result<()> {
             "warnings",
         ],
     )?;
-    run("cargo", &["test", "--workspace", "--exclude", "envault-desktop"])?;
     run(
         "cargo",
-        &["test", "--workspace", "--exclude", "envault-desktop", "--doc"],
+        &["test", "--workspace", "--exclude", "envault-desktop"],
+    )?;
+    run(
+        "cargo",
+        &[
+            "test",
+            "--workspace",
+            "--exclude",
+            "envault-desktop",
+            "--doc",
+        ],
     )?;
     Ok(())
 }

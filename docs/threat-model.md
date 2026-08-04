@@ -32,7 +32,7 @@ External providers receive credentials only through a constrained broker action.
 ## Security invariants
 
 - There is no generic API that returns secret plaintext to an agent caller.
-- Only `envault start` may spawn the daemon.
+- Only `envault start` and the packaged desktop application may spawn the daemon.
 - A stopped or locked daemon fails closed with a structured error.
 - Password input never uses process arguments, positional plaintext, or environment variables.
 - Secret names, descriptions, and sensitive metadata are encrypted at rest.

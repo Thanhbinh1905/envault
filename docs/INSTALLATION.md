@@ -17,9 +17,9 @@ It includes the EnVault logo as the application and launcher icon.
 
 The desktop package never replaces the CLI installation.
 It uses the same local vault data and IPC endpoint as an installed CLI.
-When it launches, the desktop app starts a bundled daemon in the locked state and immediately shows the tray icon.
+When it launches, the desktop app ensures a daemon is running, starting its bundled daemon if needed, and immediately shows the tray icon.
+The daemon remains locked until the user supplies the master password.
 No password is supplied to this startup process.
-Unlocking the vault still requires the master password.
 
 On Debian and Ubuntu x86_64, install the current desktop release with:
 
