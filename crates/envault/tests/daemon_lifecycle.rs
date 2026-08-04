@@ -1049,8 +1049,6 @@ fn profile_load_secret_accepts_an_inline_password_without_a_standing_admin_lease
     // The admin lease from `admin unlock` above was dropped by `admin
     // lock` - yet the grant below still succeeds because
     // `--password-stdin` proves identity for this one call.
-    // grant still succeeds because `--password-stdin` proves identity for
-    // this one call.
     assert_eq!(
         fixture.json(&["--output", "json", "admin", "status"])["active"],
         false
