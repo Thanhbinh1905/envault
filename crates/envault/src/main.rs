@@ -554,7 +554,8 @@ struct SecretValueSetArgs {
     #[arg(
         short,
         long,
-        help = "Require piped standard input; without this, prompts on a masked terminal"
+        required = true,
+        help = "Read the replacement value from piped standard input"
     )]
     stdin: bool,
 }
@@ -2884,14 +2885,7 @@ fn list_secrets(output: Output, arguments: &SecretListArgs) -> ExitCode {
 fn secret_value_command(output: Output, command: SecretValueCommand) -> ExitCode {
     let operation = match command {
         SecretValueCommand::Set(arguments) => {
-            // `--stdin` only ever changes whether a non-interactive terminal
-            // is rejected, since `read_secret_value_interactive` already
-            // reads piped input the same way `--stdin` does.
-            let value = match if arguments.stdin {
-                read_secret_value()
-            } else {
-                read_secret_value_interactive()
-            } {
+            let value = match read_secret_value() {
                 Ok(value) => value,
                 Err(error) => return print_error(output, &error),
             };
@@ -4418,6 +4412,22 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn secret_value_set_requires_stdin() {
+        assert!(
+            Cli::try_parse_from(["envault", "secret", "value", "set", "API_TOKEN"]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "envault",
+            "secret",
+            "value",
+            "set",
+            "API_TOKEN",
+            "--stdin",
+        ])
+        .is_ok());
     }
 
     #[test]
