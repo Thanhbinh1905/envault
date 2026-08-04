@@ -112,9 +112,34 @@ fn write_autostart_preference_at(path: &std::path::Path, enabled: bool) -> Resul
         .map_err(|error| format!("could not save the EnVault startup preference: {error}"))
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_linux_autostart_directory() -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "could not resolve the home directory for EnVault auto-start".to_owned())?;
+    ensure_linux_autostart_directory_at(&home)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_linux_autostart_directory_at(home: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(home.join(".config/autostart"))
+        .map_err(|error| format!("could not create the EnVault auto-start directory: {error}"))
+}
+
+fn enable_autostart(app: &tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    ensure_linux_autostart_directory()?;
+
+    app.autolaunch()
+        .enable()
+        .map_err(|error| format!("could not enable EnVault auto-start: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::write_autostart_preference_at;
+    #[cfg(target_os = "linux")]
+    use super::ensure_linux_autostart_directory_at;
 
     #[test]
     fn autostart_preference_write_creates_missing_data_directory() {
@@ -130,15 +155,29 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "true");
         std::fs::remove_dir_all(directory).unwrap();
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_autostart_directory_creates_missing_config_parent() {
+        let directory = std::env::temp_dir().join(format!(
+            "envault-desktop-autostart-directory-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        ensure_linux_autostart_directory_at(&directory)
+            .expect("auto-start directory should create the config parent");
+
+        assert!(directory.join(".config/autostart").is_dir());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 pub fn configure_default_autostart(app: &tauri::AppHandle) -> Result<(), String> {
     let preference = read_autostart_preference()?;
     let enabled = preference.unwrap_or(true);
     if enabled {
-        app.autolaunch()
-            .enable()
-            .map_err(|error| format!("could not enable EnVault auto-start: {error}"))?;
+        enable_autostart(app)?;
     } else {
         app.autolaunch()
             .disable()
@@ -193,9 +232,7 @@ pub fn auto_start_enabled(app: tauri::AppHandle) -> Result<bool, String> {
 #[allow(clippy::needless_pass_by_value)]
 pub fn set_auto_start_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     if enabled {
-        app.autolaunch()
-            .enable()
-            .map_err(|error| format!("could not enable EnVault auto-start: {error}"))?;
+        enable_autostart(&app)?;
     } else {
         app.autolaunch()
             .disable()
