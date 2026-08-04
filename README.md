@@ -59,6 +59,25 @@ curl -fsSL https://raw.githubusercontent.com/Thanhbinh1905/envault/main/install.
 The installer detects your platform, verifies the downloaded archive's SHA-256 checksum, and installs the binaries into `$HOME/.local/bin`.
 For Windows, source installation, upgrades, and manual checksum verification, read the [installation guide](docs/INSTALLATION.md).
 
+### Optional desktop app for Linux
+
+The Linux desktop app is distributed separately from the CLI.
+It starts a locked daemon and shows its system-tray status as soon as the app launches.
+The vault still requires the master password before any encrypted data is opened.
+Desktop auto-start is enabled by default and can be disabled in Security settings.
+Closing the window keeps the tray icon and current session alive.
+Quit EnVault or Stop daemon ends the daemon process.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Thanhbinh1905/envault/main/crates/envault-desktop/install-linux.sh | sh
+```
+
+The installer downloads and verifies a separate `.deb` package.
+It does not install, replace, or remove `envault`, `envaultd`, or `envaultui`.
+The desktop package never replaces the CLI installation.
+When both are present they use the same local vault data and IPC endpoint.
+See the [Linux desktop installation guide](docs/INSTALLATION.md#optional-envault-desktop-for-linux) for AppImage and manual installation.
+
 Create your vault, start the daemon, and store a first secret in the default `base` profile:
 
 ```sh
@@ -100,7 +119,7 @@ Neither integration starts the daemon, authenticates, changes the vault, or rece
 EnVault is designed around a small trusted local boundary.
 
 - Secret values and metadata are encrypted at rest.
-- The daemon starts only through `envault start` and fails closed while stopped or locked.
+- The daemon starts through `envault start` or the optional desktop app and fails closed while stopped or locked.
 - Passwords are prompted securely or read from standard input, never accepted as command-line arguments or environment variables.
 - An admin lease is required for mutations, plaintext reveal, and plaintext export.
 - Encrypted profile and workspace packages are previewed before import and committed only with the returned plan hash.
@@ -172,8 +191,7 @@ Individual credentials that live inside a profile.
 | `secret update <name>` | Change a secret's description | admin lease | `-d, --description` |
 | `secret rename <old> <new>` | Rename a secret | admin lease | - |
 | `secret delete <name>` | Delete a secret | admin lease | - |
-| `secret versions <name>` | List a secret's version history | unlocked | - |
-| `secret value set <name>` | Set a new value for an existing secret | admin lease | `-s, --stdin` (required) |
+| `secret value set <name>` | Overwrite a secret's value in place (no history retained) | admin lease | `-s, --stdin` (required) |
 | `secret value generate <name>` | Generate and set a new value | admin lease | `-f, --format <uuid-v4\|base64url\|base64>` (required); `-c/--chars` or `-b/--bytes`; `-a, --allow-weak` |
 
 ### Lifecycle

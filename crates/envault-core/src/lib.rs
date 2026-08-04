@@ -83,7 +83,7 @@ pub enum ImportConflictStrategy {
 #[serde(rename_all = "snake_case")]
 pub enum ImportAction {
     Create,
-    AppendVersion,
+    Overwrite,
     Replace,
     Rename,
     Skip,
@@ -143,7 +143,6 @@ pub struct SecretView {
     pub scope_id: ScopeId,
     pub name: String,
     pub description: Option<String>,
-    pub current_version: u64,
     pub status: SecretStatus,
 }
 
@@ -187,7 +186,6 @@ pub struct ScopeResolutionEntry {
 pub struct SecretVersionView {
     pub id: SecretVersionId,
     pub secret_id: SecretId,
-    pub version: u64,
     pub generator: Option<GeneratorFormat>,
     pub generated_length: Option<usize>,
     pub entropy_bits: Option<u32>,
@@ -198,7 +196,6 @@ pub struct PortabilityCounts {
     pub scopes: u64,
     pub profiles: u64,
     pub secrets: u64,
-    pub versions: u64,
     pub workspaces: u64,
     pub memberships: u64,
 }
@@ -241,7 +238,6 @@ pub struct PortabilityImportSummary {
     pub created: u64,
     pub replaced: u64,
     pub skipped: u64,
-    pub versions_appended: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

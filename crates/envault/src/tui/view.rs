@@ -24,7 +24,6 @@ pub fn draw<C: DaemonClient>(frame: &mut Frame, app: &App<C>) {
         Screen::Dashboard => draw_dashboard(frame, chunks[1], app),
         Screen::Profiles => draw_profiles(frame, chunks[1], app),
         Screen::Secrets => draw_secrets(frame, chunks[1], app),
-        Screen::Versions => draw_versions(frame, chunks[1], app),
         Screen::Portability => draw_portability(frame, chunks[1], app),
     }
     draw_status_line(frame, chunks[2], app);
@@ -92,7 +91,7 @@ fn draw_tabs<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>) {
             Screen::Profiles => "  admin: c/n/x/a, L:lock",
             Screen::Secrets => "  admin: c/e/n/x/g, L:lock",
             Screen::Portability => "  v:kind t:strategy i:preview x:export c:commit, L:lock",
-            _ => "  admin: L:lock",
+            Screen::Dashboard => "  admin: L:lock",
         }
     } else if screen == Screen::Portability {
         "  v:kind t:strategy, u:unlock admin"
@@ -100,11 +99,10 @@ fn draw_tabs<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>) {
         "  u:unlock admin"
     };
     let line = Line::from(format!(
-        "{}{}{}{}{}  (d/p/s/o/tab/⇧tab/←→/h/l: tabs, ↑↓/j/k: move, enter, esc, r, q){admin_hint}",
+        "{}{}{}{}  (d/p/s/o/tab/⇧tab/←→/h/l: tabs, ↑↓/j/k: move, enter, esc, r, q){admin_hint}",
         label("Dashboard", screen == Screen::Dashboard),
         label("Profiles", screen == Screen::Profiles),
         label("Secrets", screen == Screen::Secrets),
-        label("Versions", screen == Screen::Versions),
         label("Portability", screen == Screen::Portability),
     ));
     frame.render_widget(Paragraph::new(line), area);
@@ -223,44 +221,12 @@ fn draw_secrets<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>) {
     let items: Vec<ListItem> = app
         .secrets()
         .iter()
-        .map(|secret| {
-            ListItem::new(format!(
-                "{} (v{}, {:?})",
-                secret.name, secret.current_version, secret.status
-            ))
-        })
+        .map(|secret| ListItem::new(format!("{} ({:?})", secret.name, secret.status)))
         .collect();
     let block = Block::default().borders(Borders::ALL).title("Secrets");
     let mut state = ListState::default();
     if !app.secrets().is_empty() {
         state.select(Some(app.secret_selected()));
-    }
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(block)
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
-        area,
-        &mut state,
-    );
-}
-
-fn draw_versions<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>) {
-    let items: Vec<ListItem> = app
-        .versions()
-        .iter()
-        .map(|version| {
-            ListItem::new(format!(
-                "v{} generator={:?} entropy_bits={:?}",
-                version.version, version.generator, version.entropy_bits
-            ))
-        })
-        .collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Secret versions");
-    let mut state = ListState::default();
-    if !app.versions().is_empty() {
-        state.select(Some(app.version_selected()));
     }
     frame.render_stateful_widget(
         List::new(items)
@@ -287,11 +253,8 @@ fn draw_portability<C: DaemonClient>(frame: &mut Frame, area: Rect, app: &App<C>
         Some(PortabilityPreviewState::Package { preview, .. }) => {
             lines.push(Line::from(format!("plan hash: {}", preview.plan_hash)));
             lines.push(Line::from(format!(
-                "counts: scopes={} profiles={} secrets={} versions={}",
-                preview.counts.scopes,
-                preview.counts.profiles,
-                preview.counts.secrets,
-                preview.counts.versions,
+                "counts: scopes={} profiles={} secrets={}",
+                preview.counts.scopes, preview.counts.profiles, preview.counts.secrets,
             )));
             for conflict in &preview.conflicts {
                 lines.push(Line::from(format!(

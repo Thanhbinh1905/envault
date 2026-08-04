@@ -24,8 +24,8 @@ use envault_crypto::{
     encrypt, lookup_digest, random_array, unwrap_key, wrap_key,
 };
 use envault_store::{
-    ImportBatch, ImportReset, ProfileRecord, ScopeRecord, SecretRecord, SecretVersionAppend,
-    SecretVersionRecord, WorkspaceRecord,
+    ImportBatch, ImportReset, ProfileRecord, ScopeRecord, SecretRecord, SecretValueOverwrite,
+    SecretValueRecord, WorkspaceRecord,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -37,7 +37,7 @@ use super::{
     secret_value_aad, secret_wrap_aad,
 };
 
-const PACKAGE_VERSION: u16 = 1;
+const PACKAGE_VERSION: u16 = 2;
 const PACKAGE_MAGIC: &[u8] = b"ENVAULT-PORTABLE-CBOR";
 const TRANSFER_PASSWORD_MIN_BYTES: usize = 12;
 const TRANSFER_PASSWORD_MAX_BYTES: usize = 4096;
@@ -105,10 +105,10 @@ impl Drop for PackagePayload {
             if let Some(description) = &mut secret.description {
                 description.zeroize();
             }
-            for version in &mut secret.versions {
-                version.ciphertext.zeroize();
-                version.transfer_wrapped_dek.zeroize();
-                version.aad_digest.zeroize();
+            if let Some(value) = &mut secret.value {
+                value.ciphertext.zeroize();
+                value.transfer_wrapped_dek.zeroize();
+                value.aad_digest.zeroize();
             }
         }
     }
@@ -152,13 +152,13 @@ struct PortableSecret {
     description: Option<String>,
     current_version: u64,
     status: u8,
-    versions: Vec<PortableSecretVersion>,
+    /// The secret's single current value - packages never carry history.
+    value: Option<PortableSecretValue>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct PortableSecretVersion {
+struct PortableSecretValue {
     id: SecretVersionId,
-    version: u64,
     ciphertext: Vec<u8>,
     transfer_wrapped_dek: Vec<u8>,
     aad_digest: Vec<u8>,
@@ -538,7 +538,6 @@ impl VaultSession {
                     created: 0,
                     replaced: 0,
                     skipped: plan.preview.counts.profiles.max(1),
-                    versions_appended: 0,
                 });
             }
             PackagePlanMode::Workspace
@@ -561,7 +560,6 @@ impl VaultSession {
             created: plan.preview.counts.profiles + plan.preview.counts.secrets,
             replaced,
             skipped: 0,
-            versions_appended: 0,
         })
     }
 
@@ -594,7 +592,7 @@ impl VaultSession {
         let mut batch = ImportBatch::default();
         let mut created = 0_u64;
         let mut skipped = 0_u64;
-        let mut appended = 0_u64;
+        let mut overwritten = 0_u64;
         for (entry, existing, action) in plan.entries {
             match action {
                 ImportAction::Create => {
@@ -618,35 +616,38 @@ impl VaultSession {
                         encrypted_description: None,
                         current_version: 1,
                         status: 0,
+                        value: None,
                     };
-                    let version = self.encrypt_secret_version(
+                    let value = self.encrypt_secret_value(
                         &secret,
                         1,
                         SecretBytes::new(entry.value.to_vec()),
                         None,
                     )?;
-                    batch.secrets.push(secret);
-                    batch.secret_versions.push(version);
+                    batch.secrets.push(SecretRecord {
+                        value: Some(value),
+                        ..secret
+                    });
                     created = created.saturating_add(1);
                 }
-                ImportAction::AppendVersion => {
+                ImportAction::Overwrite => {
                     let secret = existing.ok_or(ServiceError::Corrupt)?;
                     let next = secret
                         .current_version
                         .checked_add(1)
                         .ok_or(ServiceError::Corrupt)?;
-                    let version = self.encrypt_secret_version(
+                    let value = self.encrypt_secret_value(
                         &secret,
                         next,
                         SecretBytes::new(entry.value.to_vec()),
                         None,
                     )?;
-                    batch.version_appends.push(SecretVersionAppend {
+                    batch.value_overwrites.push(SecretValueOverwrite {
                         secret_id: secret.id,
                         expected_current_version: secret.current_version,
-                        version,
+                        value,
                     });
-                    appended = appended.saturating_add(1);
+                    overwritten = overwritten.saturating_add(1);
                 }
                 ImportAction::Skip => skipped = skipped.saturating_add(1),
                 ImportAction::Reject | ImportAction::Replace | ImportAction::Rename => {
@@ -661,13 +662,11 @@ impl VaultSession {
             kind: None,
             counts: PortabilityCounts {
                 secrets: created,
-                versions: created.saturating_add(appended),
                 ..PortabilityCounts::default()
             },
             created,
-            replaced: 0,
+            replaced: overwritten,
             skipped,
-            versions_appended: appended,
         })
     }
 
@@ -695,13 +694,7 @@ impl VaultSession {
                 .store
                 .secret_by_id(item.secret.id)?
                 .ok_or(ServiceError::Corrupt)?;
-            let version = self
-                .store
-                .secret_versions(secret.id)?
-                .into_iter()
-                .last()
-                .ok_or(ServiceError::Corrupt)?;
-            let value = self.decrypt_secret_version(&secret, &version)?;
+            let value = self.decrypt_secret_value(&secret)?;
             let text = std::str::from_utf8(value.as_ref())
                 .map_err(|_| ServiceError::PlaintextExportUnsupported)?;
             output.extend_from_slice(item.secret.name.as_bytes());
@@ -748,7 +741,6 @@ impl VaultSession {
             scopes: 0,
             profiles: u64::try_from(document.profiles.len()).map_err(|_| ServiceError::Corrupt)?,
             secrets: secret_count,
-            versions: secret_count,
             workspaces: u64::try_from(document.workspaces.len())
                 .map_err(|_| ServiceError::Corrupt)?,
             memberships: membership_count,
@@ -829,13 +821,7 @@ impl VaultSession {
                     .store
                     .secret_by_id(item.secret.id)?
                     .ok_or(ServiceError::Corrupt)?;
-                let version = self
-                    .store
-                    .secret_versions(secret.id)?
-                    .into_iter()
-                    .last()
-                    .ok_or(ServiceError::Corrupt)?;
-                let value = self.decrypt_secret_version(&secret, &version)?;
+                let value = self.decrypt_secret_value(&secret)?;
                 let text = std::str::from_utf8(value.as_ref())
                     .map_err(|_| ServiceError::PlaintextExportUnsupported)?
                     .to_owned();
@@ -933,9 +919,8 @@ impl VaultSession {
             kind: None,
             counts: plan.preview.counts,
             created,
-            replaced: 0,
+            replaced: appended_versions,
             skipped,
-            versions_appended: appended_versions,
         })
     }
 
@@ -1021,8 +1006,8 @@ impl VaultSession {
         Ok((profile_scope_ids, created_profiles))
     }
 
-    /// Stages secret creates and version appends per `plan.secret_decisions`.
-    /// Returns `(created, appended, skipped)`.
+    /// Stages secret creates and in-place value overwrites per
+    /// `plan.secret_decisions`. Returns `(created, overwritten, skipped)`.
     fn stage_config_secrets(
         &self,
         plan: &ConfigPlan,
@@ -1063,33 +1048,36 @@ impl VaultSession {
                         )?,
                         current_version: 1,
                         status: 0,
+                        value: None,
                     };
-                    let version = self.encrypt_secret_version(
+                    let value = self.encrypt_secret_value(
                         &secret,
                         1,
                         SecretBytes::new(decision.entry.value.clone().into_bytes()),
                         None,
                     )?;
-                    batch.secrets.push(secret);
-                    batch.secret_versions.push(version);
+                    batch.secrets.push(SecretRecord {
+                        value: Some(value),
+                        ..secret
+                    });
                     created_secrets = created_secrets.saturating_add(1);
                 }
-                ImportAction::AppendVersion => {
+                ImportAction::Overwrite => {
                     let existing = decision.existing.clone().ok_or(ServiceError::Corrupt)?;
                     let next = existing
                         .current_version
                         .checked_add(1)
                         .ok_or(ServiceError::Corrupt)?;
-                    let version = self.encrypt_secret_version(
+                    let value = self.encrypt_secret_value(
                         &existing,
                         next,
                         SecretBytes::new(decision.entry.value.clone().into_bytes()),
                         None,
                     )?;
-                    batch.version_appends.push(SecretVersionAppend {
+                    batch.value_overwrites.push(SecretValueOverwrite {
                         secret_id: existing.id,
                         expected_current_version: existing.current_version,
-                        version,
+                        value,
                     });
                     appended_versions = appended_versions.saturating_add(1);
                 }
@@ -1231,18 +1219,11 @@ impl VaultSession {
             .iter()
             .filter(|entry| entry.action == ImportAction::Create)
             .count();
-        let appended_secrets = profile_plan
-            .secret_entries
-            .iter()
-            .filter(|entry| entry.action == ImportAction::AppendVersion)
-            .count();
         let counts = PortabilityCounts {
             scopes: 0,
             profiles: u64::try_from(profile_plan.new_profiles.len())
                 .map_err(|_| ServiceError::Corrupt)?,
             secrets: u64::try_from(created_secrets).map_err(|_| ServiceError::Corrupt)?,
-            versions: u64::try_from(created_secrets.saturating_add(appended_secrets))
-                .map_err(|_| ServiceError::Corrupt)?,
             workspaces: u64::try_from(workspace_plan.new_workspaces.len())
                 .map_err(|_| ServiceError::Corrupt)?,
             memberships: u64::try_from(workspace_plan.new_memberships.len())
@@ -1353,7 +1334,7 @@ impl VaultSession {
                     (None, _) => ImportAction::Create,
                     (Some(_), ImportConflictStrategy::Skip) => ImportAction::Skip,
                     (Some(secret), ImportConflictStrategy::Replace) if secret.status == 0 => {
-                        ImportAction::AppendVersion
+                        ImportAction::Overwrite
                     }
                     (Some(_), ImportConflictStrategy::Abort | ImportConflictStrategy::Replace) => {
                         ImportAction::Reject
@@ -1604,45 +1585,47 @@ impl VaultSession {
             .filter(|secret| selected_scope_ids.contains(&secret.scope_id))
         {
             let view = self.secret_view(&secret)?;
-            let mut versions = Vec::new();
-            for version in self.store.secret_versions(secret.id)? {
-                let wrap_aad = secret_wrap_aad(
-                    self.vault_id,
-                    secret.id,
-                    version.id,
-                    secret.scope_id,
-                    version.version,
-                );
-                let dek = unwrap_key(
-                    &self.master_key,
-                    &Ciphertext::decode(&version.wrapped_dek)?,
-                    &wrap_aad,
-                )?;
-                let transfer_wrapped_dek = wrap_key(
-                    transfer_key,
-                    &dek,
-                    &transfer_dek_aad(
-                        package_id,
+            let value = secret
+                .value
+                .as_ref()
+                .map(|value| {
+                    let wrap_aad = secret_wrap_aad(
                         self.vault_id,
                         secret.id,
-                        version.id,
+                        value.value_id,
                         secret.scope_id,
-                        version.version,
-                    ),
-                )?
-                .encode();
-                versions.push(PortableSecretVersion {
-                    id: version.id,
-                    version: version.version,
-                    ciphertext: version.ciphertext,
-                    transfer_wrapped_dek,
-                    aad_digest: version.aad_digest,
-                    generator: version.generator,
-                    generated_length: version.generated_length,
-                    entropy_bits: version.entropy_bits,
-                    created_at: version.created_at,
-                });
-            }
+                        secret.current_version,
+                    );
+                    let dek = unwrap_key(
+                        &self.master_key,
+                        &Ciphertext::decode(&value.wrapped_dek)?,
+                        &wrap_aad,
+                    )?;
+                    let transfer_wrapped_dek = wrap_key(
+                        transfer_key,
+                        &dek,
+                        &transfer_dek_aad(
+                            package_id,
+                            self.vault_id,
+                            secret.id,
+                            value.value_id,
+                            secret.scope_id,
+                            secret.current_version,
+                        ),
+                    )?
+                    .encode();
+                    Ok::<_, ServiceError>(PortableSecretValue {
+                        id: value.value_id,
+                        ciphertext: value.ciphertext.clone(),
+                        transfer_wrapped_dek,
+                        aad_digest: value.aad_digest.clone(),
+                        generator: value.generator,
+                        generated_length: value.generated_length,
+                        entropy_bits: value.entropy_bits,
+                        created_at: value.created_at,
+                    })
+                })
+                .transpose()?;
             secrets.push(PortableSecret {
                 id: secret.id,
                 scope_id: secret.scope_id,
@@ -1650,7 +1633,7 @@ impl VaultSession {
                 description: view.description,
                 current_version: secret.current_version,
                 status: secret.status,
-                versions,
+                value,
             });
         }
         Ok(secrets)
@@ -2086,89 +2069,92 @@ impl VaultSession {
                 )?,
                 current_version: source.current_version,
                 status: source.status,
+                value: None,
             };
-            for version in &source.versions {
-                batch.secret_versions.push(self.import_secret_version(
-                    loaded,
-                    source,
-                    version,
-                    &record,
-                    mapped(&plan.ids.versions, version.id)?,
-                )?);
-            }
-            batch.secrets.push(record);
+            let value = source
+                .value
+                .as_ref()
+                .map(|value| {
+                    self.import_secret_value(
+                        loaded,
+                        source,
+                        value,
+                        &record,
+                        mapped(&plan.ids.versions, value.id)?,
+                    )
+                })
+                .transpose()?;
+            batch.secrets.push(SecretRecord { value, ..record });
         }
         Ok(())
     }
 
-    fn import_secret_version(
+    fn import_secret_value(
         &self,
         loaded: &LoadedPackage,
         source_secret: &PortableSecret,
-        source_version: &PortableSecretVersion,
+        source_value: &PortableSecretValue,
         destination_secret: &SecretRecord,
-        destination_version_id: SecretVersionId,
-    ) -> Result<SecretVersionRecord, ServiceError> {
+        destination_value_id: SecretVersionId,
+    ) -> Result<SecretValueRecord, ServiceError> {
         let transfer_wrap_aad = transfer_dek_aad(
             loaded.envelope.package_id,
             loaded.envelope.source_vault_id,
             source_secret.id,
-            source_version.id,
+            source_value.id,
             source_secret.scope_id,
-            source_version.version,
+            source_secret.current_version,
         );
         let dek = unwrap_key(
             &loaded.transfer_key,
-            &Ciphertext::decode(&source_version.transfer_wrapped_dek)?,
+            &Ciphertext::decode(&source_value.transfer_wrapped_dek)?,
             &transfer_wrap_aad,
         )
         .map_err(|_| ServiceError::InvalidPackage)?;
         let source_aad = secret_value_aad(
             loaded.envelope.source_vault_id,
             source_secret.id,
-            source_version.id,
+            source_value.id,
             source_secret.scope_id,
-            source_version.version,
+            source_secret.current_version,
         );
-        if blake3::hash(&source_aad).as_bytes() != source_version.aad_digest.as_slice() {
+        if blake3::hash(&source_aad).as_bytes() != source_value.aad_digest.as_slice() {
             return Err(ServiceError::InvalidPackage);
         }
         let plaintext = decrypt(
             &dek,
-            &Ciphertext::decode(&source_version.ciphertext)?,
+            &Ciphertext::decode(&source_value.ciphertext)?,
             &source_aad,
         )
         .map_err(|_| ServiceError::InvalidPackage)?;
         let destination_aad = secret_value_aad(
             self.vault_id,
             destination_secret.id,
-            destination_version_id,
+            destination_value_id,
             destination_secret.scope_id,
-            source_version.version,
+            destination_secret.current_version,
         );
         let ciphertext = if source_aad == destination_aad {
-            source_version.ciphertext.clone()
+            source_value.ciphertext.clone()
         } else {
             encrypt(&dek, plaintext.as_ref(), &destination_aad)?.encode()
         };
         let destination_wrap_aad = secret_wrap_aad(
             self.vault_id,
             destination_secret.id,
-            destination_version_id,
+            destination_value_id,
             destination_secret.scope_id,
-            source_version.version,
+            destination_secret.current_version,
         );
-        Ok(SecretVersionRecord {
-            id: destination_version_id,
-            secret_id: destination_secret.id,
-            version: source_version.version,
+        Ok(SecretValueRecord {
+            value_id: destination_value_id,
             ciphertext,
             wrapped_dek: wrap_key(&self.master_key, &dek, &destination_wrap_aad)?.encode(),
             aad_digest: blake3::hash(&destination_aad).as_bytes().to_vec(),
-            generator: source_version.generator,
-            generated_length: source_version.generated_length,
-            entropy_bits: source_version.entropy_bits,
-            created_at: source_version.created_at,
+            generator: source_value.generator,
+            generated_length: source_value.generated_length,
+            entropy_bits: source_value.entropy_bits,
+            created_at: source_value.created_at,
         })
     }
 
@@ -2214,7 +2200,7 @@ impl VaultSession {
                 (None, _) => ImportAction::Create,
                 (Some(_), ImportConflictStrategy::Skip) => ImportAction::Skip,
                 (Some(existing), ImportConflictStrategy::Replace) if existing.status == 0 => {
-                    ImportAction::AppendVersion
+                    ImportAction::Overwrite
                 }
                 (Some(_), ImportConflictStrategy::Abort | ImportConflictStrategy::Replace) => {
                     ImportAction::Reject
@@ -2321,27 +2307,26 @@ impl VaultSession {
             );
             hash_state_field(&mut hasher, &record.current_version.to_be_bytes());
             hash_state_field(&mut hasher, &[record.status]);
-            for version in self.store.secret_versions(record.id)? {
-                hash_state_field(&mut hasher, b"version");
-                hash_state_field(&mut hasher, version.id.0.as_bytes());
-                hash_state_field(&mut hasher, &version.version.to_be_bytes());
-                hash_state_field(&mut hasher, &version.ciphertext);
-                hash_state_field(&mut hasher, &version.wrapped_dek);
-                hash_state_field(&mut hasher, &version.aad_digest);
-                if let Some(generator) = version.generator {
+            if let Some(value) = &record.value {
+                hash_state_field(&mut hasher, b"value");
+                hash_state_field(&mut hasher, value.value_id.0.as_bytes());
+                hash_state_field(&mut hasher, &value.ciphertext);
+                hash_state_field(&mut hasher, &value.wrapped_dek);
+                hash_state_field(&mut hasher, &value.aad_digest);
+                if let Some(generator) = value.generator {
                     hash_state_field(&mut hasher, &[1, generator]);
                 } else {
                     hash_state_field(&mut hasher, &[0]);
                 }
                 hash_state_field(
                     &mut hasher,
-                    &version.generated_length.unwrap_or_default().to_be_bytes(),
+                    &value.generated_length.unwrap_or_default().to_be_bytes(),
                 );
                 hash_state_field(
                     &mut hasher,
-                    &version.entropy_bits.unwrap_or_default().to_be_bytes(),
+                    &value.entropy_bits.unwrap_or_default().to_be_bytes(),
                 );
-                hash_state_field(&mut hasher, &version.created_at.to_be_bytes());
+                hash_state_field(&mut hasher, &value.created_at.to_be_bytes());
             }
         }
         let mut workspaces = self.store.workspaces()?;
@@ -2593,8 +2578,8 @@ fn validate_payload_header(payload: &PackagePayload) -> Result<(), ServiceError>
             payload
                 .secrets
                 .iter()
-                .map(|secret| secret.versions.len())
-                .sum::<usize>(),
+                .filter(|secret| secret.value.is_some())
+                .count(),
         );
     if total > MAX_PORTABILITY_ENTITIES {
         return Err(ServiceError::InvalidPackage);
@@ -2731,7 +2716,7 @@ fn validate_payload_secrets(
     payload: &PackagePayload,
     scope_ids: &BTreeSet<ScopeId>,
 ) -> Result<(), ServiceError> {
-    let mut version_ids = BTreeSet::new();
+    let mut value_ids = BTreeSet::new();
     let mut secret_names = BTreeSet::new();
     for secret in &payload.secrets {
         let normalized = normalize_name(&secret.name).map_err(|_| ServiceError::InvalidPackage)?;
@@ -2746,33 +2731,27 @@ fn validate_payload_secrets(
             || secret.status > 1
             || (secret.status == 0 && secret.current_version == 0)
             || (secret.status == 1 && secret.current_version != 0)
-            || usize::try_from(secret.current_version).ok() != Some(secret.versions.len())
+            || (secret.status == 0) != secret.value.is_some()
         {
             return Err(ServiceError::InvalidPackage);
         }
-        for (index, version) in secret.versions.iter().enumerate() {
-            let expected = u64::try_from(index)
-                .ok()
-                .and_then(|value| value.checked_add(1));
-            if expected != Some(version.version)
-                || version.id.0.is_nil()
-                || !version_ids.insert(version.id)
-                || version.ciphertext.len() > MAX_SECRET_VALUE_BYTES.saturating_add(64)
-                || version.transfer_wrapped_dek.len() > 256
-                || version.aad_digest.len() != 32
-                || version.created_at < 0
-                || match version.generator {
-                    Some(1..=3) => {
-                        version.generated_length.is_none() || version.entropy_bits.is_none()
-                    }
-                    None => version.generated_length.is_some() || version.entropy_bits.is_some(),
+        if let Some(value) = &secret.value {
+            if value.id.0.is_nil()
+                || !value_ids.insert(value.id)
+                || value.ciphertext.len() > MAX_SECRET_VALUE_BYTES.saturating_add(64)
+                || value.transfer_wrapped_dek.len() > 256
+                || value.aad_digest.len() != 32
+                || value.created_at < 0
+                || match value.generator {
+                    Some(1..=3) => value.generated_length.is_none() || value.entropy_bits.is_none(),
+                    None => value.generated_length.is_some() || value.entropy_bits.is_some(),
                     Some(_) => true,
                 }
             {
                 return Err(ServiceError::InvalidPackage);
             }
-            Ciphertext::decode(&version.ciphertext).map_err(|_| ServiceError::InvalidPackage)?;
-            Ciphertext::decode(&version.transfer_wrapped_dek)
+            Ciphertext::decode(&value.ciphertext).map_err(|_| ServiceError::InvalidPackage)?;
+            Ciphertext::decode(&value.transfer_wrapped_dek)
                 .map_err(|_| ServiceError::InvalidPackage)?;
         }
     }
@@ -2784,41 +2763,42 @@ fn validate_payload_crypto(
     transfer_key: &SecretKey,
 ) -> Result<(), ServiceError> {
     for secret in &payload.secrets {
-        for version in &secret.versions {
-            let transfer_aad = transfer_dek_aad(
-                payload.package_id,
-                payload.source_vault_id,
-                secret.id,
-                version.id,
-                secret.scope_id,
-                version.version,
-            );
-            let dek = unwrap_key(
-                transfer_key,
-                &Ciphertext::decode(&version.transfer_wrapped_dek)?,
-                &transfer_aad,
-            )
-            .map_err(|_| ServiceError::InvalidPackage)?;
-            let value_aad = secret_value_aad(
-                payload.source_vault_id,
-                secret.id,
-                version.id,
-                secret.scope_id,
-                version.version,
-            );
-            if blake3::hash(&value_aad).as_bytes() != version.aad_digest.as_slice() {
-                return Err(ServiceError::InvalidPackage);
-            }
-            let plaintext = decrypt(&dek, &Ciphertext::decode(&version.ciphertext)?, &value_aad)
-                .map_err(|_| ServiceError::InvalidPackage)?;
-            validate_generator_metadata(version, plaintext.as_ref())?;
+        let Some(value) = &secret.value else {
+            continue;
+        };
+        let transfer_aad = transfer_dek_aad(
+            payload.package_id,
+            payload.source_vault_id,
+            secret.id,
+            value.id,
+            secret.scope_id,
+            secret.current_version,
+        );
+        let dek = unwrap_key(
+            transfer_key,
+            &Ciphertext::decode(&value.transfer_wrapped_dek)?,
+            &transfer_aad,
+        )
+        .map_err(|_| ServiceError::InvalidPackage)?;
+        let value_aad = secret_value_aad(
+            payload.source_vault_id,
+            secret.id,
+            value.id,
+            secret.scope_id,
+            secret.current_version,
+        );
+        if blake3::hash(&value_aad).as_bytes() != value.aad_digest.as_slice() {
+            return Err(ServiceError::InvalidPackage);
         }
+        let plaintext = decrypt(&dek, &Ciphertext::decode(&value.ciphertext)?, &value_aad)
+            .map_err(|_| ServiceError::InvalidPackage)?;
+        validate_generator_metadata(value, plaintext.as_ref())?;
     }
     Ok(())
 }
 
 fn validate_generator_metadata(
-    version: &PortableSecretVersion,
+    version: &PortableSecretValue,
     plaintext: &[u8],
 ) -> Result<(), ServiceError> {
     let (Some(generator), Some(length), Some(entropy_bits)) = (
@@ -2910,14 +2890,6 @@ fn payload_counts(payload: &PackagePayload) -> Result<PortabilityCounts, Service
         profiles: u64::try_from(payload.profiles.len())
             .map_err(|_| ServiceError::InvalidPackage)?,
         secrets: u64::try_from(payload.secrets.len()).map_err(|_| ServiceError::InvalidPackage)?,
-        versions: u64::try_from(
-            payload
-                .secrets
-                .iter()
-                .map(|secret| secret.versions.len())
-                .sum::<usize>(),
-        )
-        .map_err(|_| ServiceError::InvalidPackage)?,
         workspaces: u64::try_from(payload.workspaces.len())
             .map_err(|_| ServiceError::InvalidPackage)?,
         memberships: u64::try_from(payload.memberships.len())
@@ -3011,8 +2983,8 @@ fn map_workspace_ids(
     }
     for secret in &payload.secrets {
         secret_ids.entry(secret.id).or_insert(secret.id);
-        for version in &secret.versions {
-            version_ids.entry(version.id).or_insert(version.id);
+        if let Some(value) = &secret.value {
+            version_ids.entry(value.id).or_insert(value.id);
         }
     }
 }
@@ -3060,13 +3032,13 @@ fn map_profile_ids(
                 b"secret",
             ))
         });
-        for version in &secret.versions {
-            version_ids.entry(version.id).or_insert_with(|| {
+        if let Some(value) = &secret.value {
+            version_ids.entry(value.id).or_insert_with(|| {
                 SecretVersionId(mapped_uuid(
                     package_id,
                     vault_id,
                     destination_profile_name,
-                    version.id.0,
+                    value.id.0,
                     b"version",
                 ))
             });
@@ -3478,15 +3450,8 @@ mod tests {
             .secret_by_id(secret_id)
             .expect("lookup")
             .expect("secret");
-        let version = session
-            .store
-            .secret_versions(secret_id)
-            .expect("versions")
-            .into_iter()
-            .last()
-            .expect("version");
         session
-            .decrypt_secret_version(&secret, &version)
+            .decrypt_secret_value(&secret)
             .expect("decrypt")
             .into_vec()
     }
@@ -3541,10 +3506,9 @@ mod tests {
         write_private(destination, &encoded_envelope);
     }
 
-    fn generated_version(generator: u8, value: &[u8], entropy_bits: u32) -> PortableSecretVersion {
-        PortableSecretVersion {
+    fn generated_value(generator: u8, value: &[u8], entropy_bits: u32) -> PortableSecretValue {
+        PortableSecretValue {
             id: SecretVersionId(Uuid::new_v4()),
-            version: 1,
             ciphertext: Vec::new(),
             transfer_wrapped_dek: Vec::new(),
             aad_digest: Vec::new(),
@@ -3577,24 +3541,24 @@ mod tests {
     #[test]
     fn generator_metadata_requires_canonical_format_length_and_exact_entropy() {
         let uuid = b"550e8400-e29b-41d4-a716-446655440000";
-        assert!(validate_generator_metadata(&generated_version(1, uuid, 122), uuid).is_ok());
+        assert!(validate_generator_metadata(&generated_value(1, uuid, 122), uuid).is_ok());
         let uppercase_uuid = b"550E8400-E29B-41D4-A716-446655440000";
         assert!(
-            validate_generator_metadata(&generated_version(1, uppercase_uuid, 122), uppercase_uuid)
+            validate_generator_metadata(&generated_value(1, uppercase_uuid, 122), uppercase_uuid)
                 .is_err()
         );
 
         let base64url = URL_SAFE_NO_PAD.encode([0_u8; 32]);
         assert!(
             validate_generator_metadata(
-                &generated_version(2, base64url.as_bytes(), 256),
+                &generated_value(2, base64url.as_bytes(), 256),
                 base64url.as_bytes()
             )
             .is_ok()
         );
         assert!(
             validate_generator_metadata(
-                &generated_version(2, base64url.as_bytes(), 255),
+                &generated_value(2, base64url.as_bytes(), 255),
                 base64url.as_bytes()
             )
             .is_err()
@@ -3603,14 +3567,14 @@ mod tests {
         let base64 = STANDARD.encode([0_u8; 32]);
         assert!(
             validate_generator_metadata(
-                &generated_version(3, base64.as_bytes(), 256),
+                &generated_value(3, base64.as_bytes(), 256),
                 base64.as_bytes()
             )
             .is_ok()
         );
         assert!(
             validate_generator_metadata(
-                &generated_version(3, base64.as_bytes(), 255),
+                &generated_value(3, base64.as_bytes(), 255),
                 base64.as_bytes()
             )
             .is_err()
@@ -3682,7 +3646,6 @@ mod tests {
             .expect("export");
         assert_eq!(summary.counts.profiles, 2);
         assert_eq!(summary.counts.secrets, 2);
-        assert_eq!(summary.counts.versions, 3);
         let package_bytes = std::fs::read(&package_path).expect("package");
         assert!(
             !package_bytes
@@ -3697,11 +3660,11 @@ mod tests {
 
         let before = source
             .store
-            .secret_versions(base_secret.id)
-            .expect("source versions")
-            .into_iter()
-            .last()
-            .expect("source version");
+            .secret_by_id(base_secret.id)
+            .expect("source secret")
+            .expect("present")
+            .value
+            .expect("source value");
         let self_preview = source
             .preview_package_import(
                 &package_path,
@@ -3723,11 +3686,11 @@ mod tests {
             .expect("self replace");
         let after = source
             .store
-            .secret_versions(base_secret.id)
-            .expect("replaced versions")
-            .into_iter()
-            .last()
-            .expect("replaced version");
+            .secret_by_id(base_secret.id)
+            .expect("source secret")
+            .expect("present")
+            .value
+            .expect("replaced value");
         assert_eq!(before.ciphertext, after.ciphertext);
         assert_ne!(before.wrapped_dek, after.wrapped_dek);
 
@@ -3780,7 +3743,15 @@ mod tests {
         let imported_base = destination
             .secret("base", "API_TOKEN")
             .expect("base secret");
-        assert_eq!(imported_base.current_version, 2);
+        assert_eq!(
+            destination
+                .store
+                .secret_by_id(imported_base.id)
+                .expect("secret")
+                .expect("present")
+                .current_version,
+            2
+        );
         assert_eq!(
             secret_value(&destination, imported_base.id),
             b"workspace-secret-current"
@@ -4171,7 +4142,10 @@ mod tests {
 
         let inner_tamper_path = directory.path().join("inner-tamper.envault-profile");
         mutate_authenticated_password_payload(&package_path, &inner_tamper_path, |payload| {
-            let byte = payload.secrets[0].versions[0]
+            let byte = payload.secrets[0]
+                .value
+                .as_mut()
+                .expect("value")
                 .ciphertext
                 .last_mut()
                 .expect("ciphertext");
@@ -4488,13 +4462,7 @@ mod tests {
                 &skip.plan_hash,
             )
             .expect("skip commit");
-        assert_eq!(
-            session
-                .secret_versions("base", "API_KEY")
-                .expect("versions")
-                .len(),
-            1
-        );
+        assert_eq!(secret_value(&session, api_key.id), b"first-secret");
         let stale_preview = session
             .preview_env_import("base", &env_path, ImportConflictStrategy::Replace)
             .expect("replace preview");
@@ -4508,13 +4476,7 @@ mod tests {
             ),
             Err(ServiceError::StaleImportPlan)
         ));
-        assert_eq!(
-            session
-                .secret_versions("base", "API_KEY")
-                .expect("versions")
-                .len(),
-            1
-        );
+        assert_eq!(secret_value(&session, api_key.id), b"first-secret");
         let refreshed = session
             .preview_env_import("base", &env_path, ImportConflictStrategy::Replace)
             .expect("refreshed");
@@ -4526,13 +4488,6 @@ mod tests {
                 &refreshed.plan_hash,
             )
             .expect("replace commit");
-        assert_eq!(
-            session
-                .secret_versions("base", "API_KEY")
-                .expect("versions")
-                .len(),
-            2
-        );
         assert_eq!(secret_value(&session, api_key.id), b"third-secret");
 
         assert!(matches!(

@@ -8,7 +8,7 @@ use rusqlite::{
 };
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug)]
 pub struct Store {
@@ -55,6 +55,21 @@ pub struct WorkspaceRecord {
     pub name_lookup: Vec<u8>,
 }
 
+/// A secret's single current value - there is no retained history. Present
+/// iff the owning `SecretRecord.status` is active (0); `None` for
+/// tombstones.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretValueRecord {
+    pub value_id: SecretVersionId,
+    pub ciphertext: Vec<u8>,
+    pub wrapped_dek: Vec<u8>,
+    pub aad_digest: Vec<u8>,
+    pub generator: Option<u8>,
+    pub generated_length: Option<u64>,
+    pub entropy_bits: Option<u32>,
+    pub created_at: i64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretRecord {
     pub id: SecretId,
@@ -64,6 +79,7 @@ pub struct SecretRecord {
     pub encrypted_description: Option<Vec<u8>>,
     pub current_version: u64,
     pub status: u8,
+    pub value: Option<SecretValueRecord>,
 }
 
 /// Allowlist rule binding a secret to exactly one HTTP origin/path prefix -
@@ -81,20 +97,6 @@ pub struct SecretHttpAccessRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SecretVersionRecord {
-    pub id: SecretVersionId,
-    pub secret_id: SecretId,
-    pub version: u64,
-    pub ciphertext: Vec<u8>,
-    pub wrapped_dek: Vec<u8>,
-    pub aad_digest: Vec<u8>,
-    pub generator: Option<u8>,
-    pub generated_length: Option<u64>,
-    pub entropy_bits: Option<u32>,
-    pub created_at: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImportReset {
     None,
     Workspace {
@@ -107,11 +109,15 @@ pub enum ImportReset {
     },
 }
 
+/// Overwrites an existing active secret's value in place - the replace-strategy
+/// counterpart to `ImportBatch.secrets` (which only ever creates brand-new
+/// secrets). CAS-guarded on `expected_current_version` like
+/// `Store::overwrite_secret_value`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SecretVersionAppend {
+pub struct SecretValueOverwrite {
     pub secret_id: SecretId,
     pub expected_current_version: u64,
-    pub version: SecretVersionRecord,
+    pub value: SecretValueRecord,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,8 +128,7 @@ pub struct ImportBatch {
     pub scopes: Vec<ScopeRecord>,
     pub profiles: Vec<ProfileRecord>,
     pub secrets: Vec<SecretRecord>,
-    pub secret_versions: Vec<SecretVersionRecord>,
-    pub version_appends: Vec<SecretVersionAppend>,
+    pub value_overwrites: Vec<SecretValueOverwrite>,
     pub workspaces: Vec<WorkspaceRecord>,
     pub workspace_memberships: Vec<(WorkspaceId, ProfileId)>,
 }
@@ -137,8 +142,7 @@ impl Default for ImportBatch {
             scopes: Vec::new(),
             profiles: Vec::new(),
             secrets: Vec::new(),
-            secret_versions: Vec::new(),
-            version_appends: Vec::new(),
+            value_overwrites: Vec::new(),
             workspaces: Vec::new(),
             workspace_memberships: Vec::new(),
         }
@@ -531,11 +535,7 @@ impl Store {
     }
 
     pub fn secrets(&self) -> Result<Vec<SecretRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, scope_id, encrypted_name, name_lookup, encrypted_description,
-                    current_version, status
-             FROM secret ORDER BY rowid",
-        )?;
+        let mut statement = self.connection.prepare(SECRET_SELECT_COLUMNS_QUERY)?;
         statement
             .query_map([], map_secret)?
             .collect::<Result<Vec<_>, _>>()
@@ -549,9 +549,7 @@ impl Store {
     ) -> Result<Option<SecretRecord>, StoreError> {
         self.connection
             .query_row(
-                "SELECT id, scope_id, encrypted_name, name_lookup, encrypted_description,
-                        current_version, status
-                 FROM secret WHERE scope_id = ?1 AND name_lookup = ?2",
+                &format!("{SECRET_SELECT_COLUMNS_QUERY} WHERE scope_id = ?1 AND name_lookup = ?2"),
                 params![id_bytes(scope_id.0), lookup],
                 map_secret,
             )
@@ -562,9 +560,7 @@ impl Store {
     pub fn secret_by_id(&self, secret_id: SecretId) -> Result<Option<SecretRecord>, StoreError> {
         self.connection
             .query_row(
-                "SELECT id, scope_id, encrypted_name, name_lookup, encrypted_description,
-                        current_version, status
-                 FROM secret WHERE id = ?1",
+                &format!("{SECRET_SELECT_COLUMNS_QUERY} WHERE id = ?1"),
                 params![id_bytes(secret_id.0)],
                 map_secret,
             )
@@ -625,27 +621,8 @@ impl Store {
         Ok(())
     }
 
-    pub fn insert_secret_with_version(
-        &mut self,
-        secret: &SecretRecord,
-        version: &SecretVersionRecord,
-    ) -> Result<(), StoreError> {
-        if secret.current_version != 1 || version.version != 1 || version.secret_id != secret.id {
-            return Err(StoreError::Integrity);
-        }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        insert_secret(&transaction, secret)?;
-        insert_secret_version(&transaction, version)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn insert_tombstone(&mut self, secret: &SecretRecord) -> Result<(), StoreError> {
-        if secret.status != 1 || secret.current_version != 0 {
-            return Err(StoreError::Integrity);
-        }
+    pub fn insert_secret(&mut self, secret: &SecretRecord) -> Result<(), StoreError> {
+        validate_secret_shape(secret)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -660,59 +637,54 @@ impl Store {
         encrypted_name: &[u8],
         name_lookup: &[u8],
     ) -> Result<(), StoreError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let versions_deleted = transaction.execute(
-            "DELETE FROM secret_version WHERE secret_id = ?1",
-            params![id_bytes(secret_id.0)],
-        )?;
-        if versions_deleted == 0 {
-            return Err(StoreError::Integrity);
-        }
-        let changed = transaction.execute(
+        let changed = self.connection.execute(
             "UPDATE secret
              SET encrypted_name = ?1, name_lookup = ?2, encrypted_description = NULL,
-                 current_version = 0, status = 1
+                 current_version = 0, status = 1,
+                 value_id = NULL, ciphertext = NULL, wrapped_dek = NULL, aad_digest = NULL,
+                 generator = NULL, generated_length = NULL, entropy_bits = NULL,
+                 value_created_at = NULL
              WHERE id = ?3 AND status = 0",
             params![encrypted_name, name_lookup, id_bytes(secret_id.0)],
         )?;
-        if changed != 1 {
-            return Err(StoreError::Integrity);
-        }
-        transaction.commit()?;
-        Ok(())
+        expect_single_change(changed)
     }
 
-    pub fn insert_secret_version(
+    /// Overwrites a secret's value in place - no history is retained, the
+    /// previous ciphertext/DEK/metadata are gone once this returns. CAS on
+    /// `expected_current_version` (the write-generation counter, purely
+    /// internal bookkeeping for concurrency + AAD domain separation, never
+    /// surfaced as a "version number").
+    pub fn overwrite_secret_value(
         &mut self,
         secret_id: SecretId,
         expected_current_version: u64,
-        version: &SecretVersionRecord,
+        value: &SecretValueRecord,
     ) -> Result<(), StoreError> {
-        if version.secret_id != secret_id
-            || expected_current_version.checked_add(1) != Some(version.version)
-        {
-            return Err(StoreError::Integrity);
-        }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "UPDATE secret SET current_version = ?1
-             WHERE id = ?2 AND current_version = ?3",
+        let next_version = expected_current_version
+            .checked_add(1)
+            .ok_or(StoreError::NumericRange)?;
+        let changed = self.connection.execute(
+            "UPDATE secret
+             SET current_version = ?1, value_id = ?2, ciphertext = ?3, wrapped_dek = ?4,
+                 aad_digest = ?5, generator = ?6, generated_length = ?7, entropy_bits = ?8,
+                 value_created_at = ?9
+             WHERE id = ?10 AND current_version = ?11 AND status = 0",
             params![
-                to_i64(version.version)?,
+                to_i64(next_version)?,
+                id_bytes(value.value_id.0),
+                value.ciphertext,
+                value.wrapped_dek,
+                value.aad_digest,
+                value.generator.map(i64::from),
+                value.generated_length.map(to_i64).transpose()?,
+                value.entropy_bits.map(i64::from),
+                value.created_at,
                 id_bytes(secret_id.0),
                 to_i64(expected_current_version)?,
             ],
         )?;
-        if changed != 1 {
-            return Err(StoreError::Integrity);
-        }
-        insert_secret_version(&transaction, version)?;
-        transaction.commit()?;
-        Ok(())
+        expect_single_change(changed)
     }
 
     pub fn update_secret_metadata(&mut self, secret: &SecretRecord) -> Result<(), StoreError> {
@@ -730,46 +702,14 @@ impl Store {
         expect_single_change(changed)
     }
 
-    pub fn secret_versions(
-        &self,
-        secret_id: SecretId,
-    ) -> Result<Vec<SecretVersionRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, secret_id, version, ciphertext, wrapped_dek, aad_digest,
-                    generator, generated_length, entropy_bits, created_at
-             FROM secret_version WHERE secret_id = ?1 ORDER BY version",
-        )?;
-        statement
-            .query_map(params![id_bytes(secret_id.0)], map_secret_version)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
-    }
-
     pub fn delete_secret(&mut self, secret_id: SecretId) -> Result<(), StoreError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let versions_deleted = transaction.execute(
-            "DELETE FROM secret_version WHERE secret_id = ?1",
-            params![id_bytes(secret_id.0)],
-        )?;
         transaction.execute(
             "DELETE FROM secret_http_access WHERE secret_id = ?1",
             params![id_bytes(secret_id.0)],
         )?;
-        let status: Option<u8> = transaction
-            .query_row(
-                "SELECT status FROM secret WHERE id = ?1",
-                params![id_bytes(secret_id.0)],
-                |row| read_u8(row, 0),
-            )
-            .optional()?;
-        let Some(status) = status else {
-            return Err(StoreError::Integrity);
-        };
-        if status == 0 && versions_deleted == 0 {
-            return Err(StoreError::Integrity);
-        }
         let secret_deleted = transaction.execute(
             "DELETE FROM secret WHERE id = ?1",
             params![id_bytes(secret_id.0)],
@@ -808,30 +748,37 @@ impl Store {
             )?;
         }
         for secret in &batch.secrets {
+            validate_secret_shape(secret)?;
             insert_secret(&transaction, secret)?;
         }
-        for version in &batch.secret_versions {
-            insert_secret_version(&transaction, version)?;
-        }
-        for append in &batch.version_appends {
-            if append.version.secret_id != append.secret_id
-                || append.expected_current_version.checked_add(1) != Some(append.version.version)
-            {
-                return Err(StoreError::Integrity);
-            }
+        for overwrite in &batch.value_overwrites {
+            let next_version = overwrite
+                .expected_current_version
+                .checked_add(1)
+                .ok_or(StoreError::Integrity)?;
             let changed = transaction.execute(
-                "UPDATE secret SET current_version = ?1
-                 WHERE id = ?2 AND current_version = ?3 AND status = 0",
+                "UPDATE secret
+                 SET current_version = ?1, value_id = ?2, ciphertext = ?3, wrapped_dek = ?4,
+                     aad_digest = ?5, generator = ?6, generated_length = ?7, entropy_bits = ?8,
+                     value_created_at = ?9
+                 WHERE id = ?10 AND current_version = ?11 AND status = 0",
                 params![
-                    to_i64(append.version.version)?,
-                    id_bytes(append.secret_id.0),
-                    to_i64(append.expected_current_version)?,
+                    to_i64(next_version)?,
+                    id_bytes(overwrite.value.value_id.0),
+                    overwrite.value.ciphertext,
+                    overwrite.value.wrapped_dek,
+                    overwrite.value.aad_digest,
+                    overwrite.value.generator.map(i64::from),
+                    overwrite.value.generated_length.map(to_i64).transpose()?,
+                    overwrite.value.entropy_bits.map(i64::from),
+                    overwrite.value.created_at,
+                    id_bytes(overwrite.secret_id.0),
+                    to_i64(overwrite.expected_current_version)?,
                 ],
             )?;
             if changed != 1 {
                 return Err(StoreError::Integrity);
             }
-            insert_secret_version(&transaction, &append.version)?;
         }
         validate_import_transaction(&transaction)?;
         transaction.commit()?;
@@ -877,7 +824,7 @@ impl Store {
         }
         if current == 0 {
             let transaction = self.connection.transaction()?;
-            transaction.execute_batch(SCHEMA_V4)?;
+            transaction.execute_batch(SCHEMA_V5)?;
             transaction.commit()?;
         } else if current == 1 {
             let vault_count: i64 =
@@ -895,13 +842,17 @@ impl Store {
                  DROP TABLE scope;
                  DROP TABLE vault;",
             )?;
-            transaction.execute_batch(SCHEMA_V4)?;
+            transaction.execute_batch(SCHEMA_V5)?;
             transaction.commit()?;
         } else if current == 2 {
             self.migrate_v2_to_v3()?;
             self.migrate_v3_to_v4()?;
+            self.migrate_v4_to_v5()?;
         } else if current == 3 {
             self.migrate_v3_to_v4()?;
+            self.migrate_v4_to_v5()?;
+        } else if current == 4 {
+            self.migrate_v4_to_v5()?;
         }
         Ok(())
     }
@@ -955,9 +906,57 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Folds `secret_version` into `secret` (single current value stored
+    /// inline) - the schema-level counterpart to removing version history.
+    /// Only the row matching `secret.current_version` survives; every older
+    /// version is discarded by construction (the `LEFT JOIN ... AND
+    /// secret_version.version = secret.current_version` below never selects
+    /// them).
+    fn migrate_v4_to_v5(&mut self) -> Result<(), StoreError> {
+        self.connection.pragma_update(None, "foreign_keys", "OFF")?;
+        let migration = (|| {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(MIGRATE_V4_TO_V5)?;
+            transaction.commit()?;
+            Ok::<(), StoreError>(())
+        })();
+        let restore = self.connection.pragma_update(None, "foreign_keys", "ON");
+        migration?;
+        restore?;
+        let violation: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM pragma_foreign_key_check LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if violation.is_some() {
+            return Err(StoreError::Integrity);
+        }
+        Ok(())
+    }
 }
 
-const SCHEMA_V4: &str = "
+const SECRET_SELECT_COLUMNS_QUERY: &str = "SELECT id, scope_id, encrypted_name, name_lookup, \
+     encrypted_description, current_version, status, value_id, ciphertext, wrapped_dek, \
+     aad_digest, generator, generated_length, entropy_bits, value_created_at FROM secret";
+
+fn validate_secret_shape(secret: &SecretRecord) -> Result<(), StoreError> {
+    let shape_ok = match (secret.status, &secret.value) {
+        (0, Some(_)) => secret.current_version >= 1,
+        (1, None) => secret.current_version == 0,
+        _ => false,
+    };
+    if shape_ok {
+        Ok(())
+    } else {
+        Err(StoreError::Integrity)
+    }
+}
+
+const SCHEMA_V5: &str = "
 CREATE TABLE vault (
     id BLOB PRIMARY KEY NOT NULL,
     format_version INTEGER NOT NULL,
@@ -996,21 +995,21 @@ CREATE TABLE secret (
     encrypted_description BLOB,
     current_version INTEGER NOT NULL CHECK (current_version >= 0),
     status INTEGER NOT NULL CHECK (status IN (0, 1)),
-    CHECK ((status = 0 AND current_version >= 1) OR (status = 1 AND current_version = 0)),
-    UNIQUE(scope_id, name_lookup)
-) STRICT;
-CREATE TABLE secret_version (
-    id BLOB PRIMARY KEY NOT NULL,
-    secret_id BLOB NOT NULL REFERENCES secret(id),
-    version INTEGER NOT NULL CHECK (version >= 1),
-    ciphertext BLOB NOT NULL,
-    wrapped_dek BLOB NOT NULL,
-    aad_digest BLOB NOT NULL,
+    value_id BLOB,
+    ciphertext BLOB,
+    wrapped_dek BLOB,
+    aad_digest BLOB,
     generator INTEGER,
     generated_length INTEGER,
     entropy_bits INTEGER,
-    created_at INTEGER NOT NULL,
-    UNIQUE(secret_id, version)
+    value_created_at INTEGER,
+    CHECK ((status = 0 AND current_version >= 1 AND value_id IS NOT NULL
+                AND ciphertext IS NOT NULL AND wrapped_dek IS NOT NULL
+                AND aad_digest IS NOT NULL AND value_created_at IS NOT NULL)
+        OR (status = 1 AND current_version = 0 AND value_id IS NULL
+                AND ciphertext IS NULL AND wrapped_dek IS NULL
+                AND aad_digest IS NULL AND value_created_at IS NULL)),
+    UNIQUE(scope_id, name_lookup)
 ) STRICT;
 CREATE TABLE secret_http_access (
     secret_id BLOB PRIMARY KEY NOT NULL REFERENCES secret(id),
@@ -1033,7 +1032,50 @@ CREATE TABLE workspace_membership (
     profile_id BLOB NOT NULL REFERENCES profile(id),
     PRIMARY KEY (workspace_id, profile_id)
 ) STRICT;
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;
+";
+
+const MIGRATE_V4_TO_V5: &str = "
+CREATE TABLE secret_v5 (
+    id BLOB PRIMARY KEY NOT NULL,
+    scope_id BLOB NOT NULL REFERENCES scope(id),
+    encrypted_name BLOB NOT NULL,
+    name_lookup BLOB NOT NULL,
+    encrypted_description BLOB,
+    current_version INTEGER NOT NULL CHECK (current_version >= 0),
+    status INTEGER NOT NULL CHECK (status IN (0, 1)),
+    value_id BLOB,
+    ciphertext BLOB,
+    wrapped_dek BLOB,
+    aad_digest BLOB,
+    generator INTEGER,
+    generated_length INTEGER,
+    entropy_bits INTEGER,
+    value_created_at INTEGER,
+    CHECK ((status = 0 AND current_version >= 1 AND value_id IS NOT NULL
+                AND ciphertext IS NOT NULL AND wrapped_dek IS NOT NULL
+                AND aad_digest IS NOT NULL AND value_created_at IS NOT NULL)
+        OR (status = 1 AND current_version = 0 AND value_id IS NULL
+                AND ciphertext IS NULL AND wrapped_dek IS NULL
+                AND aad_digest IS NULL AND value_created_at IS NULL)),
+    UNIQUE(scope_id, name_lookup)
+) STRICT;
+INSERT INTO secret_v5
+    (id, scope_id, encrypted_name, name_lookup, encrypted_description, current_version, status,
+     value_id, ciphertext, wrapped_dek, aad_digest, generator, generated_length, entropy_bits,
+     value_created_at)
+SELECT secret.id, secret.scope_id, secret.encrypted_name, secret.name_lookup,
+       secret.encrypted_description, secret.current_version, secret.status,
+       secret_version.id, secret_version.ciphertext, secret_version.wrapped_dek,
+       secret_version.aad_digest, secret_version.generator, secret_version.generated_length,
+       secret_version.entropy_bits, secret_version.created_at
+FROM secret
+LEFT JOIN secret_version
+    ON secret_version.secret_id = secret.id AND secret_version.version = secret.current_version;
+DROP TABLE secret_version;
+DROP TABLE secret;
+ALTER TABLE secret_v5 RENAME TO secret;
+PRAGMA user_version = 5;
 ";
 
 const MIGRATE_V3_TO_V4: &str = "
@@ -1183,11 +1225,13 @@ fn insert_workspace(
 }
 
 fn insert_secret(transaction: &Transaction<'_>, record: &SecretRecord) -> Result<(), StoreError> {
+    let value = record.value.as_ref();
     transaction.execute(
         "INSERT INTO secret
          (id, scope_id, encrypted_name, name_lookup, encrypted_description,
-          current_version, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+          current_version, status, value_id, ciphertext, wrapped_dek, aad_digest,
+          generator, generated_length, entropy_bits, value_created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             id_bytes(record.id.0),
             id_bytes(record.scope_id.0),
@@ -1196,31 +1240,17 @@ fn insert_secret(transaction: &Transaction<'_>, record: &SecretRecord) -> Result
             record.encrypted_description,
             to_i64(record.current_version)?,
             i64::from(record.status),
-        ],
-    )?;
-    Ok(())
-}
-
-fn insert_secret_version(
-    transaction: &Transaction<'_>,
-    record: &SecretVersionRecord,
-) -> Result<(), StoreError> {
-    transaction.execute(
-        "INSERT INTO secret_version
-         (id, secret_id, version, ciphertext, wrapped_dek, aad_digest,
-          generator, generated_length, entropy_bits, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            id_bytes(record.id.0),
-            id_bytes(record.secret_id.0),
-            to_i64(record.version)?,
-            record.ciphertext,
-            record.wrapped_dek,
-            record.aad_digest,
-            record.generator.map(i64::from),
-            record.generated_length.map(to_i64).transpose()?,
-            record.entropy_bits.map(i64::from),
-            record.created_at,
+            value.map(|value| id_bytes(value.value_id.0)),
+            value.map(|value| value.ciphertext.clone()),
+            value.map(|value| value.wrapped_dek.clone()),
+            value.map(|value| value.aad_digest.clone()),
+            value.and_then(|value| value.generator).map(i64::from),
+            value
+                .and_then(|value| value.generated_length)
+                .map(to_i64)
+                .transpose()?,
+            value.and_then(|value| value.entropy_bits).map(i64::from),
+            value.map(|value| value.created_at),
         ],
     )?;
     Ok(())
@@ -1237,7 +1267,6 @@ fn apply_import_reset(
             base_profile_id,
         } => {
             transaction.execute("DELETE FROM secret_http_access", [])?;
-            transaction.execute("DELETE FROM secret_version", [])?;
             transaction.execute("DELETE FROM secret", [])?;
             transaction.execute("DELETE FROM workspace_membership", [])?;
             transaction.execute("DELETE FROM workspace", [])?;
@@ -1260,11 +1289,6 @@ fn apply_import_reset(
                     continue;
                 }
                 transaction.execute(
-                    "DELETE FROM secret_version
-                     WHERE secret_id IN (SELECT id FROM secret WHERE scope_id = ?1)",
-                    params![id_bytes(scope_id.0)],
-                )?;
-                transaction.execute(
                     "DELETE FROM secret WHERE scope_id = ?1",
                     params![id_bytes(scope_id.0)],
                 )?;
@@ -1273,11 +1297,6 @@ fn apply_import_reset(
                     params![id_bytes(scope_id.0)],
                 )?;
             }
-            transaction.execute(
-                "DELETE FROM secret_version
-                 WHERE secret_id IN (SELECT id FROM secret WHERE scope_id = ?1)",
-                params![id_bytes(retained_scope_id.0)],
-            )?;
             transaction.execute(
                 "DELETE FROM secret WHERE scope_id = ?1",
                 params![id_bytes(retained_scope_id.0)],
@@ -1304,22 +1323,6 @@ fn validate_import_transaction(transaction: &Transaction<'_>) -> Result<(), Stor
         |row| row.get(0),
     )?;
     if startup_profiles < 1 {
-        return Err(StoreError::Integrity);
-    }
-    let invalid_secret: Option<i64> = transaction
-        .query_row(
-            "SELECT 1
-             FROM secret
-             WHERE (status = 0 AND current_version !=
-                       (SELECT COUNT(*) FROM secret_version WHERE secret_id = secret.id))
-                OR (status = 1 AND EXISTS
-                       (SELECT 1 FROM secret_version WHERE secret_id = secret.id))
-             LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if invalid_secret.is_some() {
         return Err(StoreError::Integrity);
     }
     Ok(())
@@ -1406,18 +1409,6 @@ fn map_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
     })
 }
 
-fn map_secret(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretRecord> {
-    Ok(SecretRecord {
-        id: SecretId(read_id(row, 0)?),
-        scope_id: ScopeId(read_id(row, 1)?),
-        encrypted_name: row.get(2)?,
-        name_lookup: row.get(3)?,
-        encrypted_description: row.get(4)?,
-        current_version: read_u64(row, 5)?,
-        status: read_u8(row, 6)?,
-    })
-}
-
 fn map_secret_http_access(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretHttpAccessRecord> {
     Ok(SecretHttpAccessRecord {
         secret_id: SecretId(read_id(row, 0)?),
@@ -1430,18 +1421,36 @@ fn map_secret_http_access(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretHtt
     })
 }
 
-fn map_secret_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVersionRecord> {
-    Ok(SecretVersionRecord {
-        id: SecretVersionId(read_id(row, 0)?),
-        secret_id: SecretId(read_id(row, 1)?),
-        version: read_u64(row, 2)?,
-        ciphertext: row.get(3)?,
-        wrapped_dek: row.get(4)?,
-        aad_digest: row.get(5)?,
-        generator: row.get(6)?,
-        generated_length: read_optional_u64(row, 7)?,
-        entropy_bits: read_optional_u32(row, 8)?,
-        created_at: row.get(9)?,
+fn map_secret(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretRecord> {
+    let value_id: Option<Vec<u8>> = row.get(7)?;
+    let value = match value_id {
+        Some(value_id) => Some(SecretValueRecord {
+            value_id: SecretVersionId(uuid::Uuid::from_slice(&value_id).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Blob,
+                    Box::new(error),
+                )
+            })?),
+            ciphertext: row.get(8)?,
+            wrapped_dek: row.get(9)?,
+            aad_digest: row.get(10)?,
+            generator: row.get(11)?,
+            generated_length: read_optional_u64(row, 12)?,
+            entropy_bits: read_optional_u32(row, 13)?,
+            created_at: row.get(14)?,
+        }),
+        None => None,
+    };
+    Ok(SecretRecord {
+        id: SecretId(read_id(row, 0)?),
+        scope_id: ScopeId(read_id(row, 1)?),
+        encrypted_name: row.get(2)?,
+        name_lookup: row.get(3)?,
+        encrypted_description: row.get(4)?,
+        current_version: read_u64(row, 5)?,
+        status: read_u8(row, 6)?,
+        value,
     })
 }
 
@@ -1556,7 +1565,6 @@ fn read_optional_u32(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
     use uuid::Uuid;
@@ -1592,6 +1600,19 @@ mod tests {
                 generation: 1,
             },
         )
+    }
+
+    fn value_fixture() -> SecretValueRecord {
+        SecretValueRecord {
+            value_id: SecretVersionId(Uuid::new_v4()),
+            ciphertext: vec![3; 64],
+            wrapped_dek: vec![4; 72],
+            aad_digest: vec![5; 32],
+            generator: None,
+            generated_length: None,
+            entropy_bits: None,
+            created_at: 1,
+        }
     }
 
     const SCHEMA_V2_FIXTURE: &str = "
@@ -1668,7 +1689,7 @@ mod tests {
         let path = directory.path().join("vault.db");
         let (vault, scope, profile) = fixture();
         let mut store = Store::open(&path).expect("first open");
-        assert_eq!(store.schema_version().expect("version"), 4);
+        assert_eq!(store.schema_version().expect("version"), 5);
         store
             .initialize(&vault, &scope, &profile)
             .expect("initialize");
@@ -1683,7 +1704,7 @@ mod tests {
                 .expect("second open")
                 .schema_version()
                 .expect("version"),
-            4
+            5
         );
     }
 
@@ -1704,18 +1725,7 @@ mod tests {
                 encrypted_description: None,
                 current_version: 1,
                 status: 0,
-            }],
-            secret_versions: vec![SecretVersionRecord {
-                id: SecretVersionId(Uuid::new_v4()),
-                secret_id: SecretId(Uuid::new_v4()),
-                version: 1,
-                ciphertext: vec![3; 64],
-                wrapped_dek: vec![4; 72],
-                aad_digest: vec![5; 32],
-                generator: None,
-                generated_length: None,
-                entropy_bits: None,
-                created_at: 1,
+                value: None,
             }],
             ..ImportBatch::default()
         };
@@ -1742,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_one_schema_migrates_profiles_and_secret_versions_losslessly() {
+    fn phase_one_schema_migrates_profiles_and_folds_current_secret_value_losslessly() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("phase-one.db");
         let (vault, scope, profile) = fixture();
@@ -1815,12 +1825,13 @@ mod tests {
         drop(connection);
 
         let migrated = Store::open(&path).expect("migrate");
-        assert_eq!(migrated.schema_version().expect("version"), 4);
+        assert_eq!(migrated.schema_version().expect("version"), 5);
         assert_eq!(migrated.profiles().expect("profiles")[0].scope_id, scope.id);
-        assert_eq!(
-            migrated.secret_versions(secret_id).expect("versions")[0].id,
-            version_id
-        );
+        let migrated_secret = migrated
+            .secret_by_id(secret_id)
+            .expect("secret")
+            .expect("present");
+        assert_eq!(migrated_secret.value.expect("value").value_id, version_id);
         migrated.integrity_check().expect("integrity");
     }
 
@@ -1942,7 +1953,7 @@ mod tests {
         drop(connection);
 
         let migrated = Store::open(&path).expect("migrate");
-        assert_eq!(migrated.schema_version().expect("version"), 4);
+        assert_eq!(migrated.schema_version().expect("version"), 5);
         assert_eq!(migrated.profiles().expect("profiles"), vec![profile]);
         assert!(migrated.workspaces().expect("workspaces").is_empty());
         migrated.integrity_check().expect("integrity");
@@ -1990,7 +2001,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_version_insertion_requires_matching_consecutive_identity() {
+    fn secret_value_overwrite_requires_matching_generation_and_active_status() {
         let (vault, scope, profile) = fixture();
         let mut store = Store::open_in_memory().expect("store");
         store
@@ -2005,31 +2016,55 @@ mod tests {
             encrypted_description: None,
             current_version: 1,
             status: 0,
+            value: Some(value_fixture()),
         };
-        let first = SecretVersionRecord {
-            id: SecretVersionId(Uuid::new_v4()),
-            secret_id,
-            version: 1,
-            ciphertext: vec![3],
-            wrapped_dek: vec![4],
-            aad_digest: vec![5; 32],
-            generator: None,
-            generated_length: None,
-            entropy_bits: None,
-            created_at: 1,
-        };
-        store
-            .insert_secret_with_version(&secret, &first)
-            .expect("first version");
-        let nonconsecutive = SecretVersionRecord {
-            id: SecretVersionId(Uuid::new_v4()),
-            version: 3,
-            ..first
-        };
+        store.insert_secret(&secret).expect("first value");
         assert!(matches!(
-            store.insert_secret_version(secret_id, 1, &nonconsecutive),
+            store.overwrite_secret_value(secret_id, 99, &value_fixture()),
             Err(StoreError::Integrity)
         ));
+        store
+            .overwrite_secret_value(secret_id, 1, &value_fixture())
+            .expect("overwrite");
+        let overwritten = store
+            .secret_by_id(secret_id)
+            .expect("secret")
+            .expect("present");
+        assert_eq!(overwritten.current_version, 2);
+    }
+
+    #[test]
+    fn overwriting_a_secret_value_discards_the_previous_one() {
+        let (vault, scope, profile) = fixture();
+        let mut store = Store::open_in_memory().expect("store");
+        store
+            .initialize(&vault, &scope, &profile)
+            .expect("initialize");
+        let secret_id = SecretId(Uuid::new_v4());
+        let first_value = value_fixture();
+        let first_value_id = first_value.value_id;
+        store
+            .insert_secret(&SecretRecord {
+                id: secret_id,
+                scope_id: scope.id,
+                encrypted_name: vec![1],
+                name_lookup: vec![2; 32],
+                encrypted_description: None,
+                current_version: 1,
+                status: 0,
+                value: Some(first_value),
+            })
+            .expect("first value");
+        store
+            .overwrite_secret_value(secret_id, 1, &value_fixture())
+            .expect("overwrite");
+        let overwritten = store
+            .secret_by_id(secret_id)
+            .expect("secret")
+            .expect("present")
+            .value
+            .expect("value");
+        assert_ne!(overwritten.value_id, first_value_id);
     }
 
     #[test]
@@ -2079,7 +2114,7 @@ mod tests {
                 .expect("migrate")
                 .schema_version()
                 .expect("version"),
-            4
+            5
         );
 
         let occupied = directory.path().join("occupied-v1.db");

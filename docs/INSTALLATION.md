@@ -1,9 +1,7 @@
 # Installation
 
-EnVault release `v0.1.0` is prepared on this branch.
-After this branch merges into `main`, pushing tag `v0.1.0` publishes the GitHub Release artifacts through the tag-triggered release workflow.
-Until that tag is published, install from source or wait for the release artifacts.
-The Rust crates are not published to crates.io yet.
+EnVault publishes verified CLI archives for Linux, macOS, and Windows.
+The optional Linux desktop application is a separately installed `.deb` or AppImage package.
 
 ## Requirements
 
@@ -11,9 +9,55 @@ Release binaries are self-contained and do not require Rust.
 The supported release targets are Linux x86_64, macOS x86_64, macOS arm64, and Windows x86_64.
 The daemon and CLI use the operating system's local IPC and keyring facilities.
 
+## Optional EnVault Desktop for Linux
+
+The desktop package is separate from the CLI archive.
+Installing the desktop application never installs, replaces, or removes `envault`, `envaultd`, or `envaultui`.
+It includes the EnVault logo as the application and launcher icon.
+
+The desktop package never replaces the CLI installation.
+It uses the same local vault data and IPC endpoint as an installed CLI.
+When it launches, the desktop app starts a bundled daemon in the locked state and immediately shows the tray icon.
+No password is supplied to this startup process.
+Unlocking the vault still requires the master password.
+
+On Debian and Ubuntu x86_64, install the current desktop release with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Thanhbinh1905/envault/main/crates/envault-desktop/install-linux.sh | sh
+```
+
+The installer downloads the standalone `.deb`, verifies its sidecar SHA-256 checksum, and invokes `apt-get`.
+It needs `sudo` when it is not run as root.
+
+For a manual `.deb` installation:
+
+1. Download `envault-desktop-v<version>-x86_64.deb` and its `.sha256` file from the [latest GitHub Release](https://github.com/Thanhbinh1905/envault/releases/latest).
+2. Verify the package.
+3. Install it with APT.
+
+```sh
+sha256sum -c envault-desktop-v<version>-x86_64.deb.sha256
+sudo apt install ./envault-desktop-v<version>-x86_64.deb
+```
+
+For a portable AppImage, download `envault-desktop-v<version>-x86_64.AppImage` and its `.sha256` file from the same release:
+
+```sh
+sha256sum -c envault-desktop-v<version>-x86_64.AppImage.sha256
+chmod +x envault-desktop-v<version>-x86_64.AppImage
+./envault-desktop-v<version>-x86_64.AppImage
+```
+
+The AppImage runs in place and does not modify a CLI installation.
+The desktop app enables opening at sign-in by default.
+Use Security settings to disable or re-enable this preference and to start or stop the daemon.
+Closing the window hides it and preserves the tray icon and current session.
+Choose Quit EnVault from the tray menu to stop the daemon and exit the application.
+
 ## Install a GitHub Release
 
-After the `v0.1.0` GitHub Release is published, the supported quick installer detects the platform, downloads the matching latest release, verifies `SHA256SUMS`, and installs into `$HOME/.local/bin`:
+The supported quick installer detects the platform, downloads the matching latest release, verifies `SHA256SUMS`, and installs into `$HOME/.local/bin`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Thanhbinh1905/envault/main/install.sh | sh

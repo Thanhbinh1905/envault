@@ -53,7 +53,7 @@ target/debug/envault start
 Automation may use `start --password-stdin` with the same safe input constraints as initialization.
 Use `envault status`, `envault lock`, and `envault stop` for explicit lifecycle control.
 Use `envault admin unlock --minutes 5`, `envault admin status`, and `envault admin lock` for the bounded admin lease.
-Profile, versioned secret, loaded-set agent discovery, and constrained HTTP broker workflows run only through daemon IPC.
+Profile, secret, loaded-set agent discovery, and constrained HTTP broker workflows run only through daemon IPC.
 
 ## Encrypted portability
 

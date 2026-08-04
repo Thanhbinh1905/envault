@@ -59,11 +59,12 @@ It unwraps the VMK and does not encrypt secret values directly.
 ## VMK
 
 The Vault Master Key held only in daemon memory while the service is active.
-It wraps each secret-version DEK.
+It wraps each secret's DEK.
 
 ## DEK
 
-A random Data Encryption Key dedicated to one immutable secret version.
+A random Data Encryption Key dedicated to one secret's current value.
+Rotated on every write; the previous DEK and ciphertext are discarded, not retained.
 
 ## Scope
 

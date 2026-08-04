@@ -4,6 +4,7 @@ members = [
   "crates/envault-broker",
   "crates/envault-core",
   "crates/envault-crypto",
+  "crates/envault-desktop/src-tauri",
   "crates/envault-platform",
   "crates/envault-protocol",
   "crates/envault-service",
@@ -14,7 +15,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97.1"
 license = "MIT OR Apache-2.0"
@@ -25,6 +26,7 @@ authors = ["Thanhbinh1905"]
 [workspace.dependencies]
 age = { version = "0.12.1", default-features = false }
 anyhow = "1.0"
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 argon2 = "0.5"
 base64 = "0.23"
 blake3 = { version = "1.8", features = ["pure"] }
@@ -48,6 +50,8 @@ rustix = { version = "1.1", features = ["fs"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_yaml = "0.9"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-build = "2"
 tempfile = "3.20"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

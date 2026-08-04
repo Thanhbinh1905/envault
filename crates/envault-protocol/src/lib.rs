@@ -184,14 +184,14 @@ pub enum Operation {
         name: String,
         generator: GeneratorSpec,
     },
-    ListSecretVersions {
-        profile: String,
-        name: String,
-    },
+    /// Admin-gated. `password` lets a single call prove admin identity
+    /// inline instead of requiring a standing lease from `AdminUnlock`;
+    /// `None` falls back to the caller's active lease, if any.
     SetSecretHttpAccess {
         profile: String,
         name: String,
         constraint: HttpConstraint,
+        password: Option<SensitiveBytes>,
     },
     RemoveSecretHttpAccess {
         profile: String,
@@ -225,13 +225,11 @@ pub enum Operation {
         password: SensitiveBytes,
     },
     /// Decrypts a secret's value for the TUI's admin-gated `Reveal` popup -
-    /// the sole path that hands plaintext to a human's eyes. `version`
-    /// selects a historical version; `None` means the current version.
-    /// `token` must be a still-valid token from `IssueRevealToken`.
+    /// the sole path that hands plaintext to a human's eyes. `token` must be
+    /// a still-valid token from `IssueRevealToken`.
     RevealSecretValue {
         profile: String,
         name: String,
-        version: Option<u64>,
         token: SensitiveBytes,
     },
     ExportPackage {
@@ -354,8 +352,7 @@ pub enum Reply {
     Secret(SecretView),
     Secrets(Vec<SecretView>),
     ResolvedSecrets(Vec<ResolvedSecretView>),
-    SecretVersion(SecretVersionView),
-    SecretVersions(Vec<SecretVersionView>),
+    SecretValueSet(SecretVersionView),
     HttpResponse(HttpResponse),
     PortabilityExport(PortabilityExportSummary),
     PortabilityPreview(PortabilityPreview),

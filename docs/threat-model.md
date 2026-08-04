@@ -36,7 +36,7 @@ External providers receive credentials only through a constrained broker action.
 - A stopped or locked daemon fails closed with a structured error.
 - Password input never uses process arguments, positional plaintext, or environment variables.
 - Secret names, descriptions, and sensitive metadata are encrypted at rest.
-- Each secret value mutation creates a new immutable version with a distinct DEK.
+- Each secret value mutation overwrites the previous value in place with a fresh DEK; no history is retained.
 - HTTP broker access is authorized only by a `secret_http_access` record attached to the target secret, matched purely by same-uid trust; there is no per-caller token, TTL, use count, or individual revocation (see the glossary and ADR 0004's addendum).
 - IPC clients and the daemon verify operating-system peer identity, and runtime path handling refuses symbolic-link or non-socket substitution.
 - Encrypted packages use a fresh transfer key and contain no VMK, plaintext secret value, or runtime state.

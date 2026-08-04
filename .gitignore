@@ -1,6 +1,9 @@
 /target/
 /.idea/
 /.vscode/
+/crates/envault-desktop/node_modules/
+/crates/envault-desktop/dist/
+/crates/envault-desktop/src-tauri/gen/
 *.swp
 *.swo
 .DS_Store
@@ -19,6 +22,7 @@
 !/.agents/skills/envault/**
 /docs/plans/
 /docs/reviews/
+/docs/adr/
 
 # Local agent-tooling state (per-machine, not part of the shipped project)
 /.claude/
