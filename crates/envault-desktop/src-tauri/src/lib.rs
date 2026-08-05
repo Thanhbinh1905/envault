@@ -50,6 +50,7 @@ pub fn run() {
             commands::delete_profile,
             commands::activate_profile,
             commands::deactivate_profile,
+            commands::create_secret,
             commands::create_generated_secret,
             commands::update_secret_description,
             commands::set_secret_value,

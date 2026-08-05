@@ -527,7 +527,11 @@ function renderProfileEditor(profile: ProfileView): HTMLElement {
     }
     const nextDescription = description.value.trim() || null;
     void guarded(async () => {
-      if (nextName !== profile.name) await api.renameProfile(profile.name, nextName);
+      if (nextName !== profile.name) {
+        const renamed = await api.renameProfile(profile.name, nextName);
+        state.editingProfile = { ...renamed, description: nextDescription, activate_on_start: activate.checked };
+        state.profiles = state.profiles.map((item) => item.name === profile.name ? state.editingProfile! : item);
+      }
       await api.updateProfile(nextName, nextDescription, activate.checked);
     }, () => {
       state.editingProfile = null;
@@ -622,7 +626,8 @@ function renderProfiles(): HTMLElement {
       onSubmit: async ({ name, description }) => {
         const nextName = name?.trim();
         if (!nextName) throw new Error("A profile name is required.");
-        await guarded(() => api.createProfile(nextName, description ?? null), () => void refreshProfiles());
+        await api.createProfile(nextName, description ?? null);
+        void refreshProfiles();
       },
     });
   }, "primary");
@@ -867,10 +872,9 @@ function renderWorkspaces(): HTMLElement {
       onSubmit: async ({ name }) => {
         const nextName = name?.trim();
         if (!nextName) throw new Error("A workspace name is required.");
-        await guarded(() => api.createWorkspace(nextName), (workspace) => {
-          void refreshWorkspaces();
-          openWorkspace(workspace);
-        });
+        const workspace = await api.createWorkspace(nextName);
+        void refreshWorkspaces();
+        openWorkspace(workspace);
       },
     });
   }, "primary");
@@ -1043,8 +1047,10 @@ function renderEditorOverlay(): HTMLElement | null {
       description: description ? description.value.trim() || null : undefined,
       value: value?.value,
     };
-    state.editor = null;
-    void editor.onSubmit(values);
+    void guarded(async () => {
+      await editor.onSubmit(values);
+      state.editor = null;
+    });
   });
   const overlay = el("div", { class: "overlay", role: "presentation" }, [
     el("section", { class: "card modal", role: "dialog", "aria-modal": "true", "aria-label": editor.title }, [form]),
@@ -1146,7 +1152,13 @@ function renderSecretDetail(secret: SecretView): HTMLElement {
     }
     askConfirm(`Save changes to “${secret.name}”?`, "Save changes", async () => {
       await guarded(async () => {
-        if (nextName !== secret.name) await api.renameSecret(currentSecretProfile(), secret.name, nextName);
+        if (nextName !== secret.name) {
+          const renamed = await api.renameSecret(currentSecretProfile(), secret.name, nextName);
+          const pending = renamed;
+          state.editingSecret = pending;
+          state.selectedSecret = nextName;
+          state.secrets = state.secrets.map((item) => item.name === secret.name ? pending : item);
+        }
         if (valueChanged) await api.setSecretValue(currentSecretProfile(), nextName, value.value);
         await api.updateSecretDescription(currentSecretProfile(), nextName, nextDescription);
       }, () => {
@@ -1258,17 +1270,9 @@ function renderSecrets(): HTMLElement {
         const nextName = name?.trim();
         if (!nextName) throw new Error("A secret name is required.");
         if (!value) throw new Error("A secret value is required.");
-        await guarded(
-          async () => {
-            const secret = await api.createGeneratedSecret(currentSecretProfile(), nextName, description ?? null);
-            await api.setSecretValue(currentSecretProfile(), nextName, value);
-            return secret;
-          },
-          (secret) => {
+        const secret = await api.createSecret(currentSecretProfile(), nextName, description ?? null, value);
           state.selectedSecret = secret.name;
           void refreshSecrets();
-          },
-        );
       },
     });
   }, "primary");

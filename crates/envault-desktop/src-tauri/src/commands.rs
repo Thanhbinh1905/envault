@@ -476,6 +476,26 @@ pub fn deactivate_profile(name: String) -> Result<ProfileView, String> {
 }
 
 #[tauri::command]
+pub fn create_secret(
+    profile: String,
+    name: String,
+    description: Option<String>,
+    value: String,
+) -> Result<SecretView, String> {
+    match client::request(Operation::CreateSecret {
+        profile,
+        name,
+        description,
+        value: SensitiveBytes::new(value.into_bytes()),
+    })
+    .map_err(describe)?
+    {
+        Reply::Secret(secret) => Ok(secret),
+        _ => Err(unexpected()),
+    }
+}
+
+#[tauri::command]
 pub fn create_generated_secret(
     profile: String,
     name: String,

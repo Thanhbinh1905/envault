@@ -86,6 +86,8 @@ export const api = {
   deleteProfile: (name: string) => call<void>("delete_profile", { name }),
   activateProfile: (name: string) => call<ProfileView>("activate_profile", { name }),
   deactivateProfile: (name: string) => call<ProfileView>("deactivate_profile", { name }),
+  createSecret: (profile: string, name: string, description: string | null, value: string) =>
+    call<SecretView>("create_secret", { profile, name, description, value }),
   createGeneratedSecret: (profile: string, name: string, description: string | null) =>
     call<SecretView>("create_generated_secret", { profile, name, description }),
   updateSecretDescription: (profile: string, name: string, description: string | null) =>

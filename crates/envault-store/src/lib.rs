@@ -155,6 +155,8 @@ pub enum StoreError {
     Database(#[from] rusqlite::Error),
     #[error("unsupported schema version {0}")]
     UnsupportedSchema(i64),
+    #[error("opening schema version {0} would discard immutable secret history")]
+    SecretHistoryMigrationRequired(i64),
     #[error("vault is not initialized")]
     NotInitialized,
     #[error("vault is already initialized")]
@@ -844,96 +846,8 @@ impl Store {
             )?;
             transaction.execute_batch(SCHEMA_V5)?;
             transaction.commit()?;
-        } else if current == 2 {
-            self.migrate_v2_to_v3()?;
-            self.migrate_v3_to_v4()?;
-            self.migrate_v4_to_v5()?;
-        } else if current == 3 {
-            self.migrate_v3_to_v4()?;
-            self.migrate_v4_to_v5()?;
-        } else if current == 4 {
-            self.migrate_v4_to_v5()?;
-        }
-        Ok(())
-    }
-
-    fn migrate_v2_to_v3(&mut self) -> Result<(), StoreError> {
-        self.connection.pragma_update(None, "foreign_keys", "OFF")?;
-        let migration = (|| {
-            let transaction = self.connection.transaction()?;
-            transaction.execute_batch(MIGRATE_V2_TO_V3)?;
-            transaction.commit()?;
-            Ok::<(), StoreError>(())
-        })();
-        let restore = self.connection.pragma_update(None, "foreign_keys", "ON");
-        migration?;
-        restore?;
-        let violation: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT 1 FROM pragma_foreign_key_check LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if violation.is_some() {
-            return Err(StoreError::Integrity);
-        }
-        Ok(())
-    }
-
-    fn migrate_v3_to_v4(&mut self) -> Result<(), StoreError> {
-        self.connection.pragma_update(None, "foreign_keys", "OFF")?;
-        let migration = (|| {
-            let transaction = self.connection.transaction()?;
-            transaction.execute_batch(MIGRATE_V3_TO_V4)?;
-            transaction.commit()?;
-            Ok::<(), StoreError>(())
-        })();
-        let restore = self.connection.pragma_update(None, "foreign_keys", "ON");
-        migration?;
-        restore?;
-        let violation: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT 1 FROM pragma_foreign_key_check LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if violation.is_some() {
-            return Err(StoreError::Integrity);
-        }
-        Ok(())
-    }
-
-    /// Folds `secret_version` into `secret` (single current value stored
-    /// inline) - the schema-level counterpart to removing version history.
-    /// Only the row matching `secret.current_version` survives; every older
-    /// version is discarded by construction (the `LEFT JOIN ... AND
-    /// secret_version.version = secret.current_version` below never selects
-    /// them).
-    fn migrate_v4_to_v5(&mut self) -> Result<(), StoreError> {
-        self.connection.pragma_update(None, "foreign_keys", "OFF")?;
-        let migration = (|| {
-            let transaction = self.connection.transaction()?;
-            transaction.execute_batch(MIGRATE_V4_TO_V5)?;
-            transaction.commit()?;
-            Ok::<(), StoreError>(())
-        })();
-        let restore = self.connection.pragma_update(None, "foreign_keys", "ON");
-        migration?;
-        restore?;
-        let violation: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT 1 FROM pragma_foreign_key_check LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if violation.is_some() {
-            return Err(StoreError::Integrity);
+        } else if current <= 4 {
+            return Err(StoreError::SecretHistoryMigrationRequired(current));
         }
         Ok(())
     }
@@ -1033,123 +947,6 @@ CREATE TABLE workspace_membership (
     PRIMARY KEY (workspace_id, profile_id)
 ) STRICT;
 PRAGMA user_version = 5;
-";
-
-const MIGRATE_V4_TO_V5: &str = "
-CREATE TABLE secret_v5 (
-    id BLOB PRIMARY KEY NOT NULL,
-    scope_id BLOB NOT NULL REFERENCES scope(id),
-    encrypted_name BLOB NOT NULL,
-    name_lookup BLOB NOT NULL,
-    encrypted_description BLOB,
-    current_version INTEGER NOT NULL CHECK (current_version >= 0),
-    status INTEGER NOT NULL CHECK (status IN (0, 1)),
-    value_id BLOB,
-    ciphertext BLOB,
-    wrapped_dek BLOB,
-    aad_digest BLOB,
-    generator INTEGER,
-    generated_length INTEGER,
-    entropy_bits INTEGER,
-    value_created_at INTEGER,
-    CHECK ((status = 0 AND current_version >= 1 AND value_id IS NOT NULL
-                AND ciphertext IS NOT NULL AND wrapped_dek IS NOT NULL
-                AND aad_digest IS NOT NULL AND value_created_at IS NOT NULL)
-        OR (status = 1 AND current_version = 0 AND value_id IS NULL
-                AND ciphertext IS NULL AND wrapped_dek IS NULL
-                AND aad_digest IS NULL AND value_created_at IS NULL)),
-    UNIQUE(scope_id, name_lookup)
-) STRICT;
-INSERT INTO secret_v5
-    (id, scope_id, encrypted_name, name_lookup, encrypted_description, current_version, status,
-     value_id, ciphertext, wrapped_dek, aad_digest, generator, generated_length, entropy_bits,
-     value_created_at)
-SELECT secret.id, secret.scope_id, secret.encrypted_name, secret.name_lookup,
-       secret.encrypted_description, secret.current_version, secret.status,
-       secret_version.id, secret_version.ciphertext, secret_version.wrapped_dek,
-       secret_version.aad_digest, secret_version.generator, secret_version.generated_length,
-       secret_version.entropy_bits, secret_version.created_at
-FROM secret
-LEFT JOIN secret_version
-    ON secret_version.secret_id = secret.id AND secret_version.version = secret.current_version;
-DROP TABLE secret_version;
-DROP TABLE secret;
-ALTER TABLE secret_v5 RENAME TO secret;
-PRAGMA user_version = 5;
-";
-
-const MIGRATE_V3_TO_V4: &str = "
-CREATE TABLE workspace (
-    id BLOB PRIMARY KEY NOT NULL,
-    vault_id BLOB NOT NULL REFERENCES vault(id),
-    encrypted_name BLOB NOT NULL,
-    name_lookup BLOB NOT NULL,
-    UNIQUE(vault_id, name_lookup)
-) STRICT;
-CREATE TABLE workspace_membership (
-    workspace_id BLOB NOT NULL REFERENCES workspace(id),
-    profile_id BLOB NOT NULL REFERENCES profile(id),
-    PRIMARY KEY (workspace_id, profile_id)
-) STRICT;
-PRAGMA user_version = 4;
-";
-
-const MIGRATE_V2_TO_V3: &str = "
-CREATE TABLE profile_v3 (
-    id BLOB PRIMARY KEY NOT NULL,
-    vault_id BLOB NOT NULL REFERENCES vault(id),
-    scope_id BLOB NOT NULL REFERENCES scope(id),
-    encrypted_name BLOB NOT NULL,
-    name_lookup BLOB NOT NULL,
-    encrypted_description BLOB,
-    activate_on_start INTEGER NOT NULL CHECK (activate_on_start IN (0, 1)),
-    generation INTEGER NOT NULL CHECK (generation >= 1),
-    UNIQUE(vault_id, name_lookup)
-) STRICT;
-INSERT INTO profile_v3
-    (id, vault_id, scope_id, encrypted_name, name_lookup, encrypted_description,
-     activate_on_start, generation)
-SELECT profile.id, profile.vault_id,
-       (SELECT scope.id FROM scope
-        WHERE scope.vault_id = profile.vault_id AND scope.parent_id IS NULL),
-       profile.encrypted_name, profile.name_lookup, profile.encrypted_description,
-       profile.activate_on_start, profile.generation
-FROM profile;
-DROP INDEX one_startup_profile_per_vault;
-DROP TABLE profile;
-ALTER TABLE profile_v3 RENAME TO profile;
-
-CREATE TABLE secret_v3 (
-    id BLOB PRIMARY KEY NOT NULL,
-    scope_id BLOB NOT NULL REFERENCES scope(id),
-    encrypted_name BLOB NOT NULL,
-    name_lookup BLOB NOT NULL,
-    encrypted_description BLOB,
-    current_version INTEGER NOT NULL CHECK (current_version >= 0),
-    status INTEGER NOT NULL CHECK (status IN (0, 1)),
-    CHECK ((status = 0 AND current_version >= 1) OR (status = 1 AND current_version = 0)),
-    UNIQUE(scope_id, name_lookup)
-) STRICT;
-INSERT INTO secret_v3
-    (id, scope_id, encrypted_name, name_lookup, encrypted_description, current_version, status)
-SELECT id, scope_id, encrypted_name, name_lookup, encrypted_description, current_version, status
-FROM secret;
-DROP TABLE secret;
-ALTER TABLE secret_v3 RENAME TO secret;
-
-DROP TABLE IF EXISTS audit_event;
-DROP TABLE IF EXISTS principal;
-DROP TABLE IF EXISTS policy_rule;
-CREATE TABLE secret_http_access (
-    secret_id BLOB PRIMARY KEY NOT NULL REFERENCES secret(id),
-    encrypted_host BLOB NOT NULL,
-    port INTEGER NOT NULL,
-    methods TEXT NOT NULL,
-    encrypted_path_prefix BLOB NOT NULL,
-    max_request_bytes INTEGER NOT NULL,
-    max_response_bytes INTEGER NOT NULL
-) STRICT;
-PRAGMA user_version = 3;
 ";
 
 fn insert_vault(transaction: &Transaction<'_>, record: &VaultRecord) -> Result<(), StoreError> {
@@ -1752,7 +1549,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_one_schema_migrates_profiles_and_folds_current_secret_value_losslessly() {
+    fn versioned_schema_refuses_destructive_migration() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("phase-one.db");
         let (vault, scope, profile) = fixture();
@@ -1824,15 +1621,27 @@ mod tests {
             .expect("version");
         drop(connection);
 
-        let migrated = Store::open(&path).expect("migrate");
-        assert_eq!(migrated.schema_version().expect("version"), 5);
-        assert_eq!(migrated.profiles().expect("profiles")[0].scope_id, scope.id);
-        let migrated_secret = migrated
-            .secret_by_id(secret_id)
-            .expect("secret")
-            .expect("present");
-        assert_eq!(migrated_secret.value.expect("value").value_id, version_id);
-        migrated.integrity_check().expect("integrity");
+        assert!(matches!(
+            Store::open(&path),
+            Err(StoreError::SecretHistoryMigrationRequired(2))
+        ));
+        let connection = Connection::open(&path).expect("reopen v2");
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("version"),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT id FROM secret_version WHERE secret_id = ?1",
+                    [id_bytes(secret_id.0)],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .expect("secret version"),
+            id_bytes(version_id.0),
+        );
     }
 
     const SCHEMA_V3_FIXTURE: &str = "
@@ -1903,7 +1712,7 @@ mod tests {
     ";
 
     #[test]
-    fn phase_two_schema_migrates_to_workspace_tables_cleanly() {
+    fn versioned_workspace_schema_refuses_destructive_migration() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("phase-two.db");
         let (vault, scope, profile) = fixture();
@@ -1952,28 +1761,10 @@ mod tests {
             .expect("profile");
         drop(connection);
 
-        let migrated = Store::open(&path).expect("migrate");
-        assert_eq!(migrated.schema_version().expect("version"), 5);
-        assert_eq!(migrated.profiles().expect("profiles"), vec![profile]);
-        assert!(migrated.workspaces().expect("workspaces").is_empty());
-        migrated.integrity_check().expect("integrity");
-
-        let mut migrated = migrated;
-        let workspace_id = WorkspaceId(Uuid::new_v4());
-        let workspace = WorkspaceRecord {
-            id: workspace_id,
-            vault_id: vault.id,
-            encrypted_name: vec![13_u8],
-            name_lookup: vec![14_u8; 32],
-        };
-        migrated.create_workspace(&workspace).expect("workspace");
-        assert_eq!(migrated.workspaces().expect("workspaces"), vec![workspace]);
-        assert!(
-            migrated
-                .profiles_in_workspace(workspace_id)
-                .expect("members")
-                .is_empty()
-        );
+        assert!(matches!(
+            Store::open(&path),
+            Err(StoreError::SecretHistoryMigrationRequired(3))
+        ));
     }
 
     #[test]
