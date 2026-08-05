@@ -129,7 +129,14 @@ fn verify() -> Result<()> {
     )?;
     run(
         "cargo",
-        &["test", "--workspace", "--exclude", "envault-desktop"],
+        &[
+            "test",
+            "--workspace",
+            "--exclude",
+            "envault-desktop",
+            "--",
+            "--test-threads=1",
+        ],
     )?;
     run(
         "cargo",

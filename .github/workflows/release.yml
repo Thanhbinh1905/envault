@@ -69,6 +69,11 @@ jobs:
           contents=$(dpkg-deb -c target/release/bundle/deb/*.deb)
           grep -F 'usr/lib/EnVault/bin/envaultd' <<<"$contents"
           grep -F 'usr/share/icons/hicolor/512x512/apps/envault-desktop.png' <<<"$contents"
+          appimage=$(printf '%s\n' target/release/bundle/appimage/*.AppImage)
+          chmod +x "$appimage"
+          "$appimage" --appimage-extract >/dev/null
+          test -x squashfs-root/usr/bin/envault-desktop
+          test -x squashfs-root/usr/lib/EnVault/bin/envaultd
 
       - name: Prepare desktop release assets
         shell: bash
@@ -105,7 +110,7 @@ jobs:
         with:
           toolchain: 1.97.1
       - run: cargo build --workspace --exclude envault-desktop --all-targets
-      - run: cargo test --workspace --exclude envault-desktop
+      - run: cargo test --workspace --exclude envault-desktop -- --test-threads=1
 
   windows-compile:
     name: Windows compile check

@@ -43,7 +43,7 @@ jobs:
         with:
           toolchain: 1.97.1
       - run: cargo build --workspace --exclude envault-desktop --all-targets
-      - run: cargo test --workspace --exclude envault-desktop
+      - run: cargo test --workspace --exclude envault-desktop -- --test-threads=1
 
   windows-compile:
     name: Windows compile check

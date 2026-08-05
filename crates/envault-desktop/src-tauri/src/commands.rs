@@ -30,6 +30,7 @@ fn unexpected() -> String {
     "the daemon returned an unexpected response".to_string()
 }
 
+#[cfg(debug_assertions)]
 fn installed_cli_daemon() -> Option<std::path::PathBuf> {
     let default_location = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -68,9 +69,6 @@ fn bundled_daemon_executable(app: &tauri::AppHandle) -> Result<std::path::PathBu
 
 #[cfg(not(debug_assertions))]
 fn daemon_executable(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    if let Some(daemon) = installed_cli_daemon() {
-        return Ok(daemon);
-    }
     bundled_daemon_executable(app)
 }
 

@@ -952,7 +952,6 @@ function renderRevealOverlay(): HTMLElement | null {
       el("div", { class: "eyebrow warning" }, ["SENSITIVE VALUE"]),
       el("h2", {}, ["Reveal only when needed"]),
       el("code", { class: "reveal-value" }, [value]),
-      el("p", { class: "muted" }, ["Clipboard contents are cleared after 20 seconds unless you copy something else first."]),
       el("div", { class: "actions" }, [button("Close", "secondary", close), copy]),
     ]),
   ]);
@@ -1323,7 +1322,7 @@ function renderSettings(): HTMLElement {
     el("div", { class: "card setting-card" }, [
       el("div", { class: "eyebrow" }, ["REVEAL PROTECTION"]),
       el("h2", {}, ["Values are not shown by default"]),
-      el("p", { class: "muted" }, ["Revealing a value requires this unlocked session. Clipboard copies are cleared after 20 seconds."]),
+      el("p", { class: "muted" }, ["Revealing a value requires this unlocked session."]),
     ]),
     el("div", { class: "card setting-card" }, [
       el("div", { class: "eyebrow" }, ["ENVAULT SERVICE"]),
