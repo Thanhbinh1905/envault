@@ -24,7 +24,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --exclude envault-desktop --all-targets -- -D warnings
       - run: cargo xtask contract
-      - run: cargo nextest run --workspace --exclude envault-desktop
+      - run: cargo nextest run --workspace --exclude envault-desktop --test-threads=1
       - run: cargo test --workspace --exclude envault-desktop --doc
       - run: cargo deny check
       - run: cargo audit
@@ -66,4 +66,4 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace --exclude envault-desktop
+      - run: cargo nextest run --workspace --exclude envault-desktop --test-threads=1
