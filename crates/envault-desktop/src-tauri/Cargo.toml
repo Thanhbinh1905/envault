@@ -21,10 +21,10 @@ path = "src/main.rs"
 tauri-build = { workspace = true, features = [] }
 
 [dependencies]
-envault = { path = "../../envault" }
-envault-core = { path = "../../envault-core" }
-envault-platform = { path = "../../envault-platform" }
-envault-protocol = { path = "../../envault-protocol" }
+envault = { version = "0.3.0", path = "../../envault" }
+envault-core = { version = "0.3.0", path = "../../envault-core" }
+envault-platform = { version = "0.3.0", path = "../../envault-platform" }
+envault-protocol = { version = "0.3.0", path = "../../envault-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 tauri = { workspace = true, features = ["tray-icon", "image-png"] }

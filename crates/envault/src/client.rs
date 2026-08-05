@@ -132,21 +132,19 @@ pub fn start_locked_with_daemon_executable(
 /// between the daemon writing its bootstrap handshake response (which is
 /// what unblocks the lock holder) and the daemon actually entering its
 /// accept loop. That window is transient and self-resolving, so this probe
-/// retries a bounded number of times on exactly a protocol-level hiccup
+/// retries until the daemon transition deadline on exactly a protocol-level hiccup
 /// before treating it as a real failure, mirroring `wait_for_daemon_exit`'s
 /// existing tolerance for the same class of startup-transition ambiguity.
 /// `Status` is read-only and idempotent, so retrying it has no side effect.
 #[cfg(unix)]
 fn probe_status_tolerating_startup_race() -> Result<Reply, ClientError> {
-    const MAX_ATTEMPTS: u32 = 10;
-    const RETRY_INTERVAL: Duration = Duration::from_millis(20);
-
-    let mut attempt = 0;
+    let deadline = Instant::now()
+        .checked_add(DAEMON_TRANSITION_TIMEOUT)
+        .ok_or(ClientError::Timeout)?;
     loop {
         match request(Operation::Status) {
-            Err(ClientError::Protocol) if attempt < MAX_ATTEMPTS => {
-                attempt += 1;
-                std::thread::sleep(RETRY_INTERVAL);
+            Err(ClientError::Protocol) if Instant::now() < deadline => {
+                std::thread::sleep(DAEMON_TRANSITION_INTERVAL);
             }
             result => return result,
         }
