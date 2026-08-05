@@ -426,7 +426,6 @@ enum SecretCommand {
     Update(NameDescriptionArgs),
     Rename(RenameArgs),
     Delete(NameArgs),
-    Versions(NameArgs),
     Value {
         #[command(subcommand)]
         command: SecretValueCommand,
@@ -510,6 +509,11 @@ struct ProfileLoadArgs {
     max_request_bytes: usize,
     #[arg(short = 'R', long, default_value_t = 256 * 1024)]
     max_response_bytes: usize,
+    #[arg(
+        long,
+        help = "With --secret, when no admin lease is active: read the master password from standard input instead of prompting"
+    )]
+    password_stdin: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -547,7 +551,12 @@ struct SecretListArgs {
 #[derive(Debug, clap::Args)]
 struct SecretValueSetArgs {
     name: String,
-    #[arg(short, long, required = true)]
+    #[arg(
+        short,
+        long,
+        required = true,
+        help = "Read the replacement value from piped standard input"
+    )]
     stdin: bool,
 }
 
@@ -1690,15 +1699,55 @@ fn profile_load(output: Output, arguments: ProfileLoadArgs) -> ExitCode {
         max_request_bytes: arguments.max_request_bytes,
         max_response_bytes: arguments.max_response_bytes,
     };
-    match client::request(Operation::SetSecretHttpAccess {
-        profile: arguments.name,
-        name: secret,
+    set_secret_http_access(
+        output,
+        arguments.name,
+        secret,
         constraint,
+        arguments.password_stdin,
+    )
+}
+
+/// Tries the admin-gated grant against the caller's active admin lease
+/// first. If none is active, prompts inline for the master password (or
+/// reads it from `--password-stdin`) and retries as a one-shot call that
+/// proves identity for just this request, instead of forcing a separate
+/// `envault admin unlock` round trip first.
+fn set_secret_http_access(
+    output: Output,
+    profile: String,
+    name: String,
+    constraint: HttpConstraint,
+    password_stdin: bool,
+) -> ExitCode {
+    match client::request(Operation::SetSecretHttpAccess {
+        profile: profile.clone(),
+        name: name.clone(),
+        constraint: constraint.clone(),
+        password: None,
     }) {
         Ok(Reply::Acknowledged { no_op }) => {
             print_acknowledgement(output, "http_access_set", no_op)
         }
         Ok(_) => print_error(output, &unexpected_response()),
+        Err(ClientError::Remote(error)) if error.code == "admin_auth_required" => {
+            let password = match read_master_password(password_stdin, false) {
+                Ok(password) => password,
+                Err(error) => return print_error(output, &error),
+            };
+            match client::request(Operation::SetSecretHttpAccess {
+                profile,
+                name,
+                constraint,
+                password: Some(password),
+            }) {
+                Ok(Reply::Acknowledged { no_op }) => {
+                    print_acknowledgement(output, "http_access_set", no_op)
+                }
+                Ok(_) => print_error(output, &unexpected_response()),
+                Err(error) => print_error(output, &client_error(error)),
+            }
+        }
         Err(error) => print_error(output, &client_error(error)),
     }
 }
@@ -2731,28 +2780,6 @@ fn secret_command(output: Output, command: SecretCommand) -> ExitCode {
                 "secret_deleted",
             )
         }
-        SecretCommand::Versions(arguments) => {
-            let (profile, name) = parse_secret_ref(&arguments.name);
-            match client::request(Operation::ListSecretVersions {
-                profile: profile.clone(),
-                name: name.clone(),
-            }) {
-                Ok(Reply::SecretVersions(versions)) => {
-                    let help: &[&str] = if versions.is_empty() {
-                        &[]
-                    } else {
-                        &["Run `envault secret value generate \"<name>\"` to add a new version"]
-                    };
-                    print_versions(output, &versions, help)
-                }
-                Ok(_) => print_error(output, &unexpected_response()),
-                Err(ClientError::Remote(error)) => print_error(
-                    output,
-                    &suggest_on_not_found(error, &name, &secret_names_in_profile(&profile)),
-                ),
-                Err(error) => print_error(output, &client_error(error)),
-            }
-        }
         SecretCommand::Value { command } => secret_value_command(output, command),
     }
 }
@@ -2858,12 +2885,6 @@ fn list_secrets(output: Output, arguments: &SecretListArgs) -> ExitCode {
 fn secret_value_command(output: Output, command: SecretValueCommand) -> ExitCode {
     let operation = match command {
         SecretValueCommand::Set(arguments) => {
-            if !arguments.stdin {
-                return print_error(
-                    output,
-                    &input_error("secret_stdin_required", "use `--stdin`"),
-                );
-            }
             let value = match read_secret_value() {
                 Ok(value) => value,
                 Err(error) => return print_error(output, &error),
@@ -2889,7 +2910,7 @@ fn secret_value_command(output: Output, command: SecretValueCommand) -> ExitCode
         }
     };
     match client::request(operation) {
-        Ok(Reply::SecretVersion(version)) => print_versions(output, &[version], &[]),
+        Ok(Reply::SecretValueSet(value)) => print_value_set(output, &value, &[]),
         Ok(_) => print_error(output, &unexpected_response()),
         Err(error) => print_error(output, &client_error(error)),
     }
@@ -3499,24 +3520,22 @@ fn vault_database_path() -> Result<PathBuf, StructuredError> {
 fn print_portability_export(output: Output, summary: &PortabilityExportSummary) -> ExitCode {
     match output {
         Output::Human => println!(
-            "package: exported · kind: {:?} · id: {} · profiles: {} · secrets: {} · versions: {} · workspaces: {} · memberships: {} · path: {}",
+            "package: exported · kind: {:?} · id: {} · profiles: {} · secrets: {} · workspaces: {} · memberships: {} · path: {}",
             summary.kind,
             summary.package_id,
             summary.counts.profiles,
             summary.counts.secrets,
-            summary.counts.versions,
             summary.counts.workspaces,
             summary.counts.memberships,
             summary.output_path
         ),
         Output::Json => print_json(summary),
         Output::Toon => println!(
-            "package{{status,kind,id,profiles,secrets,versions,workspaces,memberships,password_slots,age_slots,path}}: exported,{:?},{},{},{},{},{},{},{},{},{}",
+            "package{{status,kind,id,profiles,secrets,workspaces,memberships,password_slots,age_slots,path}}: exported,{:?},{},{},{},{},{},{},{},{}",
             summary.kind,
             summary.package_id,
             summary.counts.profiles,
             summary.counts.secrets,
-            summary.counts.versions,
             summary.counts.workspaces,
             summary.counts.memberships,
             summary.password_slots,
@@ -3531,11 +3550,10 @@ fn print_portability_preview(output: Output, preview: &PortabilityPreview) -> Ex
     match output {
         Output::Human => {
             println!(
-                "import: preview · kind: {:?} · profiles: {} · secrets: {} · versions: {} · workspaces: {} · memberships: {} · strategy: {:?}",
+                "import: preview · kind: {:?} · profiles: {} · secrets: {} · workspaces: {} · memberships: {} · strategy: {:?}",
                 preview.kind,
                 preview.counts.profiles,
                 preview.counts.secrets,
-                preview.counts.versions,
                 preview.counts.workspaces,
                 preview.counts.memberships,
                 preview.strategy
@@ -3558,11 +3576,10 @@ fn print_portability_preview(output: Output, preview: &PortabilityPreview) -> Ex
         Output::Json => print_json(preview),
         Output::Toon => {
             println!(
-                "import{{status,kind,profiles,secrets,versions,workspaces,memberships,strategy,plan_hash}}: preview,{:?},{},{},{},{},{},{:?},{}",
+                "import{{status,kind,profiles,secrets,workspaces,memberships,strategy,plan_hash}}: preview,{:?},{},{},{},{},{:?},{}",
                 preview.kind,
                 preview.counts.profiles,
                 preview.counts.secrets,
-                preview.counts.versions,
                 preview.counts.workspaces,
                 preview.counts.memberships,
                 preview.strategy,
@@ -3630,13 +3647,13 @@ fn print_env_import_preview(output: Output, preview: &EnvImportPreview) -> ExitC
 fn print_portability_import(output: Output, summary: &PortabilityImportSummary) -> ExitCode {
     match output {
         Output::Human => println!(
-            "import: committed · created: {} · replaced: {} · skipped: {} · versions appended: {}",
-            summary.created, summary.replaced, summary.skipped, summary.versions_appended
+            "import: committed · created: {} · replaced: {} · skipped: {}",
+            summary.created, summary.replaced, summary.skipped
         ),
         Output::Json => print_json(summary),
         Output::Toon => println!(
-            "import{{status,created,replaced,skipped,versions_appended}}: committed,{},{},{},{}",
-            summary.created, summary.replaced, summary.skipped, summary.versions_appended
+            "import{{status,created,replaced,skipped}}: committed,{},{},{}",
+            summary.created, summary.replaced, summary.skipped
         ),
     }
     ExitCode::SUCCESS
@@ -3758,17 +3775,16 @@ fn print_secrets(output: Output, secrets: &[SecretView], help: &[&str]) -> ExitC
         }
         Output::Toon => {
             println!(
-                "secrets[{}]{{id,scope_id,name,description,current_version,status}}:",
+                "secrets[{}]{{id,scope_id,name,description,status}}:",
                 secrets.len()
             );
             for secret in secrets {
                 println!(
-                    "  {},{},{},{},{},{:?}",
+                    "  {},{},{},{},{:?}",
                     secret.id.0,
                     secret.scope_id.0,
                     toon_string(&secret.name),
                     optional_toon(secret.description.as_deref()),
-                    secret.current_version,
                     secret.status
                 );
             }
@@ -3778,20 +3794,12 @@ fn print_secrets(output: Output, secrets: &[SecretView], help: &[&str]) -> ExitC
             if secrets.is_empty() {
                 println!("secrets: 0 secrets found");
             } else {
-                let mut table = human_table(vec![
-                    "name",
-                    "id",
-                    "scope",
-                    "version",
-                    "status",
-                    "description",
-                ]);
+                let mut table = human_table(vec!["name", "id", "scope", "status", "description"]);
                 for secret in secrets {
                     table.add_row(vec![
                         secret.name.clone(),
                         short_id(secret.id.0),
                         short_id(secret.scope_id.0),
-                        secret.current_version.to_string(),
                         format!("{:?}", secret.status),
                         secret.description.clone().unwrap_or_default(),
                     ]);
@@ -3804,45 +3812,33 @@ fn print_secrets(output: Output, secrets: &[SecretView], help: &[&str]) -> ExitC
     ExitCode::SUCCESS
 }
 
-fn print_versions(output: Output, versions: &[SecretVersionView], help: &[&str]) -> ExitCode {
+/// Confirms a secret's value was set/generated - the value overwrites
+/// in place, so there is nothing further to list (no version history).
+fn print_value_set(output: Output, value: &SecretVersionView, help: &[&str]) -> ExitCode {
     match output {
         Output::Json => {
-            print_json(versions);
+            print_json(value);
         }
         Output::Toon => {
+            println!("value_set{{id,secret_id,generator,generated_length,entropy_bits}}:");
             println!(
-                "versions[{}]{{id,secret_id,version,generator,generated_length,entropy_bits}}:",
-                versions.len()
+                "  {},{},{:?},{},{}",
+                value.id.0,
+                value.secret_id.0,
+                value.generator,
+                optional_number(value.generated_length),
+                optional_number(value.entropy_bits)
             );
-            for version in versions {
-                println!(
-                    "  {},{},{},{:?},{},{}",
-                    version.id.0,
-                    version.secret_id.0,
-                    version.version,
-                    version.generator,
-                    optional_number(version.generated_length),
-                    optional_number(version.entropy_bits)
-                );
-            }
             print_toon_help(help);
         }
         Output::Human => {
-            if versions.is_empty() {
-                println!("versions: 0 versions found");
-            } else {
-                let mut table =
-                    human_table(vec!["version", "id", "generator", "length", "entropy_bits"]);
-                for version in versions {
-                    table.add_row(vec![
-                        version.version.to_string(),
-                        short_id(version.id.0),
-                        format!("{:?}", version.generator),
-                        optional_number(version.generated_length),
-                        optional_number(version.entropy_bits),
-                    ]);
-                }
-                println!("{table}");
+            println!("value set for secret {}", short_id(value.secret_id.0));
+            if let Some(generator) = value.generator {
+                println!(
+                    "  generator: {generator:?}, length: {}, entropy_bits: {}",
+                    optional_number(value.generated_length),
+                    optional_number(value.entropy_bits)
+                );
             }
             print_human_help(help);
         }
@@ -4415,6 +4411,15 @@ mod tests {
                 "--acknowledge-os-keystore",
             ])
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn secret_value_set_requires_stdin() {
+        assert!(Cli::try_parse_from(["envault", "secret", "value", "set", "API_TOKEN"]).is_err());
+        assert!(
+            Cli::try_parse_from(["envault", "secret", "value", "set", "API_TOKEN", "--stdin",])
+                .is_ok()
         );
     }
 

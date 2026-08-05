@@ -13,7 +13,7 @@ use envault_core::{
     SecretVersionId, SecretVersionView, VaultId, validate_description, validate_generator,
 };
 use envault_crypto::{SecretBytes, SecretKey, encrypt, random_bytes};
-use envault_store::{SecretVersionRecord, StoreError};
+use envault_store::{SecretValueRecord, StoreError};
 use uuid::Uuid;
 
 use super::{ALGORITHM_VERSION, FORMAT_VERSION, ServiceError};
@@ -102,13 +102,13 @@ fn generate_encoded_bytes(
     })
 }
 
-pub(super) fn version_view(
-    record: &SecretVersionRecord,
+pub(super) fn value_view(
+    secret_id: SecretId,
+    record: &SecretValueRecord,
 ) -> Result<SecretVersionView, ServiceError> {
     Ok(SecretVersionView {
-        id: record.id,
-        secret_id: record.secret_id,
-        version: record.version,
+        id: record.value_id,
+        secret_id,
         generator: record.generator.map(generator_format).transpose()?,
         generated_length: record
             .generated_length

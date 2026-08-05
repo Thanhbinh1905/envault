@@ -36,7 +36,6 @@ pub(crate) struct FakeClient {
     pub admin_status: RefCell<VecDeque<Result<AdminLeaseStatus, ClientError>>>,
     pub profiles: RefCell<VecDeque<Result<Vec<ProfileView>, ClientError>>>,
     pub secrets: RefCell<VecDeque<Result<Vec<SecretView>, ClientError>>>,
-    pub versions: RefCell<VecDeque<Result<Vec<SecretVersionView>, ClientError>>>,
     pub reveal: RefCell<VecDeque<Result<SensitiveBytes, ClientError>>>,
     pub reveal_token: RefCell<VecDeque<Result<SensitiveBytes, ClientError>>>,
     pub admin_unlock: RefCell<VecDeque<Result<AdminLeaseStatus, ClientError>>>,
@@ -63,14 +62,9 @@ impl DaemonClient for FakeClient {
         pop(&self.secrets)
     }
 
-    fn list_secret_versions(&self, _name: &str) -> Result<Vec<SecretVersionView>, ClientError> {
-        pop(&self.versions)
-    }
-
     fn reveal_secret_value(
         &self,
         _name: &str,
-        _version: Option<u64>,
         _token: &SensitiveBytes,
     ) -> Result<SensitiveBytes, ClientError> {
         pop(&self.reveal)
@@ -150,7 +144,7 @@ impl DaemonClient for FakeClient {
         _name: String,
         _generator: GeneratorSpec,
     ) -> Result<SecretVersionView, ClientError> {
-        Ok(sample_version(2))
+        Ok(sample_value())
     }
 
     fn preview_package_import(
@@ -250,16 +244,14 @@ pub(crate) fn sample_secret(name: &str, description: Option<String>) -> SecretVi
         scope_id: ScopeId(Uuid::new_v4()),
         name: name.to_string(),
         description,
-        current_version: 1,
         status: SecretStatus::Active,
     }
 }
 
-pub(crate) fn sample_version(version: u64) -> SecretVersionView {
+pub(crate) fn sample_value() -> SecretVersionView {
     SecretVersionView {
         id: SecretVersionId(Uuid::new_v4()),
         secret_id: SecretId(Uuid::new_v4()),
-        version,
         generator: Some(GeneratorFormat::Base64Url),
         generated_length: Some(32),
         entropy_bits: Some(192),
@@ -284,6 +276,5 @@ pub(crate) fn sample_import_summary() -> PortabilityImportSummary {
         created: 1,
         replaced: 0,
         skipped: 0,
-        versions_appended: 0,
     }
 }

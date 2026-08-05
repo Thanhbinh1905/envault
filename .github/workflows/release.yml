@@ -23,13 +23,78 @@ jobs:
         with:
           tool: cargo-nextest,cargo-deny,cargo-audit
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --exclude envault-desktop --all-targets -- -D warnings
       - run: cargo xtask contract
-      - run: cargo nextest run --workspace
-      - run: cargo test --workspace --doc
+      - run: cargo nextest run --workspace --exclude envault-desktop --test-threads=1
+      - run: cargo test --workspace --exclude envault-desktop --doc
       - run: cargo deny check
       - run: cargo audit
       - run: cargo xtask package-verify
+
+  desktop-linux:
+    name: Build Linux desktop
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+
+      - name: Check desktop version matches tag
+        shell: bash
+        run: |
+          version=$(jq -r '.version' crates/envault-desktop/src-tauri/tauri.conf.json)
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$version" = "$tag_version" || {
+            echo "tag $GITHUB_REF_NAME does not match desktop version $version" >&2
+            exit 1
+          }
+
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libayatana-appindicator3-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev
+
+      - name: Build desktop packages
+        working-directory: crates/envault-desktop
+        run: |
+          npm ci
+          npm run tauri -- build
+
+      - name: Verify desktop package contents
+        shell: bash
+        run: |
+          contents=$(dpkg-deb -c target/release/bundle/deb/*.deb)
+          grep -F 'usr/lib/EnVault/bin/envaultd' <<<"$contents"
+          grep -F 'usr/share/icons/hicolor/512x512/apps/envault-desktop.png' <<<"$contents"
+          appimage=$(printf '%s\n' target/release/bundle/appimage/*.AppImage)
+          chmod +x "$appimage"
+          "$appimage" --appimage-extract >/dev/null
+          test -x squashfs-root/usr/bin/envault-desktop
+          test -x squashfs-root/usr/lib/EnVault/bin/envaultd
+
+      - name: Prepare desktop release assets
+        shell: bash
+        run: |
+          mkdir -p desktop-dist
+          cp target/release/bundle/deb/*.deb "desktop-dist/envault-desktop-${GITHUB_REF_NAME}-x86_64.deb"
+          cp target/release/bundle/appimage/*.AppImage "desktop-dist/envault-desktop-${GITHUB_REF_NAME}-x86_64.AppImage"
+          (cd desktop-dist && sha256sum *.deb *.AppImage | sort -k2 > checksums)
+          while IFS='  ' read -r checksum asset; do
+            printf '%s  %s\n' "$checksum" "$asset" >"desktop-dist/$asset.sha256"
+          done < desktop-dist/checksums
+          rm desktop-dist/checksums
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-desktop-linux
+          path: |
+            desktop-dist/envault-desktop-v*.deb
+            desktop-dist/envault-desktop-v*.AppImage
+            desktop-dist/envault-desktop-v*.sha256
+          if-no-files-found: error
 
   build-platform:
     name: Build (${{ matrix.os }})
@@ -44,8 +109,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
-      - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace
+      - run: cargo build --workspace --exclude envault-desktop --all-targets
+      - run: cargo test --workspace --exclude envault-desktop -- --test-threads=1
 
   windows-compile:
     name: Windows compile check
@@ -56,7 +121,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
-      - run: cargo check --workspace --all-targets
+      - run: cargo check --workspace --exclude envault-desktop --all-targets
 
   windows-runtime:
     name: Windows runtime tests
@@ -70,7 +135,7 @@ jobs:
       - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace
+      - run: cargo nextest run --workspace --exclude envault-desktop --test-threads=1
 
   build:
     name: Build (${{ matrix.target }})
@@ -159,7 +224,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, desktop-linux]
     permissions:
       contents: write
     runs-on: ubuntu-latest

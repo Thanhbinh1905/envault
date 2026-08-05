@@ -1,0 +1,39 @@
+[package]
+name = "envault-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Desktop GUI for EnVault: tray icon, profile/secret browser, admin-lease-gated reveal"
+
+[lib]
+name = "envault_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "envault-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { workspace = true, features = [] }
+
+[dependencies]
+envault = { version = "0.3.0", path = "../../envault" }
+envault-core = { version = "0.3.0", path = "../../envault-core" }
+envault-platform = { version = "0.3.0", path = "../../envault-platform" }
+envault-protocol = { version = "0.3.0", path = "../../envault-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { workspace = true, features = ["tray-icon", "image-png"] }
+tauri-plugin-clipboard-manager = "2"
+tokio.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-autostart = "2"

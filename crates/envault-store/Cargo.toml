@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-envault-core = { version = "=0.2.1", path = "../envault-core" }
+envault-core = { version = "=0.3.0", path = "../envault-core" }
 rusqlite.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

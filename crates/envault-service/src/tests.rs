@@ -169,7 +169,7 @@ fn update_profile_rejects_clearing_the_last_activate_on_start_profile() {
 }
 
 #[test]
-fn secret_versions_are_immutable_and_rename_preserves_identity() {
+fn set_secret_value_overwrites_in_place_and_rename_preserves_identity() {
     let (_directory, _path, _password, mut session) = initialized();
     let created = session
         .create_secret(
@@ -183,7 +183,6 @@ fn secret_versions_are_immutable_and_rename_preserves_identity() {
         .rename_secret("base", "openai_api_key", "OPENAI_PRIMARY_KEY")
         .expect("rename secret");
     assert_eq!(renamed.id, created.id);
-    assert_eq!(renamed.current_version, 1);
     let updated = session
         .update_secret(
             "base",
@@ -192,44 +191,32 @@ fn secret_versions_are_immutable_and_rename_preserves_identity() {
         )
         .expect("update secret");
     assert_eq!(updated.id, created.id);
-    assert_eq!(updated.current_version, 1);
     assert_eq!(
         session
             .secret("base", "openai_primary_key")
             .expect("show secret"),
         updated
     );
-    let second = session
+    let before_overwrite = session
+        .secret_by_ref("base", "openai_primary_key", false)
+        .expect("secret")
+        .id;
+    session
         .set_secret_value(
             "base",
             "openai_primary_key",
             SensitiveInput::copy_from_slice(b"phase-one-second-sentinel"),
         )
         .expect("set value");
-    assert_eq!(second.version, 2);
-    let versions = session
-        .secret_versions("base", "openai_primary_key")
-        .expect("versions");
-    assert_eq!(versions.len(), 2);
-    assert_ne!(versions[0].id, versions[1].id);
     let record = session
         .secret_by_ref("base", "openai_primary_key", false)
         .expect("secret");
-    let stored_versions = session
-        .store
-        .secret_versions(record.id)
-        .expect("stored versions");
+    assert_eq!(record.id, before_overwrite);
+    assert_eq!(record.current_version, 2);
     assert_eq!(
         session
-            .decrypt_secret_version(&record, &stored_versions[0])
-            .expect("first value")
-            .as_ref(),
-        b"phase-one-plaintext-sentinel"
-    );
-    assert_eq!(
-        session
-            .decrypt_secret_version(&record, &stored_versions[1])
-            .expect("second value")
+            .decrypt_secret_value(&record)
+            .expect("current value")
             .as_ref(),
         b"phase-one-second-sentinel"
     );
@@ -238,7 +225,7 @@ fn secret_versions_are_immutable_and_rename_preserves_identity() {
 #[test]
 fn generators_return_only_redacted_metadata() {
     let (_directory, _path, _password, mut session) = initialized();
-    let secret = session
+    session
         .create_generated_secret(
             "base",
             "SESSION_TOKEN",
@@ -250,13 +237,14 @@ fn generators_return_only_redacted_metadata() {
             },
         )
         .expect("generated secret");
-    assert_eq!(secret.current_version, 1);
-    let versions = session
-        .secret_versions("base", "session_token")
-        .expect("versions");
-    assert_eq!(versions[0].generated_length, Some(64));
-    assert_eq!(versions[0].entropy_bits, Some(384));
-    assert_eq!(versions[0].generator, Some(GeneratorFormat::Base64Url));
+    let record = session
+        .secret_by_ref("base", "session_token", false)
+        .expect("secret");
+    assert_eq!(record.current_version, 1);
+    let value = record.value.as_ref().expect("value");
+    assert_eq!(value.generated_length, Some(64));
+    assert_eq!(value.entropy_bits, Some(384));
+    assert_eq!(value.generator, Some(2));
 }
 
 #[test]
@@ -437,7 +425,7 @@ fn cryptographic_integrity_check_detects_secret_value_tamper() {
     session.checkpoint().expect("checkpoint");
     let connection = rusqlite::Connection::open(&path).expect("open database");
     let mut ciphertext: Vec<u8> = connection
-        .query_row("SELECT ciphertext FROM secret_version LIMIT 1", [], |row| {
+        .query_row("SELECT ciphertext FROM secret LIMIT 1", [], |row| {
             row.get(0)
         })
         .expect("ciphertext");
@@ -445,7 +433,7 @@ fn cryptographic_integrity_check_detects_secret_value_tamper() {
     *last ^= 0x40;
     connection
         .execute(
-            "UPDATE secret_version SET ciphertext = ?1",
+            "UPDATE secret SET ciphertext = ?1",
             rusqlite::params![ciphertext],
         )
         .expect("tamper value");

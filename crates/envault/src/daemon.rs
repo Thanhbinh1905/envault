@@ -119,9 +119,9 @@ struct RuntimeState {
 }
 
 impl RuntimeState {
-    fn new(vault: VaultSession, database_path: PathBuf) -> Result<Self, DaemonError> {
+    fn new(vault: Option<VaultSession>, database_path: PathBuf) -> Result<Self, DaemonError> {
         Ok(Self {
-            vault: Some(vault),
+            vault,
             database_path,
             admin_lease: None,
             reveal_token_key: CapabilityTokenKey::generate()?,
@@ -269,6 +269,19 @@ impl RuntimeState {
         constraint: HttpConstraint,
     ) -> Result<(), RuntimeFailure> {
         self.require_admin(peer)?;
+        self.set_secret_http_access_authorized(profile, name, constraint)
+    }
+
+    /// Same mutation as `set_secret_http_access` without the lease check -
+    /// for callers that already proved admin identity for this one call
+    /// (an inline `password` on the request, verified by
+    /// `verify_master_password`).
+    fn set_secret_http_access_authorized(
+        &mut self,
+        profile: &str,
+        name: &str,
+        constraint: HttpConstraint,
+    ) -> Result<(), RuntimeFailure> {
         let vault = self.vault.as_mut().ok_or(RuntimeFailure::Locked)?;
         vault
             .load_profile(profile)
@@ -522,7 +535,7 @@ struct Server {
 /// unlocks the vault. Only listener/transport creation differs by platform.
 fn prepare_runtime_lock_and_state(
     config: &DaemonConfig,
-    password: SensitiveBytes,
+    password: Option<SensitiveBytes>,
 ) -> Result<(std::fs::File, RuntimeState), DaemonError> {
     envault_platform::create_private_directory(&config.runtime_directory)?;
     let lock_file = envault_platform::open_private_lock_file(&config.lock_path)?;
@@ -531,9 +544,14 @@ fn prepare_runtime_lock_and_state(
         Err(std::fs::TryLockError::WouldBlock) => return Err(DaemonError::AlreadyRunning),
         Err(std::fs::TryLockError::Error(error)) => return Err(DaemonError::Io(error)),
     }
-    let sensitive = SensitiveInput::new(password.into_vec());
-    let vault = VaultSession::unlock(&config.database_path, &sensitive)?;
-    drop(sensitive);
+    let vault = password
+        .map(|password| {
+            let sensitive = SensitiveInput::new(password.into_vec());
+            let result = VaultSession::unlock(&config.database_path, &sensitive);
+            drop(sensitive);
+            result
+        })
+        .transpose()?;
     let state = RuntimeState::new(vault, config.database_path.clone())?;
     Ok((lock_file, state))
 }
@@ -541,7 +559,26 @@ fn prepare_runtime_lock_and_state(
 #[cfg(unix)]
 impl Server {
     fn prepare(config: &DaemonConfig, password: SensitiveBytes) -> Result<Self, DaemonError> {
-        let (lock_file, state) = prepare_runtime_lock_and_state(config, password)?;
+        let (lock_file, state) = prepare_runtime_lock_and_state(config, Some(password))?;
+        remove_stale_socket(&config.socket_path)?;
+        let listener = UnixListener::bind(&config.socket_path)?;
+        envault_platform::set_private_socket_permissions(&config.socket_path)?;
+        let socket_guard = SocketGuard::new(config.socket_path.clone())?;
+        let owner_uid = std::fs::metadata(&config.runtime_directory)?.uid();
+        Ok(Self {
+            listener,
+            state: Arc::new(Mutex::new(state)),
+            owner_uid,
+            socket_guard,
+            _lock_file: lock_file,
+            shutdown: Arc::new(Notify::new()),
+            connections: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
+            authentication: Arc::new(Semaphore::new(1)),
+        })
+    }
+
+    fn prepare_locked(config: &DaemonConfig) -> Result<Self, DaemonError> {
+        let (lock_file, state) = prepare_runtime_lock_and_state(config, None)?;
         remove_stale_socket(&config.socket_path)?;
         let listener = UnixListener::bind(&config.socket_path)?;
         envault_platform::set_private_socket_permissions(&config.socket_path)?;
@@ -620,7 +657,22 @@ impl Server {
 #[cfg(windows)]
 impl Server {
     fn prepare(config: &DaemonConfig, password: SensitiveBytes) -> Result<Self, DaemonError> {
-        let (lock_file, state) = prepare_runtime_lock_and_state(config, password)?;
+        let (lock_file, state) = prepare_runtime_lock_and_state(config, Some(password))?;
+        let pipe_name = crate::client::windows_pipe_name(&config.socket_path);
+        let listener = envault_windows_ffi::create_named_pipe_server(&pipe_name, true)?;
+        Ok(Self {
+            listener,
+            pipe_name,
+            state: Arc::new(Mutex::new(state)),
+            _lock_file: lock_file,
+            shutdown: Arc::new(Notify::new()),
+            connections: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
+            authentication: Arc::new(Semaphore::new(1)),
+        })
+    }
+
+    fn prepare_locked(config: &DaemonConfig) -> Result<Self, DaemonError> {
+        let (lock_file, state) = prepare_runtime_lock_and_state(config, None)?;
         let pipe_name = crate::client::windows_pipe_name(&config.socket_path);
         let listener = envault_windows_ffi::create_named_pipe_server(&pipe_name, true)?;
         Ok(Self {
@@ -763,6 +815,17 @@ pub async fn run_from_stdio() -> Result<(), DaemonError> {
     }
 }
 
+/// Runs the daemon without loading a vault session.
+///
+/// The daemon still owns the private IPC endpoint and reports `Locked`, but
+/// it receives no master-password material. A regular client start replaces
+/// this locked process with an unlocked session after the user authenticates.
+pub async fn run_locked() -> Result<(), DaemonError> {
+    envault_platform::harden_sensitive_process()?;
+    let config = DaemonConfig::from_platform()?;
+    Server::prepare_locked(&config)?.run().await
+}
+
 async fn handle_connection<S>(
     stream: S,
     peer: PeerIdentity,
@@ -850,6 +913,7 @@ const fn deadline_failure(is_portability: bool) -> RuntimeFailure {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn process_decoded_request(
     request: Request<AuthenticatedRequest>,
     peer: PeerIdentity,
@@ -868,7 +932,12 @@ async fn process_decoded_request(
     }
     if matches!(
         &request.body.operation,
-        Operation::AdminUnlock { .. } | Operation::IssueRevealToken { .. }
+        Operation::AdminUnlock { .. }
+            | Operation::IssueRevealToken { .. }
+            | Operation::SetSecretHttpAccess {
+                password: Some(_),
+                ..
+            }
     ) {
         state
             .try_lock()
@@ -895,6 +964,21 @@ async fn process_decoded_request(
                 .await
                 .map(|token| (Reply::RevealToken(token), false))
         }
+        Operation::SetSecretHttpAccess {
+            profile,
+            name,
+            constraint,
+            password: Some(password),
+        } => authorize_set_secret_http_access(
+            state,
+            password,
+            profile,
+            name,
+            constraint,
+            Arc::clone(authentication),
+        )
+        .await
+        .map(|()| (Reply::Acknowledged { no_op: false }, false)),
         Operation::HttpRequest {
             profile,
             name,
@@ -938,6 +1022,7 @@ async fn process_decoded_request(
 }
 
 impl RuntimeState {
+    #[allow(clippy::too_many_lines)]
     fn handle(
         &mut self,
         peer: PeerIdentity,
@@ -970,6 +1055,7 @@ impl RuntimeState {
                 profile,
                 name,
                 constraint,
+                password: None,
             } => {
                 self.set_secret_http_access(peer, &profile, &name, constraint)?;
                 Ok((Reply::Acknowledged { no_op: false }, false))
@@ -989,7 +1075,6 @@ impl RuntimeState {
             Operation::RevealSecretValue {
                 profile,
                 name,
-                version,
                 token,
             } => {
                 self.verify_reveal_token(peer, &token)?;
@@ -997,7 +1082,7 @@ impl RuntimeState {
                     .vault
                     .as_ref()
                     .ok_or(RuntimeFailure::Locked)?
-                    .reveal_secret_value(&profile, &name, version)
+                    .reveal_secret_value(&profile, &name)
                     .map_err(|error| map_service_failure(&error))?;
                 Ok((
                     Reply::SecretPlaintext(SensitiveBytes::new(value.into_vec())),
@@ -1028,8 +1113,7 @@ impl RuntimeState {
             | Operation::RenameSecret { .. }
             | Operation::DeleteSecret { .. }
             | Operation::SetSecretValue { .. }
-            | Operation::GenerateSecretValue { .. }
-            | Operation::ListSecretVersions { .. }) => self.handle_secret(peer, operation),
+            | Operation::GenerateSecretValue { .. }) => self.handle_secret(peer, operation),
             operation @ (Operation::ExportPackage { .. }
             | Operation::PreviewPackageImport { .. }
             | Operation::CommitPackageImport { .. }
@@ -1039,9 +1123,14 @@ impl RuntimeState {
             | Operation::ExportConfig { .. }
             | Operation::PreviewConfigImport { .. }
             | Operation::CommitConfigImport { .. }) => self.handle_portability(peer, operation),
+            // `password: Some(_)` is handled earlier in
+            // `process_decoded_request`, before this synchronous dispatch.
             Operation::HttpRequest { .. }
             | Operation::AdminUnlock { .. }
-            | Operation::IssueRevealToken { .. } => Err(RuntimeFailure::Internal),
+            | Operation::IssueRevealToken { .. }
+            | Operation::SetSecretHttpAccess {
+                password: Some(_), ..
+            } => Err(RuntimeFailure::Internal),
         }
     }
 
@@ -1218,11 +1307,6 @@ impl RuntimeState {
                     .secret(&profile, &name)
                     .map_err(|error| map_service_failure(&error))?,
             ),
-            Operation::ListSecretVersions { profile, name } => Reply::SecretVersions(
-                vault
-                    .secret_versions(&profile, &name)
-                    .map_err(|error| map_service_failure(&error))?,
-            ),
             _ => return Err(RuntimeFailure::Internal),
         };
         Ok((reply, false))
@@ -1288,7 +1372,7 @@ impl RuntimeState {
                 profile,
                 name,
                 value,
-            } => Reply::SecretVersion(
+            } => Reply::SecretValueSet(
                 vault
                     .set_secret_value(&profile, &name, SensitiveInput::new(value.into_vec()))
                     .map_err(|error| map_service_failure(&error))?,
@@ -1297,7 +1381,7 @@ impl RuntimeState {
                 profile,
                 name,
                 generator,
-            } => Reply::SecretVersion(
+            } => Reply::SecretValueSet(
                 vault
                     .generate_secret_value(&profile, &name, generator)
                     .map_err(|error| map_service_failure(&error))?,
@@ -1513,6 +1597,22 @@ async fn authenticate_admin(
     if let Some(ttl_minutes) = ttl_minutes {
         validate_admin_lease(ttl_minutes).map_err(|_| RuntimeFailure::InvalidTtl)?;
     }
+    verify_master_password(state, password, authentication).await?;
+    state
+        .try_lock()
+        .map_err(|_| RuntimeFailure::Busy)?
+        .issue_admin_lease(peer, ttl_minutes)
+}
+
+/// Proves the caller knows the vault's master password, without issuing an
+/// admin lease - the one-shot counterpart to `authenticate_admin`, used to
+/// authorize a single admin-gated call inline (e.g. `SetSecretHttpAccess`
+/// with `password: Some(_)`) without minting a standing lease.
+async fn verify_master_password(
+    state: &Arc<Mutex<RuntimeState>>,
+    password: SensitiveBytes,
+    authentication: Arc<Semaphore>,
+) -> Result<(), RuntimeFailure> {
     let database_path = {
         let state = state.try_lock().map_err(|_| RuntimeFailure::Busy)?;
         if state.vault.is_none() {
@@ -1535,10 +1635,30 @@ async fn authenticate_admin(
     .map_err(|_| RuntimeFailure::Internal)?
     .map_err(|error| map_service_failure(&error))?;
     drop(authenticated);
-    state
-        .try_lock()
-        .map_err(|_| RuntimeFailure::Busy)?
-        .issue_admin_lease(peer, ttl_minutes)
+    Ok(())
+}
+
+/// One-shot counterpart to `RuntimeState::set_secret_http_access`: proves
+/// the inline `password` instead of relying on an active admin lease, then
+/// applies the mutation without minting one.
+async fn authorize_set_secret_http_access(
+    state: &Arc<Mutex<RuntimeState>>,
+    password: SensitiveBytes,
+    profile: String,
+    name: String,
+    constraint: HttpConstraint,
+    authentication: Arc<Semaphore>,
+) -> Result<(), RuntimeFailure> {
+    verify_master_password(state, password, authentication).await?;
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        state
+            .try_lock()
+            .map_err(|_| RuntimeFailure::Busy)?
+            .set_secret_http_access_authorized(&profile, &name, constraint)
+    })
+    .await
+    .map_err(|_| RuntimeFailure::Internal)?
 }
 
 /// Re-verifies the vault password (same cost/rate-limit shape as
@@ -1578,7 +1698,7 @@ async fn issue_reveal_token(
 
 /// Named, explicit categorization of every `Operation` variant `handle`'s
 /// outer match routes to `handle_secret` (the `CreateSecret | ... |
-/// ListSecretVersions` group). Kept as one deliberate list rather than an
+/// GenerateSecretValue` group). Kept as one deliberate list rather than an
 /// inline `matches!` so the read/mutation split for a new secret operation
 /// is a conscious choice made here, next to every existing one, instead of
 /// a copy-pasted addition to whichever arm looked closest by analogy.
@@ -1587,8 +1707,7 @@ fn is_secret_read_only(operation: &Operation) -> bool {
     match operation {
         Operation::ListSecrets
         | Operation::ListResolvedSecrets { .. }
-        | Operation::DescribeSecret { .. }
-        | Operation::ListSecretVersions { .. } => true,
+        | Operation::DescribeSecret { .. } => true,
         // Mutations (`CreateSecret`, `CreateGeneratedSecret`, `UpdateSecret`,
         // `RenameSecret`, `DeleteSecret`, `SetSecretValue`,
         // `GenerateSecretValue`) and anything not yet listed both fall
@@ -2014,9 +2133,22 @@ mod tests {
         let vault = VaultSession::unlock(&path, &password).expect("unlock");
         (
             directory,
-            RuntimeState::new(vault, path).expect("runtime state"),
+            RuntimeState::new(Some(vault), path).expect("runtime state"),
             password,
         )
+    }
+
+    #[test]
+    fn locked_runtime_reports_locked_without_opening_a_vault() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut state = RuntimeState::new(None, directory.path().join("vault.db"))
+            .expect("locked runtime state");
+
+        let status = state.status(peer()).expect("status");
+
+        assert_eq!(status.service, ServiceState::Locked);
+        assert!(status.loaded_profiles.is_empty());
+        assert!(!status.admin_lease_active);
     }
 
     #[test]
@@ -2047,16 +2179,12 @@ mod tests {
     }
 
     #[test]
-    fn is_secret_read_only_matches_exactly_the_four_read_operations() {
+    fn is_secret_read_only_matches_exactly_the_three_read_operations() {
         assert!(is_secret_read_only(&Operation::ListSecrets));
         assert!(is_secret_read_only(&Operation::ListResolvedSecrets {
             profile: "base".to_string(),
         }));
         assert!(is_secret_read_only(&Operation::DescribeSecret {
-            profile: "base".to_string(),
-            name: "x".to_string(),
-        }));
-        assert!(is_secret_read_only(&Operation::ListSecretVersions {
             profile: "base".to_string(),
             name: "x".to_string(),
         }));

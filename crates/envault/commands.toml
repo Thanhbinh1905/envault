@@ -177,14 +177,6 @@ outputs = ["human", "json", "toon"]
 errors = ["admin_auth_required", "not_found"]
 
 [[command]]
-path = "secret versions"
-auth = "service"
-daemon = "required"
-agent = false
-outputs = ["human", "json", "toon"]
-errors = ["envault_locked", "not_found"]
-
-[[command]]
 path = "secret value set"
 auth = "admin"
 daemon = "required"

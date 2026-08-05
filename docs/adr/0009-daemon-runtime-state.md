@@ -11,8 +11,9 @@ The runtime must remain portable across Linux and macOS while Windows named pipe
 
 ## Decision
 
-`envault start` is the only executable path that spawns `envaultd`.
-The parent sends the master password through an anonymous standard-input pipe using a bounded sensitive protocol frame and waits for one readiness frame from the child.
+`envault start` spawns `envaultd` for an authenticated CLI start.
+The packaged desktop application may start its bundled daemon in the locked state without a password.
+For an authenticated CLI start, the parent sends the master password through an anonymous standard-input pipe using a bounded sensitive protocol frame and waits for one readiness frame from the child.
 The password is never passed through arguments, environment variables, files, logs, or shell-visible process metadata.
 
 The daemon owns the unlocked `VaultSession`, listens on one Unix socket, blocks on operating-system events while idle, and handles one bounded request per accepted connection.

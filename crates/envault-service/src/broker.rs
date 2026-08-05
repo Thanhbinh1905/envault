@@ -161,16 +161,10 @@ impl VaultSession {
             max_response_bytes: usize::try_from(access.max_response_bytes)
                 .map_err(|_| ServiceError::Corrupt)?,
         };
-        if secret.status != 0 || secret.current_version == 0 {
+        if secret.status != 0 || secret.value.is_none() {
             return Err(ServiceError::NotFound);
         }
-        let version = self
-            .store
-            .secret_versions(secret.id)?
-            .into_iter()
-            .find(|version| version.version == secret.current_version)
-            .ok_or(ServiceError::Corrupt)?;
-        let credential = self.decrypt_secret_version(&secret, &version)?.into_vec();
+        let credential = self.decrypt_secret_value(&secret)?.into_vec();
         prepare_bearer_request(request, constraint, credential)
             .map(AgentHttpRequest)
             .map_err(ServiceError::from)

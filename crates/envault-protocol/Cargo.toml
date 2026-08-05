@@ -9,9 +9,9 @@ repository.workspace = true
 
 [dependencies]
 ciborium.workspace = true
-envault-broker = { version = "=0.2.1", path = "../envault-broker" }
-envault-core = { version = "=0.2.1", path = "../envault-core" }
-envault-crypto = { version = "=0.2.1", path = "../envault-crypto" }
+envault-broker = { version = "=0.3.0", path = "../envault-broker" }
+envault-core = { version = "=0.3.0", path = "../envault-core" }
+envault-crypto = { version = "=0.3.0", path = "../envault-crypto" }
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

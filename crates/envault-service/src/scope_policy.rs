@@ -314,6 +314,7 @@ impl VaultSession {
             existing.encrypted_description = None;
             existing.current_version = 0;
             existing.status = 1;
+            existing.value = None;
             self.store.convert_secret_to_tombstone(
                 existing.id,
                 &existing.encrypted_name,
@@ -335,8 +336,9 @@ impl VaultSession {
             encrypted_description: None,
             current_version: 0,
             status: 1,
+            value: None,
         };
-        self.store.insert_tombstone(&record)?;
+        self.store.insert_secret(&record)?;
         self.secret_view(&record)
     }
 

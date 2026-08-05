@@ -16,11 +16,9 @@ pub trait DaemonClient {
     fn admin_status(&self) -> Result<AdminLeaseStatus, ClientError>;
     fn list_profiles(&self) -> Result<Vec<ProfileView>, ClientError>;
     fn list_secrets(&self) -> Result<Vec<SecretView>, ClientError>;
-    fn list_secret_versions(&self, name: &str) -> Result<Vec<SecretVersionView>, ClientError>;
     fn reveal_secret_value(
         &self,
         name: &str,
-        version: Option<u64>,
         token: &SensitiveBytes,
     ) -> Result<SensitiveBytes, ClientError>;
     /// Re-proves the vault password to mint a token bound to the current
@@ -141,26 +139,14 @@ impl DaemonClient for RealClient {
         }
     }
 
-    fn list_secret_versions(&self, name: &str) -> Result<Vec<SecretVersionView>, ClientError> {
-        match client::request(Operation::ListSecretVersions {
-            profile: "base".to_string(),
-            name: name.to_string(),
-        })? {
-            Reply::SecretVersions(versions) => Ok(versions),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
     fn reveal_secret_value(
         &self,
         name: &str,
-        version: Option<u64>,
         token: &SensitiveBytes,
     ) -> Result<SensitiveBytes, ClientError> {
         match client::request(Operation::RevealSecretValue {
             profile: "base".to_string(),
             name: name.to_string(),
-            version,
             token: token.clone(),
         })? {
             Reply::SecretPlaintext(value) => Ok(value),
@@ -299,7 +285,7 @@ impl DaemonClient for RealClient {
             name,
             generator,
         })? {
-            Reply::SecretVersion(version) => Ok(version),
+            Reply::SecretValueSet(version) => Ok(version),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -413,7 +399,6 @@ pub enum Screen {
     Dashboard,
     Profiles,
     Secrets,
-    Versions,
     Portability,
 }
 
@@ -424,8 +409,7 @@ impl Screen {
         match self {
             Screen::Dashboard => Screen::Profiles,
             Screen::Profiles => Screen::Secrets,
-            Screen::Secrets => Screen::Versions,
-            Screen::Versions => Screen::Portability,
+            Screen::Secrets => Screen::Portability,
             Screen::Portability => Screen::Dashboard,
         }
     }
@@ -437,8 +421,7 @@ impl Screen {
             Screen::Dashboard => Screen::Portability,
             Screen::Profiles => Screen::Dashboard,
             Screen::Secrets => Screen::Profiles,
-            Screen::Versions => Screen::Secrets,
-            Screen::Portability => Screen::Versions,
+            Screen::Portability => Screen::Secrets,
         }
     }
 }
@@ -783,8 +766,6 @@ pub struct App<C: DaemonClient> {
     profile_selected: usize,
     secrets: Vec<SecretView>,
     secret_selected: usize,
-    versions: Vec<SecretVersionView>,
-    version_selected: usize,
     portability_kind: PortabilityKind,
     portability_strategy: ImportConflictStrategy,
     portability_preview: Option<PortabilityPreviewState>,
@@ -808,8 +789,6 @@ impl<C: DaemonClient> App<C> {
             profile_selected: 0,
             secrets: Vec::new(),
             secret_selected: 0,
-            versions: Vec::new(),
-            version_selected: 0,
             portability_kind: PortabilityKind::Profile,
             portability_strategy: ImportConflictStrategy::Abort,
             portability_preview: None,
@@ -858,14 +837,6 @@ impl<C: DaemonClient> App<C> {
 
     pub fn secret_selected(&self) -> usize {
         self.secret_selected
-    }
-
-    pub fn versions(&self) -> &[SecretVersionView] {
-        &self.versions
-    }
-
-    pub fn version_selected(&self) -> usize {
-        self.version_selected
     }
 
     pub fn portability_kind(&self) -> PortabilityKind {
@@ -938,23 +909,6 @@ impl<C: DaemonClient> App<C> {
         }
     }
 
-    fn refresh_versions(&mut self) {
-        let Some(secret) = self.secrets.get(self.secret_selected) else {
-            self.versions.clear();
-            return;
-        };
-        let name = secret.name.clone();
-        match self.client.list_secret_versions(&name) {
-            Ok(versions) => {
-                self.versions = versions;
-                self.version_selected = self
-                    .version_selected
-                    .min(self.versions.len().saturating_sub(1));
-            }
-            Err(error) => self.status_message = Some(describe_error(&error)),
-        }
-    }
-
     fn go_to(&mut self, screen: Screen) {
         self.status_message = None;
         self.screen = screen;
@@ -962,7 +916,6 @@ impl<C: DaemonClient> App<C> {
             Screen::Dashboard => self.refresh_dashboard(),
             Screen::Profiles => self.refresh_profiles(),
             Screen::Secrets => self.refresh_secrets(),
-            Screen::Versions => self.refresh_versions(),
             Screen::Portability => {}
         }
     }
@@ -999,7 +952,6 @@ impl<C: DaemonClient> App<C> {
     fn on_key_normal(&mut self, code: crossterm::event::KeyCode) {
         use crossterm::event::KeyCode;
         match code {
-            KeyCode::Esc if self.screen == Screen::Versions => self.go_to(Screen::Secrets),
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('d') => self.go_to(Screen::Dashboard),
             KeyCode::Char('p') => self.go_to(Screen::Profiles),
@@ -1012,7 +964,6 @@ impl<C: DaemonClient> App<C> {
             }
             KeyCode::Up | KeyCode::Char('k') => self.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
-            KeyCode::Enter => self.select(),
             KeyCode::Char('u') if self.reveal_token.is_none() => {
                 self.status_message = None;
                 self.mode = Mode::PasswordInput(
@@ -1178,16 +1129,7 @@ impl<C: DaemonClient> App<C> {
             }
             (Screen::Secrets, 'v') => {
                 if let Some(secret) = self.secrets.get(self.secret_selected).cloned() {
-                    self.reveal_secret(secret.name, None);
-                }
-            }
-            (Screen::Versions, 'v') => {
-                if let (Some(secret), Some(version)) = (
-                    self.secrets.get(self.secret_selected).cloned(),
-                    self.versions.get(self.version_selected),
-                ) {
-                    let version = version.version;
-                    self.reveal_secret(secret.name, Some(version));
+                    self.reveal_secret(secret.name);
                 }
             }
             _ => {}
@@ -1198,12 +1140,12 @@ impl<C: DaemonClient> App<C> {
     /// daemon re-checks both the admin lease and this process's reveal token
     /// at the exact moment of reveal rather than trusting any cached flag,
     /// since either can expire or be revoked between key presses.
-    fn reveal_secret(&mut self, name: String, version: Option<u64>) {
+    fn reveal_secret(&mut self, name: String) {
         let Some(token) = self.reveal_token.clone() else {
             self.status_message = Some("admin lease required; press 'u' to unlock".to_string());
             return;
         };
-        match self.client.reveal_secret_value(&name, version, &token) {
+        match self.client.reveal_secret_value(&name, &token) {
             Ok(value) => {
                 let text = String::from_utf8_lossy(value.as_slice()).into_owned();
                 self.mode = Mode::Reveal(name, Zeroizing::new(text));
@@ -1878,15 +1820,9 @@ impl<C: DaemonClient> App<C> {
                     .client
                     .generate_secret_value(name, GeneratorSpec::default())
                 {
-                    Ok(version) => {
-                        self.status_message = Some(format!(
-                            "rotated secret value to version {}",
-                            version.version
-                        ));
+                    Ok(_) => {
+                        self.status_message = Some("rotated secret value".to_string());
                         self.refresh_secrets();
-                        if self.screen == Screen::Versions {
-                            self.refresh_versions();
-                        }
                     }
                     Err(error) => self.status_message = Some(describe_error(&error)),
                 }
@@ -1991,10 +1927,6 @@ impl<C: DaemonClient> App<C> {
                 self.secret_selected =
                     Self::move_selection_up(self.secrets.len(), self.secret_selected);
             }
-            Screen::Versions => {
-                self.version_selected =
-                    Self::move_selection_up(self.versions.len(), self.version_selected);
-            }
             Screen::Dashboard | Screen::Portability => {}
         }
     }
@@ -2009,25 +1941,15 @@ impl<C: DaemonClient> App<C> {
                 self.secret_selected =
                     Self::move_selection_down(self.secrets.len(), self.secret_selected);
             }
-            Screen::Versions => {
-                self.version_selected =
-                    Self::move_selection_down(self.versions.len(), self.version_selected);
-            }
             Screen::Dashboard | Screen::Portability => {}
-        }
-    }
-
-    fn select(&mut self) {
-        if self.screen == Screen::Secrets && !self.secrets.is_empty() {
-            self.go_to(Screen::Versions);
         }
     }
 }
 
 fn describe_import_summary(summary: &PortabilityImportSummary) -> String {
     format!(
-        "import committed: {} created, {} replaced, {} skipped, {} versions appended",
-        summary.created, summary.replaced, summary.skipped, summary.versions_appended
+        "import committed: {} created, {} replaced, {} skipped",
+        summary.created, summary.replaced, summary.skipped
     )
 }
 
@@ -2038,7 +1960,7 @@ mod tests {
     use super::*;
     use crate::tui::test_support::{
         FakeClient, sample_admin_status, sample_env_preview, sample_import_summary, sample_profile,
-        sample_secret, sample_status, sample_version,
+        sample_secret, sample_status,
     };
 
     fn app_with(client: FakeClient) -> App<FakeClient> {
@@ -2062,18 +1984,10 @@ mod tests {
             .profiles
             .borrow_mut()
             .push_back(Ok(vec![sample_profile("base", None)]));
-        // Secrets is refreshed twice: once on entry, once again when Esc
-        // returns from Versions back to Secrets.
-        for _ in 0..2 {
-            client
-                .secrets
-                .borrow_mut()
-                .push_back(Ok(vec![sample_secret("db-password", None)]));
-        }
         client
-            .versions
+            .secrets
             .borrow_mut()
-            .push_back(Ok(vec![sample_version(1)]));
+            .push_back(Ok(vec![sample_secret("db-password", None)]));
         let mut app = app_with(client);
         assert_eq!(app.screen(), Screen::Dashboard);
 
@@ -2084,13 +1998,6 @@ mod tests {
         app.on_key(KeyCode::Char('s'));
         assert_eq!(app.screen(), Screen::Secrets);
         assert_eq!(app.secrets().len(), 1);
-
-        app.on_key(KeyCode::Enter);
-        assert_eq!(app.screen(), Screen::Versions);
-        assert_eq!(app.versions().len(), 1);
-
-        app.on_key(KeyCode::Esc);
-        assert_eq!(app.screen(), Screen::Secrets);
     }
 
     #[test]
@@ -2104,14 +2011,13 @@ mod tests {
             .admin_status
             .borrow_mut()
             .push_back(Ok(sample_admin_status(false)));
-        // Forward lap (Tab x4: Dashboard -> Profiles -> Secrets -> Versions
-        // -> Portability) plus the wrap back to Dashboard, then a full
-        // backward lap (Shift+Tab x4) plus its wrap: each traversal touches
-        // Profiles/Secrets/Versions/Dashboard twice.
+        // Forward lap (Tab x3: Dashboard -> Profiles -> Secrets ->
+        // Portability) plus the wrap back to Dashboard, then a full
+        // backward lap (Shift+Tab x3) plus its wrap: each traversal touches
+        // Profiles/Secrets/Dashboard twice.
         for _ in 0..2 {
             client.profiles.borrow_mut().push_back(Ok(Vec::new()));
             client.secrets.borrow_mut().push_back(Ok(Vec::new()));
-            client.versions.borrow_mut().push_back(Ok(Vec::new()));
             client
                 .status
                 .borrow_mut()
@@ -2129,8 +2035,6 @@ mod tests {
         app.on_key(KeyCode::Right);
         assert_eq!(app.screen(), Screen::Secrets);
         app.on_key(KeyCode::Char('l'));
-        assert_eq!(app.screen(), Screen::Versions);
-        app.on_key(KeyCode::Tab);
         assert_eq!(app.screen(), Screen::Portability);
         app.on_key(KeyCode::Tab);
         assert_eq!(app.screen(), Screen::Dashboard, "next() must wrap");
@@ -2138,10 +2042,8 @@ mod tests {
         app.on_key(KeyCode::BackTab);
         assert_eq!(app.screen(), Screen::Portability);
         app.on_key(KeyCode::Left);
-        assert_eq!(app.screen(), Screen::Versions);
-        app.on_key(KeyCode::Char('h'));
         assert_eq!(app.screen(), Screen::Secrets);
-        app.on_key(KeyCode::BackTab);
+        app.on_key(KeyCode::Char('h'));
         assert_eq!(app.screen(), Screen::Profiles);
         app.on_key(KeyCode::BackTab);
         assert_eq!(app.screen(), Screen::Dashboard, "previous() must wrap");

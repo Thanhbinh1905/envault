@@ -1027,6 +1027,59 @@ fn secret_http_access_rejects_private_and_loopback_hosts() {
 }
 
 #[test]
+fn profile_load_secret_accepts_an_inline_password_without_a_standing_admin_lease() {
+    let fixture = DaemonFixture::initialize_and_start();
+    assert_success(&fixture.run(
+        &["--output", "json", "admin", "unlock", "--password-stdin"],
+        Some(PASSWORD),
+    ));
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "secret",
+            "create",
+            "base.INLINE_AUTH_TOKEN",
+            "--stdin",
+        ],
+        Some(b"phase4-e2e-credential"),
+    ));
+    assert_success(&fixture.run(&["--output", "json", "admin", "lock"], None));
+
+    // The admin lease from `admin unlock` above was dropped by `admin
+    // lock` - yet the grant below still succeeds because
+    // `--password-stdin` proves identity for this one call.
+    assert_eq!(
+        fixture.json(&["--output", "json", "admin", "status"])["active"],
+        false
+    );
+    assert_success(&fixture.run(
+        &[
+            "--output",
+            "json",
+            "profile",
+            "load",
+            "base",
+            "--secret",
+            "INLINE_AUTH_TOKEN",
+            "--host",
+            "example.test",
+            "--method",
+            "get",
+            "--password-stdin",
+        ],
+        Some(PASSWORD),
+    ));
+
+    // The one-shot call must not have minted a standing lease as a side
+    // effect - a second admin-gated call still requires its own proof.
+    assert_eq!(
+        fixture.json(&["--output", "json", "admin", "status"])["active"],
+        false
+    );
+}
+
+#[test]
 fn secret_http_access_gates_request_http_without_any_principal_or_token() {
     let fixture = DaemonFixture::initialize_and_start();
     assert_success(&fixture.run(

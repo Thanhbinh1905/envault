@@ -119,14 +119,35 @@ fn verify() -> Result<()> {
         &[
             "clippy",
             "--workspace",
+            "--exclude",
+            "envault-desktop",
             "--all-targets",
             "--",
             "-D",
             "warnings",
         ],
     )?;
-    run("cargo", &["test", "--workspace"])?;
-    run("cargo", &["test", "--workspace", "--doc"])?;
+    run(
+        "cargo",
+        &[
+            "test",
+            "--workspace",
+            "--exclude",
+            "envault-desktop",
+            "--",
+            "--test-threads=1",
+        ],
+    )?;
+    run(
+        "cargo",
+        &[
+            "test",
+            "--workspace",
+            "--exclude",
+            "envault-desktop",
+            "--doc",
+        ],
+    )?;
     Ok(())
 }
 

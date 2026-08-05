@@ -63,6 +63,19 @@ pub fn request(operation: Operation) -> Result<Reply, ClientError> {
 
 #[cfg(unix)]
 pub fn start(password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
+    start_with_daemon_executable(password, daemon_executable()?)
+}
+
+/// Starts the daemon executable supplied by a trusted local application.
+///
+/// The CLI resolves its sibling `envaultd` binary through [`start`].
+/// Desktop bundles resolve the daemon from their read-only application resources
+/// so they do not depend on a separate CLI installation.
+#[cfg(unix)]
+pub fn start_with_daemon_executable(
+    password: SensitiveBytes,
+    executable: PathBuf,
+) -> Result<DaemonStatus, ClientError> {
     let _start_lock = acquire_start_lock()?;
     match probe_status_tolerating_startup_race() {
         Ok(Reply::Status(status)) if status.service == ServiceState::Unlocked => return Ok(status),
@@ -80,9 +93,37 @@ pub fn start(password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
         Ok(_) => return Err(ClientError::UnexpectedResponse),
         Err(error) => return Err(error),
     }
-    match spawn_daemon(password) {
+    match spawn_daemon(password, executable) {
         Err(ClientError::Remote(error)) if error.code == "daemon_busy" => wait_for_running_daemon(),
         result => result,
+    }
+}
+
+/// Starts a locked daemon without ever supplying the master password.
+///
+/// This is used by the desktop application at process startup so its tray
+/// status is available before the user opens the vault. The normal [`start`] path
+/// remains responsible for starting an unlocked vault session.
+#[cfg(unix)]
+pub fn start_locked_with_daemon_executable(
+    executable: PathBuf,
+) -> Result<DaemonStatus, ClientError> {
+    let _start_lock = acquire_start_lock()?;
+    match probe_status_tolerating_startup_race() {
+        Ok(Reply::Status(status)) => return Ok(status),
+        Err(ClientError::NotRunning) => {}
+        Ok(_) => return Err(ClientError::UnexpectedResponse),
+        Err(error) => return Err(error),
+    }
+    match Command::new(executable)
+        .arg("--locked")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(_) => wait_for_daemon_status(),
+        Err(_) => Err(ClientError::NotRunning),
     }
 }
 
@@ -91,21 +132,19 @@ pub fn start(password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
 /// between the daemon writing its bootstrap handshake response (which is
 /// what unblocks the lock holder) and the daemon actually entering its
 /// accept loop. That window is transient and self-resolving, so this probe
-/// retries a bounded number of times on exactly a protocol-level hiccup
+/// retries until the daemon transition deadline on exactly a protocol-level hiccup
 /// before treating it as a real failure, mirroring `wait_for_daemon_exit`'s
 /// existing tolerance for the same class of startup-transition ambiguity.
 /// `Status` is read-only and idempotent, so retrying it has no side effect.
 #[cfg(unix)]
 fn probe_status_tolerating_startup_race() -> Result<Reply, ClientError> {
-    const MAX_ATTEMPTS: u32 = 10;
-    const RETRY_INTERVAL: Duration = Duration::from_millis(20);
-
-    let mut attempt = 0;
+    let deadline = Instant::now()
+        .checked_add(DAEMON_TRANSITION_TIMEOUT)
+        .ok_or(ClientError::Timeout)?;
     loop {
         match request(Operation::Status) {
-            Err(ClientError::Protocol) if attempt < MAX_ATTEMPTS => {
-                attempt += 1;
-                std::thread::sleep(RETRY_INTERVAL);
+            Err(ClientError::Protocol) if Instant::now() < deadline => {
+                std::thread::sleep(DAEMON_TRANSITION_INTERVAL);
             }
             result => return result,
         }
@@ -129,6 +168,21 @@ fn probe_status_tolerating_startup_race() -> Result<Reply, ClientError> {
 /// operation.
 #[cfg(windows)]
 pub fn start(_password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
+    Err(ClientError::UnsupportedPlatform)
+}
+
+#[cfg(not(unix))]
+pub fn start_with_daemon_executable(
+    _password: SensitiveBytes,
+    _executable: PathBuf,
+) -> Result<DaemonStatus, ClientError> {
+    Err(ClientError::UnsupportedPlatform)
+}
+
+#[cfg(not(unix))]
+pub fn start_locked_with_daemon_executable(
+    _executable: PathBuf,
+) -> Result<DaemonStatus, ClientError> {
     Err(ClientError::UnsupportedPlatform)
 }
 
@@ -179,8 +233,10 @@ pub fn request_at(path: &std::path::Path, operation: Operation) -> Result<Reply,
 }
 
 #[cfg(unix)]
-fn spawn_daemon(password: SensitiveBytes) -> Result<DaemonStatus, ClientError> {
-    let executable = daemon_executable()?;
+fn spawn_daemon(
+    password: SensitiveBytes,
+    executable: PathBuf,
+) -> Result<DaemonStatus, ClientError> {
     let mut child = Command::new(executable)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -315,12 +371,24 @@ fn acquire_start_lock() -> Result<std::fs::File, ClientError> {
 
 #[cfg(unix)]
 fn wait_for_running_daemon() -> Result<DaemonStatus, ClientError> {
+    wait_for_daemon_status_matching(|status| status.service == ServiceState::Unlocked)
+}
+
+#[cfg(unix)]
+fn wait_for_daemon_status() -> Result<DaemonStatus, ClientError> {
+    wait_for_daemon_status_matching(|_| true)
+}
+
+#[cfg(unix)]
+fn wait_for_daemon_status_matching(
+    matches: impl Fn(&DaemonStatus) -> bool,
+) -> Result<DaemonStatus, ClientError> {
     let deadline = Instant::now()
         .checked_add(DAEMON_TRANSITION_TIMEOUT)
         .ok_or(ClientError::Timeout)?;
     loop {
         match request(Operation::Status) {
-            Ok(Reply::Status(status)) if status.service == ServiceState::Unlocked => {
+            Ok(Reply::Status(status)) if matches(&status) => {
                 return Ok(status);
             }
             Ok(Reply::Status(_))

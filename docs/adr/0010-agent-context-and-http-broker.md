@@ -18,7 +18,7 @@ Discovery capabilities may bind a vault, scope tree, or exact secret and return 
 
 The application service exposes specialized discovery and HTTP preparation workflows.
 It does not expose a generic value getter.
-HTTP preparation authorizes and audits the exact secret action, decrypts only the current version, transfers the value into an opaque broker request, and drops the service-owned plaintext buffer.
+HTTP preparation authorizes and audits the exact secret action, decrypts the current value, transfers the value into an opaque broker request, and drops the service-owned plaintext buffer.
 Only the broker can execute or inspect the opaque prepared request.
 
 The broker accepts no caller-supplied authorization, host, proxy, redirect, cookie, or arbitrary header override.

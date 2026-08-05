@@ -15,7 +15,7 @@ use envault_crypto::{
     derive_key, encrypt, lookup_digest, random_array, unwrap_key, wrap_key,
 };
 use envault_store::{
-    ProfileRecord, ScopeRecord, SecretRecord, SecretVersionRecord, Store, StoreError, VaultRecord,
+    ProfileRecord, ScopeRecord, SecretRecord, SecretValueRecord, Store, StoreError, VaultRecord,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -37,7 +37,7 @@ use internal::{
     GeneratorMetadata, decode_cbor, encode_cbor, encrypt_text, generate_value, generator_code,
     map_store_initialization, metadata_aad, publish_no_replace, remove_database_artifacts,
     remove_sidecars, secret_value_aad, secret_wrap_aad, unix_seconds,
-    validate_optional_description, version_view, vmk_aad,
+    validate_optional_description, value_view, vmk_aad,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -633,13 +633,7 @@ impl VaultSession {
                     .store
                     .secret_by_id(item.secret.id)?
                     .ok_or(ServiceError::Corrupt)?;
-                let version = self
-                    .store
-                    .secret_versions(secret.id)?
-                    .into_iter()
-                    .last()
-                    .ok_or(ServiceError::Corrupt)?;
-                let value = self.decrypt_secret_version(&secret, &version)?;
+                let value = self.decrypt_secret_value(&secret)?;
                 if values.insert(item.secret.name, value).is_some() {
                     return Err(ServiceError::DuplicateSecretAcrossProfiles);
                 }
@@ -658,13 +652,7 @@ impl VaultSession {
         name: &str,
     ) -> Result<SecretBytes, ServiceError> {
         let secret = self.secret_by_ref(profile, name, true)?;
-        let version = self
-            .store
-            .secret_versions(secret.id)?
-            .into_iter()
-            .last()
-            .ok_or(ServiceError::Corrupt)?;
-        self.decrypt_secret_version(&secret, &version)
+        self.decrypt_secret_value(&secret)
     }
 
     pub fn update_secret(
@@ -722,7 +710,7 @@ impl VaultSession {
         value: SensitiveInput,
     ) -> Result<SecretVersionView, ServiceError> {
         let record = self.secret_by_ref(profile, name, false)?;
-        self.add_secret_version(&record, value.into_secret(), None)
+        self.overwrite_secret_value(&record, value.into_secret(), None)
     }
 
     pub fn generate_secret_value(
@@ -733,41 +721,26 @@ impl VaultSession {
     ) -> Result<SecretVersionView, ServiceError> {
         let record = self.secret_by_ref(profile, name, false)?;
         let generated = generate_value(spec)?;
-        self.add_secret_version(&record, generated.value, Some(generated.metadata))
-    }
-
-    pub fn secret_versions(
-        &self,
-        profile: &str,
-        name: &str,
-    ) -> Result<Vec<SecretVersionView>, ServiceError> {
-        let secret = self.secret_by_ref(profile, name, true)?;
-        self.store
-            .secret_versions(secret.id)?
-            .iter()
-            .map(version_view)
-            .collect()
+        self.overwrite_secret_value(&record, generated.value, Some(generated.metadata))
     }
 
     /// Decrypts a secret's value for display - the sole path that hands
-    /// plaintext to the TUI for a human to look at. `version` selects a
-    /// specific historical version; `None` means the current version.
+    /// plaintext to a human's eyes (TUI's `Reveal` popup and the desktop
+    /// app). There is no version history: this always returns the one value
+    /// currently stored. Does not require the profile to be in the runtime
+    /// loaded set: the caller already had to supply the vault password to
+    /// mint the `RevealSecretValue` token (see `IssueRevealToken`), which is
+    /// a stronger proof of authorization than loaded-set membership. The
+    /// loaded-set gate stays enforced for the automation paths that hand
+    /// plaintext to a child process without a human looking at it
+    /// (`resolve_run_env`, `resolve_argv_secret`).
     pub fn reveal_secret_value(
         &self,
         profile: &str,
         name: &str,
-        version: Option<u64>,
     ) -> Result<SecretBytes, ServiceError> {
-        let secret = self.secret_by_ref(profile, name, true)?;
-        let versions = self.store.secret_versions(secret.id)?;
-        let record = match version {
-            Some(requested) => versions
-                .into_iter()
-                .find(|record| record.version == requested)
-                .ok_or(ServiceError::NotFound)?,
-            None => versions.into_iter().last().ok_or(ServiceError::Corrupt)?,
-        };
-        self.decrypt_secret_version(&secret, &record)
+        let secret = self.secret_by_ref(profile, name, false)?;
+        self.decrypt_secret_value(&secret)
     }
 
     pub fn delete_secret(&mut self, profile: &str, name: &str) -> Result<(), ServiceError> {
@@ -801,32 +774,21 @@ impl VaultSession {
         self.validate_encrypted_metadata()
             .map_err(|_| ServiceError::Corrupt)?;
         for secret in self.store.secrets()? {
-            let versions = self.store.secret_versions(secret.id)?;
-            if (secret.status == 0 && secret.current_version == 0)
-                || (secret.status == 1 && secret.current_version != 0)
+            if (secret.status == 0 && secret.value.is_none())
+                || (secret.status == 1 && secret.value.is_some())
                 || secret.status > 1
             {
                 return Err(ServiceError::Corrupt);
             }
-            if usize::try_from(secret.current_version).ok() != Some(versions.len()) {
-                return Err(ServiceError::Corrupt);
-            }
-            for (index, version) in versions.iter().enumerate() {
-                let expected_version = u64::try_from(index)
-                    .ok()
-                    .and_then(|value| value.checked_add(1))
-                    .ok_or(ServiceError::Corrupt)?;
-                if version.secret_id != secret.id || version.version != expected_version {
-                    return Err(ServiceError::Corrupt);
-                }
-                let view = version_view(version).map_err(|_| ServiceError::Corrupt)?;
+            if let Some(value) = &secret.value {
+                let view = value_view(secret.id, value).map_err(|_| ServiceError::Corrupt)?;
                 match view.generator {
                     Some(_) if view.generated_length.is_some() && view.entropy_bits.is_some() => {}
                     None if view.generated_length.is_none() && view.entropy_bits.is_none() => {}
                     _ => return Err(ServiceError::Corrupt),
                 }
                 drop(
-                    self.decrypt_secret_version(&secret, version)
+                    self.decrypt_secret_value(&secret)
                         .map_err(|_| ServiceError::Corrupt)?,
                 );
             }
@@ -876,13 +838,19 @@ impl VaultSession {
             )?,
             current_version: 1,
             status: 0,
+            value: None,
         };
-        let version = self.encrypt_secret_version(&secret, 1, value, generator)?;
-        self.store.insert_secret_with_version(&secret, &version)?;
+        let value = self.encrypt_secret_value(&secret, 1, value, generator)?;
+        let secret = SecretRecord {
+            value: Some(value),
+            ..secret
+        };
+        self.store.insert_secret(&secret)?;
         self.secret_view(&secret)
     }
 
-    fn add_secret_version(
+    /// Overwrites the secret's value in place - no history is retained.
+    fn overwrite_secret_value(
         &mut self,
         secret: &SecretRecord,
         value: SecretBytes,
@@ -895,19 +863,19 @@ impl VaultSession {
             .current_version
             .checked_add(1)
             .ok_or(ServiceError::Corrupt)?;
-        let record = self.encrypt_secret_version(secret, next_version, value, generator)?;
+        let record = self.encrypt_secret_value(secret, next_version, value, generator)?;
         self.store
-            .insert_secret_version(secret.id, secret.current_version, &record)?;
-        version_view(&record)
+            .overwrite_secret_value(secret.id, secret.current_version, &record)?;
+        value_view(secret.id, &record)
     }
 
-    fn encrypt_secret_version(
+    fn encrypt_secret_value(
         &self,
         secret: &SecretRecord,
         version: u64,
         value: SecretBytes,
         generator: Option<GeneratorMetadata>,
-    ) -> Result<SecretVersionRecord, ServiceError> {
+    ) -> Result<SecretValueRecord, ServiceError> {
         let id = SecretVersionId(Uuid::new_v4());
         let aad = secret_value_aad(self.vault_id, secret.id, id, secret.scope_id, version);
         let wrap_aad = secret_wrap_aad(self.vault_id, secret.id, id, secret.scope_id, version);
@@ -915,10 +883,8 @@ impl VaultSession {
         let ciphertext = encrypt(&dek, value.as_ref(), &aad)?.encode();
         drop(value);
         let wrapped_dek = wrap_key(&self.master_key, &dek, &wrap_aad)?.encode();
-        Ok(SecretVersionRecord {
-            id,
-            secret_id: secret.id,
-            version,
+        Ok(SecretValueRecord {
+            value_id: id,
             ciphertext,
             wrapped_dek,
             aad_digest: blake3::hash(&aad).as_bytes().to_vec(),
@@ -929,34 +895,31 @@ impl VaultSession {
         })
     }
 
-    fn decrypt_secret_version(
-        &self,
-        secret: &SecretRecord,
-        version: &SecretVersionRecord,
-    ) -> Result<SecretBytes, ServiceError> {
+    fn decrypt_secret_value(&self, secret: &SecretRecord) -> Result<SecretBytes, ServiceError> {
+        let value = secret.value.as_ref().ok_or(ServiceError::Corrupt)?;
         let aad = secret_value_aad(
             self.vault_id,
             secret.id,
-            version.id,
+            value.value_id,
             secret.scope_id,
-            version.version,
+            secret.current_version,
         );
-        if blake3::hash(&aad).as_bytes() != version.aad_digest.as_slice() {
+        if blake3::hash(&aad).as_bytes() != value.aad_digest.as_slice() {
             return Err(ServiceError::Corrupt);
         }
         let wrap_aad = secret_wrap_aad(
             self.vault_id,
             secret.id,
-            version.id,
+            value.value_id,
             secret.scope_id,
-            version.version,
+            secret.current_version,
         );
         let dek = unwrap_key(
             &self.master_key,
-            &Ciphertext::decode(&version.wrapped_dek)?,
+            &Ciphertext::decode(&value.wrapped_dek)?,
             &wrap_aad,
         )?;
-        decrypt(&dek, &Ciphertext::decode(&version.ciphertext)?, &aad).map_err(ServiceError::from)
+        decrypt(&dek, &Ciphertext::decode(&value.ciphertext)?, &aad).map_err(ServiceError::from)
     }
 
     fn profile_by_name(&self, name: &str) -> Result<ProfileRecord, ServiceError> {
@@ -1177,7 +1140,6 @@ impl VaultSession {
                 "description",
                 record.encrypted_description.as_deref(),
             )?,
-            current_version: record.current_version,
             status: match record.status {
                 0 => SecretStatus::Active,
                 1 => SecretStatus::Tombstone,
