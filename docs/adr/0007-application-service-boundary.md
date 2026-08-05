@@ -20,6 +20,6 @@ The daemon will own long-lived unlocked service sessions in Phase 3.
 
 ## Consequences
 
-CLI, TUI, and future desktop clients share one orchestration layer.
+CLI, TUI, and desktop clients share one orchestration layer.
 Cryptographic keys never become presentation-layer types.
 Phase 1 can test the full encrypted core independently from IPC while preserving the final runtime ownership model.
